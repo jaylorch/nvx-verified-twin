@@ -1,0 +1,72 @@
+name: Package release
+description: Build and upload an NVX binary release for one platform
+
+inputs:
+  platform:
+    description: Platform suffix used in the package and artifact names
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Rematerialize canonical kernel inputs
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        python scripts\nvx.py materialize-kernel-provenance-inputs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Package Linux release
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        set -euo pipefail
+        version="$(cat VERSION)"
+        package="nvx-${version}-${PLATFORM}"
+        python3 scripts/nvx.py package \
+          --version "${version}" \
+          --destination "dist/${package}" \
+          --binary-only
+        python3 scripts/nvx.py archive-release \
+          --source "dist/${package}" \
+          --destination "dist/${package}.tar.gz"
+
+    - name: Package Windows release
+      if: runner.os == 'Windows'
+      shell: powershell
+      env:
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        $Version = (Get-Content VERSION -Raw).Trim()
+        $Package = "nvx-$Version-$env:PLATFORM"
+        python scripts\nvx.py package `
+          --version $Version `
+          --destination "dist\$Package" `
+          --binary-only
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        python scripts\nvx.py archive-release `
+          --source "dist\$Package" `
+          --destination "dist\$Package.zip"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Upload Linux release
+      if: runner.os != 'Windows'
+      uses: actions/upload-artifact@v7
+      with:
+        name: release-${{ inputs.platform }}
+        path: dist/*.tar.gz
+        if-no-files-found: error
+        compression-level: 0
+        retention-days: 1
+
+    - name: Upload Windows release
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@v7
+      with:
+        name: release-${{ inputs.platform }}
+        path: dist/*.zip
+        if-no-files-found: error
+        compression-level: 0
+        retention-days: 1

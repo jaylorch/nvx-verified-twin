@@ -1,0 +1,175 @@
+#!/bin/sh
+set -eu
+
+check_share() {
+    share=$1
+    share_mode=$2
+    if [ "$share_mode" = eperm ]; then
+        check_share_denied "$share"
+        echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+        return
+    fi
+    [ "$(cat "$share/nvx-host-marker")" = host-to-guest ]
+    [ ! -e "$share/nvx-denied" ]
+    case "$share_mode" in
+        rw)
+            printf 'guest-to-host\n' >"$share/nvx-guest-marker"
+            mkdir "$share/nvx-guest-directory"
+            check_share_symlinks "$share"
+            ;;
+        caller)
+            printf 'guest-to-host\n' >"$share/nvx-guest-marker"
+            mkdir "$share/nvx-guest-directory"
+            check_share_ownership "$share"
+            mkdir "$share/nvx-caller-links"
+            check_share_symlinks "$share" "$share/nvx-caller-links"
+            ;;
+        ro)
+            if touch "$share/nvx-guest-marker" 2>/dev/null; then
+                exit 1
+            fi
+            if ln -s nvx-host-marker "$share/nvx-guest-link" 2>/dev/null; then
+                exit 1
+            fi
+            ;;
+        *) exit 2 ;;
+    esac
+    echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+}
+
+# With --mount-owner caller, the workload owns what it creates, so it can
+# populate the directories that it creates without host-granted access.
+check_share_ownership() {
+    share=$1
+    identity=$(id -u):$(id -g)
+    [ "$(stat -c %u:%g "$share/nvx-guest-marker")" = "$identity" ]
+    [ "$(stat -c %u:%g "$share/nvx-guest-directory")" = "$identity" ]
+    mkdir "$share/nvx-guest-directory/nested"
+    printf 'nested\n' >"$share/nvx-guest-directory/nested/file"
+    mv "$share/nvx-guest-directory/nested/file" \
+        "$share/nvx-guest-directory/nested/renamed"
+    [ "$(cat "$share/nvx-guest-directory/nested/renamed")" = nested ]
+    [ "$(stat -c %u:%g "$share/nvx-guest-directory/nested/renamed")" = "$identity" ]
+    echo "NVX-UBUNTU-SANDBOX-OWNER-OK target=$share identity=$identity"
+}
+
+# When OpenVMM cannot assume the workload identity, every share operation
+# fails with EPERM instead of running as the VMM. The guest permission bits
+# allow the read and the listing, so only the host can refuse them. uutils
+# commands describe some EPERM failures as "Permission denied", so writes
+# need only fail; the host checks that the share is unchanged.
+check_share_denied() {
+    share=$1
+    if error=$(cat "$share/nvx-host-marker" 2>&1); then
+        exit 1
+    fi
+    expect_eperm "$error"
+    if error=$(ls "$share" 2>&1); then
+        exit 1
+    fi
+    expect_eperm "$error"
+    if (: >"$share/nvx-guest-marker") 2>/dev/null; then
+        exit 1
+    fi
+    if mkdir "$share/nvx-guest-directory" 2>/dev/null; then
+        exit 1
+    fi
+}
+
+expect_eperm() {
+    case "$1" in
+        *'Operation not permitted'*) ;;
+        *)
+            echo "unexpected share error: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Exercise the symbolic-link primitives that package managers and language
+# toolchains use. The links directory defaults to the host-created,
+# world-writable nvx-links, because a directory that the guest creates is
+# owned by the VMM user unless the share runs with --mount-owner caller.
+check_share_symlinks() {
+    share=$1
+    links=${2:-$share/nvx-links}
+
+    # An npm-style .bin shim: a relative link to an executable in the share.
+    printf '#!/bin/sh\necho NVX-SYMLINK-TOOL-OK\n' >/tmp/nvx-tool
+    chmod 0755 /tmp/nvx-tool
+    cp /tmp/nvx-tool "$share/nvx-tool"
+    ln -s ../nvx-tool "$links/nvx-tool"
+    [ "$(readlink "$links/nvx-tool")" = ../nvx-tool ]
+    [ "$("$links/nvx-tool")" = NVX-SYMLINK-TOOL-OK ]
+
+    # Targets are stored exactly, even when they do not exist.
+    ln -s /nvx/absolute/target "$links/absolute"
+    [ "$(readlink "$links/absolute")" = /nvx/absolute/target ]
+
+    # Rename, replace, and remove a link without touching its target.
+    ln -s ../nvx-host-marker "$links/temporary"
+    mv "$links/temporary" "$links/marker"
+    [ "$(cat "$links/marker")" = host-to-guest ]
+    ln -sfn ../nvx-guest-marker "$links/marker"
+    [ "$(readlink "$links/marker")" = ../nvx-guest-marker ]
+    [ "$(cat "$links/marker")" = guest-to-host ]
+    rm "$links/marker"
+    [ "$(cat "$share/nvx-guest-marker")" = guest-to-host ]
+
+    # A link that leaves the share resolves in the guest, never on the host.
+    ln -s ../../nvx-outside-marker "$links/outside"
+    [ "$(readlink "$links/outside")" = ../../nvx-outside-marker ]
+    if [ "$(cat "$links/outside" 2>/dev/null)" = host-outside ]; then
+        exit 1
+    fi
+    printf 'guest-write\n' 2>/dev/null >"$links/outside" || true
+
+    # A link into a denied path cannot expose it.
+    ln -s ../nvx-denied/secret "$links/denied"
+    ln -s ../nvx-denied "$links/denied-directory"
+    if cat "$links/denied" >/dev/null 2>&1; then
+        exit 1
+    fi
+    if ls "$links/denied-directory/" >/dev/null 2>&1; then
+        exit 1
+    fi
+    echo "NVX-UBUNTU-SANDBOX-SYMLINK-OK target=$share"
+}
+
+# A share's access mode holds whichever share a path reaches it through: a
+# link in the read-write share cannot write into the read-only share.
+check_shares_isolated() {
+    rw_share=$1
+    ro_share=$2
+    ln -s "$ro_share/nvx-host-marker" "$rw_share/nvx-cross-share-link"
+    if (printf 'cross-share\n' >"$rw_share/nvx-cross-share-link") 2>/dev/null; then
+        exit 1
+    fi
+    [ "$(cat "$ro_share/nvx-host-marker")" = host-to-guest ]
+    rm "$rw_share/nvx-cross-share-link"
+    echo "NVX-UBUNTU-SANDBOX-SHARES-ISOLATED-OK rw=$rw_share ro=$ro_share"
+}
+
+[ "$(id -u)" = 65534 ]
+[ "$(id -g)" = 65534 ]
+[ "${HOME:-}" = /nonexistent ]
+grep -qx 'ID=ubuntu' /etc/os-release
+printf 'scratch-backed-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
+[ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = scratch-backed-write ]
+# Each share is a TARGET MODE pair; a final TARGET alone is read-only.
+rw_share=
+ro_share=
+while [ "$#" -gt 0 ]; do
+    share_mode=${2:-ro}
+    check_share "$1" "$share_mode"
+    case "$share_mode" in
+        rw) [ -n "$rw_share" ] || rw_share=$1 ;;
+        ro) [ -n "$ro_share" ] || ro_share=$1 ;;
+    esac
+    shift
+    [ "$#" -eq 0 ] || shift
+done
+if [ -n "$rw_share" ] && [ -n "$ro_share" ]; then
+    check_shares_isolated "$rw_share" "$ro_share"
+fi
+echo "NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534"

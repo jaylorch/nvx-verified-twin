@@ -1,0 +1,12 @@
+.git
+.github
+.cache
+.venv
+build
+data
+dist
+aci_edge_sandboxes
+openvmm
+third_party
+**/__pycache__
+**/*.pyc

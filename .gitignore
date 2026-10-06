@@ -1,0 +1,15 @@
+/build/
+/dist/
+/data/baseline/
+/data/results/
+/data/runs/
+/.cache/
+/.venv/
+/.ruff_cache/
+/.nvx-hosts.json
+/aci_edge_sandboxes/target/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+Thumbs.db

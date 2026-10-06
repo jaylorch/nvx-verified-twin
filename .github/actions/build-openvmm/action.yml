@@ -1,0 +1,194 @@
+name: Build OpenVMM
+description: Checkout and cache or build one reusable OpenVMM binary
+
+inputs:
+  ssh-key:
+    description: SSH deploy key used to checkout OpenVMM
+    required: true
+  backend:
+    description: Validated NVX backend used to select and cache the build
+    required: true
+  binary-path:
+    description: Normalized OpenVMM binary path produced by the build
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout OpenVMM
+      id: openvmm
+      uses: ./.github/actions/checkout-openvmm
+      with:
+        ssh-key: ${{ inputs.ssh-key }}
+
+    - name: Set up retrying curl
+      uses: ./.github/actions/setup-curl
+
+    - name: Verify source pins on Linux
+      if: runner.os != 'Windows'
+      shell: bash
+      run: python3 scripts/nvx.py verify
+
+    - name: Verify source pins on Windows
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: python scripts\nvx.py verify
+
+    - name: Set up Windows cache tools
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: python scripts\nvx.py setup-cross-os-cache
+
+    - name: Prepare Linux cache tools
+      id: cache-tools-linux
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cache_tools="${RUNNER_TEMP}/nvx-gzip-cache-tools"
+        mkdir -p "${cache_tools}"
+        ln -sf "$(command -v tar)" "${cache_tools}/tar"
+        ln -sf "$(command -v gzip)" "${cache_tools}/gzip"
+        echo "path=${cache_tools}" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore OpenVMM inputs on Linux
+      if: runner.os != 'Windows'
+      uses: actions/cache/restore@v5
+      env:
+        PATH: ${{ steps.cache-tools-linux.outputs.path }}
+      with:
+        path: |
+          openvmm/flowey-persist/flowey_lib_common__download_gh_release
+          openvmm/flowey-persist/flowey_lib_common__cache
+        key: openvmm-inputs-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+        restore-keys: |
+          openvmm-inputs-v1-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Restore OpenVMM inputs on Windows
+      if: runner.os == 'Windows'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          openvmm/flowey-persist/flowey_lib_common__download_gh_release
+          openvmm/flowey-persist/flowey_lib_common__cache
+        key: openvmm-inputs-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+        restore-keys: |
+          openvmm-inputs-v1-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Restore OpenVMM binary on Linux
+      id: restore-openvmm-binary-linux
+      if: runner.os != 'Windows'
+      uses: actions/cache/restore@v5
+      env:
+        PATH: ${{ steps.cache-tools-linux.outputs.path }}
+      with:
+        path: |
+          build/openvmm.provenance.json
+          ${{ inputs.binary-path }}
+        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+
+    - name: Restore OpenVMM binary on Windows
+      id: restore-openvmm-binary-windows
+      if: runner.os == 'Windows'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          build/openvmm.provenance.json
+          ${{ inputs.binary-path }}
+        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+
+    - name: Restore shared Cargo cache on Linux
+      id: restore-cargo-linux
+      if: runner.os != 'Windows' && steps.restore-openvmm-binary-linux.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v5
+      env:
+        PATH: ${{ steps.cache-tools-linux.outputs.path }}
+      with:
+        path: |
+          ${{ format('{0}/cargo-home/registry', runner.temp) }}
+          ${{ format('{0}/cargo-home/git', runner.temp) }}
+        key: openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openvmm/Cargo.lock') }}
+        restore-keys: |
+          openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Restore shared Cargo cache on Windows
+      id: restore-cargo-windows
+      if: runner.os == 'Windows' && steps.restore-openvmm-binary-windows.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          ${{ format('{0}/cargo-home/registry', runner.temp) }}
+          ${{ format('{0}/cargo-home/git', runner.temp) }}
+        key: openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openvmm/Cargo.lock') }}
+        restore-keys: |
+          openvmm-cargo-v1-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Build OpenVMM on Linux
+      if: runner.os != 'Windows' && steps.restore-openvmm-binary-linux.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 scripts/nvx.py build-openvmm --backend "${{ inputs.backend }}"
+
+    - name: Build OpenVMM on Windows
+      if: runner.os == 'Windows' && steps.restore-openvmm-binary-windows.outputs.cache-hit != 'true'
+      shell: powershell
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python scripts\nvx.py build-openvmm --backend "${{ inputs.backend }}"
+
+    - name: Verify OpenVMM binary on Linux
+      if: runner.os != 'Windows'
+      shell: bash
+      run: test -x "${{ inputs.binary-path }}"
+
+    - name: Verify OpenVMM binary on Windows
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        if (-not (Test-Path -LiteralPath "${{ inputs.binary-path }}" -PathType Leaf)) {
+          throw "OpenVMM binary was not produced: ${{ inputs.binary-path }}"
+        }
+
+    - name: Verify OpenVMM provenance on Linux
+      if: runner.os != 'Windows'
+      shell: bash
+      run: test -f build/openvmm.provenance.json
+
+    - name: Verify OpenVMM provenance on Windows
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        if (-not (Test-Path -LiteralPath "build/openvmm.provenance.json" -PathType Leaf)) {
+          throw "OpenVMM provenance was not produced"
+        }
+
+    - name: Save OpenVMM binary on Linux
+      if: >-
+        success() &&
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/dev' &&
+        runner.os != 'Windows' &&
+        steps.restore-openvmm-binary-linux.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      env:
+        PATH: ${{ steps.cache-tools-linux.outputs.path }}
+      with:
+        path: |
+          build/openvmm.provenance.json
+          ${{ inputs.binary-path }}
+        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}
+
+    - name: Save OpenVMM binary on Windows
+      if: >-
+        success() &&
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/dev' &&
+        runner.os == 'Windows' &&
+        steps.restore-openvmm-binary-windows.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          build/openvmm.provenance.json
+          ${{ inputs.binary-path }}
+        key: openvmm-binary-v6-${{ inputs.backend }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm.outputs.sha }}

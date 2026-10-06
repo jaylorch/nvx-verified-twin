@@ -1,0 +1,351 @@
+name: Build guest artifacts
+description: Cache or build the pinned Linux kernel and guest images
+
+inputs:
+  restore-only:
+    description: >-
+      Only restore cached artifacts; skip Docker builds, determinism checks,
+      and cache saves for artifacts that miss the cache
+    required: false
+    default: "false"
+  debug-kernel:
+    description: Also cache or build the CI debug kernel (build/vmlinux-debug)
+    required: false
+    default: "false"
+  guest-images:
+    description: >-
+      Cache or build the kernel and guest images; "false" with debug-kernel
+      builds only the CI debug kernel, for a job that runs beside this one
+    required: false
+    default: "true"
+
+outputs:
+  kernel-cache-key:
+    description: Exact cache key for the Linux kernel artifacts
+    value: ${{ steps.guest-cache-keys.outputs.kernel }}
+  debug-kernel-cache-key:
+    description: Exact cache key for the Linux debug kernel artifacts
+    value: ${{ steps.guest-cache-keys.outputs.kernel-debug }}
+  alpine-cache-key:
+    description: Exact cache key for the Alpine disk image artifacts
+    value: ${{ steps.guest-cache-keys.outputs.alpine }}
+  ubuntu-cache-key:
+    description: Exact cache key for the Ubuntu initramfs artifacts
+    value: ${{ steps.guest-cache-keys.outputs.ubuntu }}
+  ubuntu-distro-cache-key:
+    description: Exact cache key for the Ubuntu EROFS distro artifacts
+    value: ${{ steps.guest-cache-keys.outputs.ubuntu-distro }}
+  azurelinux-cache-key:
+    description: Exact cache key for the Azure Linux initramfs artifacts
+    value: ${{ steps.guest-cache-keys.outputs.azurelinux }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve guest artifact versions
+      id: guest-versions
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        manifest = json.loads(
+            Path("SOURCE-MANIFEST.json").read_text(encoding="utf-8")
+        )
+        with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+            print(f"kernel-version={manifest['linux']['version']}", file=output)
+            print(f"alpine-version={manifest['alpine']['version']}", file=output)
+            print(f"ubuntu-version={manifest['ubuntu']['version']}", file=output)
+            print(f"azurelinux-version={manifest['azurelinux']['version']}", file=output)
+            print(f"azurelinux-image={manifest['azurelinux']['image']}", file=output)
+        PY
+
+    - name: Resolve guest cache keys
+      id: guest-cache-keys
+      shell: bash
+      env:
+        KERNEL_VERSION: ${{ steps.guest-versions.outputs.kernel-version }}
+        ALPINE_VERSION: ${{ steps.guest-versions.outputs.alpine-version }}
+        UBUNTU_VERSION: ${{ steps.guest-versions.outputs.ubuntu-version }}
+        AZURELINUX_VERSION: ${{ steps.guest-versions.outputs.azurelinux-version }}
+        KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/patches/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
+        DEBUG_KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/config-microvm-debug', 'kernel/patches/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
+        ALPINE_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/alpine/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py') }}
+        UBUNTU_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/ubuntu/**', 'ubuntu/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py', 'scripts/nvx_tools/ubuntu.py') }}
+        AZURELINUX_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'azurelinux/**', 'docker/Dockerfile', 'scripts/nvx_tools/azurelinux.py', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py') }}
+      run: |
+        set -euo pipefail
+        {
+          echo "kernel=linux-kernel-v1-${KERNEL_VERSION}-${KERNEL_INPUT_HASH}"
+          echo "kernel-debug=linux-kernel-debug-v1-${KERNEL_VERSION}-${DEBUG_KERNEL_INPUT_HASH}"
+          echo "alpine=alpine-image-v1-${ALPINE_VERSION}-${ALPINE_INPUT_HASH}"
+          echo "ubuntu=ubuntu-initramfs-v1-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
+          echo "ubuntu-distro=ubuntu-distro-v1-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
+          echo "azurelinux=azurelinux-initramfs-v1-${AZURELINUX_VERSION}-${AZURELINUX_INPUT_HASH}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Restore Linux kernel (zstd)
+      id: cache-linux-kernel-zstd
+      if: inputs.guest-images == 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          build/vmlinux
+          build/vmlinux.config
+          build/vmlinux.provenance.json
+        key: ${{ steps.guest-cache-keys.outputs.kernel }}
+        enableCrossOsArchive: true
+
+    - name: Restore Alpine disk image (zstd)
+      id: cache-alpine-image-zstd
+      if: inputs.guest-images == 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          build/initramfs.cpio.gz
+          build/initramfs.cpio.gz.packages.json
+          build/initramfs.provenance.json
+        key: ${{ steps.guest-cache-keys.outputs.alpine }}
+        enableCrossOsArchive: true
+
+    - name: Restore Ubuntu initramfs (zstd)
+      id: cache-ubuntu-initramfs-zstd
+      if: inputs.guest-images == 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          build/initramfs-ubuntu.cpio.gz
+          build/initramfs-ubuntu.cpio.gz.packages.json
+        key: ${{ steps.guest-cache-keys.outputs.ubuntu }}
+        enableCrossOsArchive: true
+
+    - name: Restore Ubuntu distro layer (zstd)
+      id: cache-ubuntu-distro-zstd
+      if: inputs.guest-images == 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          build/ubuntu-distro.erofs
+          build/ubuntu-distro.erofs.manifest.json
+        key: ${{ steps.guest-cache-keys.outputs.ubuntu-distro }}
+        enableCrossOsArchive: true
+
+    - name: Restore Azure Linux initramfs (zstd)
+      id: cache-azurelinux-initramfs-zstd
+      if: inputs.guest-images == 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          build/initramfs-azurelinux.cpio.gz
+          build/initramfs-azurelinux.cpio.gz.packages.json
+        key: ${{ steps.guest-cache-keys.outputs.azurelinux }}
+        enableCrossOsArchive: true
+
+    - name: Build Linux kernel (Docker)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
+      shell: bash
+      run: >-
+        docker build
+        --file docker/Dockerfile
+        --target kernel-artifacts
+        --output type=local,dest=build
+        .
+
+    - name: Save Linux kernel (zstd)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          build/vmlinux
+          build/vmlinux.config
+          build/vmlinux.provenance.json
+        key: ${{ steps.guest-cache-keys.outputs.kernel }}
+        enableCrossOsArchive: true
+
+    - name: Restore Linux debug kernel (zstd)
+      id: cache-linux-debug-kernel-zstd
+      if: inputs.debug-kernel == 'true'
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          build/vmlinux-debug
+          build/vmlinux-debug.config
+          build/vmlinux-debug.provenance.json
+        key: ${{ steps.guest-cache-keys.outputs.kernel-debug }}
+        enableCrossOsArchive: true
+
+    - name: Build Linux debug kernel (Docker)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.debug-kernel == 'true' &&
+        steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
+      shell: bash
+      run: >-
+        docker build
+        --file docker/Dockerfile
+        --target kernel-debug-artifacts
+        --output type=local,dest=build
+        .
+
+    - name: Save Linux debug kernel (zstd)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.debug-kernel == 'true' &&
+        steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          build/vmlinux-debug
+          build/vmlinux-debug.config
+          build/vmlinux-debug.provenance.json
+        key: ${{ steps.guest-cache-keys.outputs.kernel-debug }}
+        enableCrossOsArchive: true
+
+    - name: Build Alpine disk image (Docker)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
+      shell: bash
+      run: >-
+        docker build
+        --file docker/Dockerfile
+        --target initramfs-artifacts
+        --output type=local,dest=build
+        .
+
+    - name: Save Alpine disk image (zstd)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          build/initramfs.cpio.gz
+          build/initramfs.cpio.gz.packages.json
+          build/initramfs.provenance.json
+        key: ${{ steps.guest-cache-keys.outputs.alpine }}
+        enableCrossOsArchive: true
+
+    - name: Build Ubuntu initramfs (Docker)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
+      shell: bash
+      run: >-
+        docker build
+        --file docker/Dockerfile
+        --target ubuntu-initramfs-artifacts
+        --output type=local,dest=build
+        .
+
+    - name: Verify Ubuntu artifact determinism (Docker)
+      if: >-
+        inputs.restore-only != 'true' &&
+        (
+          inputs.guest-images == 'true' &&
+          (
+            steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' ||
+            steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+          )
+        )
+      shell: bash
+      run: >-
+        docker build
+        --file docker/Dockerfile
+        --target ubuntu-determinism
+        .
+
+    - name: Save Ubuntu initramfs (zstd)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          build/initramfs-ubuntu.cpio.gz
+          build/initramfs-ubuntu.cpio.gz.packages.json
+        key: ${{ steps.guest-cache-keys.outputs.ubuntu }}
+        enableCrossOsArchive: true
+
+    - name: Build Azure Linux initramfs (Docker)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        AZURELINUX_IMAGE: ${{ steps.guest-versions.outputs.azurelinux-image }}
+        AZURELINUX_VERSION: ${{ steps.guest-versions.outputs.azurelinux-version }}
+      run: >-
+        docker build
+        --file docker/Dockerfile
+        --target azurelinux-initramfs-artifacts
+        --build-arg AZURELINUX_IMAGE="${AZURELINUX_IMAGE}"
+        --build-arg AZURELINUX_VERSION="${AZURELINUX_VERSION}"
+        --output type=local,dest=build
+        .
+
+    - name: Save Azure Linux initramfs (zstd)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          build/initramfs-azurelinux.cpio.gz
+          build/initramfs-azurelinux.cpio.gz.packages.json
+        key: ${{ steps.guest-cache-keys.outputs.azurelinux }}
+        enableCrossOsArchive: true
+
+    - name: Build Ubuntu distro layer (Docker)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+      shell: bash
+      run: >-
+        docker build
+        --file docker/Dockerfile
+        --target ubuntu-distro-layer-artifacts
+        --output type=local,dest=build
+        .
+
+    - name: Save Ubuntu distro layer (zstd)
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.guest-images == 'true' &&
+        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          build/ubuntu-distro.erofs
+          build/ubuntu-distro.erofs.manifest.json
+        key: ${{ steps.guest-cache-keys.outputs.ubuntu-distro }}
+        enableCrossOsArchive: true
+
+    - name: Prepare Ubuntu sandbox scratch template
+      if: inputs.guest-images == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p build
+        rm -f build/ubuntu-smoke-scratch.ext4
+        truncate --size 64M build/ubuntu-smoke-scratch.ext4
+        mkfs.ext4 -q -F -m 0 \
+          -U 4f3c8bf7-1959-47b4-8811-62b17bbddaf4 \
+          -E lazy_itable_init=0,lazy_journal_init=0 \
+          build/ubuntu-smoke-scratch.ext4
