@@ -1,3 +1,7 @@
+> This repository is a verified twin of the
+> [OpenVMM repository](https://github.com/microsoft/openvmm). See
+> [VERIFICATION.md](VERIFICATION.md) for instructions on verifying its code.
+
 # OpenVMM
 
 [![Build Status](https://github.com/microsoft/openvmm/actions/workflows/openvmm-ci.yaml/badge.svg?branch=main)](https://github.com/microsoft/openvmm/actions/workflows/openvmm-ci.yaml)

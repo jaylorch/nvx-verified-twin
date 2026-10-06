@@ -78,6 +78,8 @@ edition = "2024"
 version = "0.2.0"
 
 [workspace.dependencies]
+vstd = { path = "../verus/source/vstd" }
+
 xtask_fuzz = { path = "xtask/xtask_fuzz" }
 
 # opentmk
@@ -780,7 +782,10 @@ unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "forbid"
 
 # TODO: Needed for xshell compatibility, fixed in v0.2.7
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trick_rust_analyzer_into_highlighting_interpolated_bits)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(trick_rust_analyzer_into_highlighting_interpolated_bits)',
+  'cfg(verus_only)',
+] }
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
