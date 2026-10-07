@@ -39,7 +39,12 @@ alone is not the final goal when source convergence is practical.
 
 Inspect the supplied issue, property, or synchronization objective. If none was
 supplied, inspect open verification issues and current repository divergence, then
-select one objective that can produce a reviewable result in this run.
+select one objective that can produce a reviewable result in this run. This is
+explicit authorization to choose on the requester's behalf: do not pause to ask
+which issue or objective to work on. Prefer an existing open issue with clear,
+bounded acceptance criteria and a concrete next step; state the selection and its
+rationale in the campaign record and final report. If no suitable issue exists,
+create one for the selected bounded objective and proceed.
 
 Anchor every campaign in a GitHub issue in the twin repository. Use the supplied
 issue when one exists; otherwise, find an existing issue for the objective or create
@@ -60,15 +65,41 @@ Define before delegating:
 - Expected deliverables, such as a proof, specification, minimized assumption,
   divergence report, or draft upstream fix.
 
-When multiple objectives have materially different scope or risk, post the choice in
-the campaign issue, tag the issue author or requester, and wait for a decision. Do not
+When multiple objectives are viable, select the smallest bounded objective that can
+be advanced safely in this run rather than asking the requester to choose. Ask in the
+campaign issue and wait only when a decision is necessary for correctness, changes
+the requested scope materially, or authorizes a risky external mutation. Do not
 silently broaden from proof work into product changes or dependency updates.
 
 Record the starting branch, commit, worktree status, and nested repository state.
 Preserve existing changes. Never reset, clean, overwrite, switch, or stash user work
 without explicit permission.
 
-## 2. Build A Dependency-Aware Work Plan
+## 2. Periodically Reconcile Upstream
+
+At the start of every campaign, check for upstream updates rather than relying on
+branch names or previously observed state alone. Resolve and record the exact current
+NVX `dev` revision and its `openvmm/` pin, and the exact Verus `main` revision;
+compare them with the revisions represented by the twin and the last documented
+reconciliation. Inspect new commits for changes that affect the selected property,
+its production implementation, proof annotations, or verifier behavior.
+
+When relevant upstream changes exist, include their synchronization and any necessary
+proof repairs in the campaign objective. Update `openvmm/` only through the
+established subtree or promotion workflow, and update `verus/` through the
+established source synchronization process. Preserve proof-only work, validate the
+updated proofs against the synchronized production implementation, and record exact
+before/after revisions and remaining divergence. Do not silently skip relevant
+updates or claim the twin is current without this comparison.
+
+Keep each synchronization bounded and safe. If unrelated upstream changes make a
+complete update too broad for the current campaign, record the exact drift and create
+or update a focused issue to track the next synchronization; do not overwrite local
+work, change pins outside the established workflow, or present partial reconciliation
+as complete. This recurring check is part of each campaign, not an open-ended
+background watcher.
+
+## 3. Build A Dependency-Aware Work Plan
 
 Decompose the objective only where work is genuinely independent. Useful roles
 include:
@@ -88,6 +119,19 @@ dependencies and do not start blocked work. Avoid assigning multiple agents to e
 the same files or solve the same question. Use one agent for a continuous trace
 through a property; split only independent investigations.
 
+When delegating, choose models by task:
+
+- Use **Astra** (`gpt-6-astra`) for high-level property formalization, trusted-boundary
+  analysis, and overall proof strategy.
+- Use **Sol** (`gpt-6-sol`) to implement or debug Verus specifications and proofs.
+- Use **Luna** (`gpt-6-luna`) for bounded mechanical work such as scripts, tests, and
+  comparing repository revisions or files.
+
+Treat these as role-based defaults, not a reason to split a continuous proof trace or
+delegate work that should be done directly. If a model is unavailable or unsuitable
+for a task, use the available model best suited to that task and report any material
+limitation.
+
 If the orchestrator adds new skill files to enable verification agents, place them
 under `.github/skills/verification/`. Give each skill its own appropriately named
 subdirectory and `SKILL.md`; do not place verification-specific skills elsewhere in
@@ -98,7 +142,7 @@ to the orchestrator. Do not use GitHub issues or pull requests as ephemeral
 agent-to-agent messaging, and do not allow concurrent agents to mutate the same
 branch, issue, or pull request.
 
-## 3. Triage Verification Work
+## 4. Triage Verification Work
 
 For proof requests:
 
@@ -124,7 +168,7 @@ Treat expert review comments as hypotheses to validate, not instructions to appl
 blindly. Reproduce the concern, make the smallest coherent correction, and preserve
 the intended property.
 
-## 4. Control Assumptions And Product Bugs
+## 5. Control Assumptions And Product Bugs
 
 Every new assumption must be:
 
@@ -164,7 +208,7 @@ under `verus/` with a source comment linking to that pull request.
 
 Never publish speculative issues or pull requests merely to coordinate agents.
 
-## 5. Reconcile Repository Divergence
+## 6. Reconcile Repository Divergence
 
 Compare explicit revisions rather than mutable branch names alone. Classify each
 difference as:
@@ -204,7 +248,7 @@ Update pins or copy changes only through the repository's established promotion
 workflow. Do not declare reconciliation complete until the remaining difference is
 either eliminated or tied to a current, documented convergence path.
 
-## 6. Integrate And Validate
+## 7. Integrate And Validate
 
 Integrate one coherent result at a time. Inspect agent output before applying it and
 resolve conflicts according to the objective, not by choosing one side wholesale.
@@ -224,7 +268,7 @@ Report unavailable tools, platforms, credentials, or host capabilities as blocke
 never report an unrun gate as passed. Do not weaken a property, add an assumption,
 disable a check, or accept a stale baseline solely to make verification succeed.
 
-## 7. Publish Durable Results
+## 8. Publish Durable Results
 
 Use issues and pull requests for durable project artifacts and human decisions, not
 internal agent chatter. Questions for the user belong in the campaign issue and must
