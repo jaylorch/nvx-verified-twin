@@ -88,6 +88,11 @@ dependencies and do not start blocked work. Avoid assigning multiple agents to e
 the same files or solve the same question. Use one agent for a continuous trace
 through a property; split only independent investigations.
 
+If the orchestrator adds new skill files to enable verification agents, place them
+under `.github/skills/verification/`. Give each skill its own appropriately named
+subdirectory and `SKILL.md`; do not place verification-specific skills elsewhere in
+`.github/skills/`.
+
 The orchestrator owns integration and all shared state. Agents report results directly
 to the orchestrator. Do not use GitHub issues or pull requests as ephemeral
 agent-to-agent messaging, and do not allow concurrent agents to mutate the same
