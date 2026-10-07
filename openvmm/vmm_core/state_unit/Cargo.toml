@@ -7,6 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+vstd.workspace = true
 vmcore.workspace = true
 
 inspect = { workspace = true, features = ["defer"] }
@@ -23,6 +24,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 test_with_tracing.workspace = true
+
+[package.metadata.verus]
+verify = true
 
 [lints]
 workspace = true

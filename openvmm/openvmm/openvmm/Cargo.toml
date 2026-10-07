@@ -56,7 +56,6 @@ embed-resource.workspace = true
 ignored = [
   "ms-tcg-tpm-sys",
   "ms-tpm-20-ref",
-  "vstd", # Available for incremental Verus instrumentation.
 ]
 
 [package.metadata.verus]

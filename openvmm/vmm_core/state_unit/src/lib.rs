@@ -30,6 +30,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(verus_only)]
+use vstd::prelude::*;
+
 mod advance_time;
 mod inventory;
 pub mod quiesce;

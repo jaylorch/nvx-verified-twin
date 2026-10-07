@@ -1,7 +1,8 @@
 # Verifying OpenVMM with Verus
 
-This repository is configured to verify the `openvmm` package using the Verus
-source code in the sibling `verus` directory.
+This repository is configured to run Cargo Verus directly on the `openvmm` and
+`state_unit` packages using the Verus source code in the sibling `verus`
+directory.
 
 ## Set up external build packages
 
@@ -42,7 +43,21 @@ Run Verus after updating files in the repository. From the repository root:
 cd openvmm
 PATH="../verus/source/target-verus/release:$PATH" \
   cargo verus verify -p openvmm --no-default-features
+
+PATH="../verus/source/target-verus/release:$PATH" \
+  cargo verus verify -p state_unit
 ```
 
-The package depends on `vstd` and opts into Cargo Verus verification, but it
-does not yet contain Verus specifications or proof annotations.
+The `openvmm` package depends on `vstd` and opts into Cargo Verus verification,
+but it does not yet contain Verus specifications or proof annotations.
+
+`state_unit` is also opted in, but **a successful package-level command does
+not prove `extract`**. A direct `verus!` wrapper around the unchanged helper
+currently fails: Verus ignores `StateTransitionError` and `UnitErrorSet`,
+which are declared outside the macro, and reports `anyhow::Error` as an
+unsupported type. A local experiment with external type specifications for
+these types still failed because Verus does not support private fields in
+transparent external type specifications (it suggested `external_body`, which
+would introduce a trusted boundary). The iterator and `FnMut` proof obligations
+were therefore not reached. No production helper replacement or trusted
+assumption is retained.

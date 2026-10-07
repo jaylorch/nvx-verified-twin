@@ -8141,6 +8141,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tracing",
  "vmcore",
+ "vstd",
 ]
 
 [[package]]
