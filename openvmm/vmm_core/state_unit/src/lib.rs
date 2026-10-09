@@ -30,6 +30,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(verus_only))]
+use vstd::prelude::verus;
 #[cfg(verus_only)]
 use vstd::prelude::*;
 
@@ -416,13 +418,16 @@ pub struct SavedStateUnit {
     pub state: SavedStateBlob,
 }
 
+verus! {
 /// An error from a state transition.
 #[derive(Debug, Error)]
+#[verifier::external_derive]
 #[error("{op} failed")]
 pub struct StateTransitionError {
     op: &'static str,
     #[source]
     errors: UnitErrorSet,
+}
 }
 
 fn extract<T, E: Into<anyhow::Error>, U>(
@@ -460,8 +465,10 @@ fn check<E: Into<anyhow::Error>>(
     Ok(())
 }
 
-#[derive(Debug)]
-struct UnitErrorSet(Vec<(Arc<str>, anyhow::Error)>);
+verus! {
+    #[derive(Debug)]
+    struct UnitErrorSet(Vec<(Arc<str>, anyhow::Error)>);
+}
 
 impl Display for UnitErrorSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

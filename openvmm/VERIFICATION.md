@@ -71,13 +71,31 @@ cannot panic, terminate, or safely unwind. Its postcondition applies on normal
 return. The example is not the production `extract` implementation, and its
 `verus_only` module is not exercised by ordinary package tests.
 
-The unchanged `extract` still cannot be wrapped directly in `verus!`:
-`StateTransitionError` and `UnitErrorSet` are outside the macro; moving the
-derived error type inside requires unsupported `thiserror`/formatting
-specifications, while opaque specifications for those types prohibit the
-production struct constructor. The iterator and `FnMut` obligations are
-unreached. No production helper replacement or `external_body` annotation
-on `extract` is retained.
+`StateTransitionError` and `UnitErrorSet` are inside `verus!` and remain
+transparent with their private fields and real constructor: no external type
+specification or assumption was added for either type.
+`#[verifier::external_derive]` on `StateTransitionError` excludes its
+generated Debug, Error, and Display implementations from verification,
+leaving their Rust behavior untouched. This is needed because thiserror's
+derived formatting invokes unsupported functions, and Verus does not
+recognize the generated `std::error::Error` trait implementation.
+
+**The production `extract` is not yet wrapped or proved.** A temporary
+wrapper around the actual body, with only a match-arm comma added for Verus
+parsing, got past the error types but failed two automatic loop invariants
+(at loop entry and exit). A minimal `fn consume<I: IntoIterator>` with an
+empty `for` body fails the same invariants; the same body over `Vec<u64>`
+verifies. Generic `IntoIterator::into_iter` currently supplies no contract
+that its resulting iterator satisfies vstd's prophetic iterator laws or has
+a decreasing measure. Suppressing the automatic invariants would not
+establish those requirements: arbitrary Rust iterators need not terminate,
+so this failure alone is not evidence of a verifier bug. Explicit lawful,
+finite-iterator preconditions and concrete caller witnesses are the next
+local proof avenue. The temporary wrapper was removed to keep
+the package gate green. Callback `FnMut` contracts and a postcondition
+relating results to the input sequence remain future proof work; no
+`external_body` annotation on `extract`, blanket iterator assumption,
+or shadow extraction implementation is retained.
 
 ## Verified LAPIC tick conversion
 
