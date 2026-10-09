@@ -88,8 +88,9 @@ external type specification with `external_body` **only on the type shell**:
 `SavedStateBlob` has a private `ProtobufAny` field
 (`vm/vmcore/src/save_restore.rs`), so transparent type support failed.
 It grants no constructor, clone, bytes, parse, or encoding properties.
-`verification/assumptions/arc_str_display.rs` adds one narrow trusted
-stdlib contract connecting vstd's uninterpreted generic
+The reusable `vstd::string::group_string_axioms` now supplies the same
+one-way trusted standard-library text law formerly local to
+`verification/assumptions/arc_str_display.rs`, connecting vstd's uninterpreted generic
 `to_string_from_display_ensures::<Arc<str>>` to logical text equality for
 every `Arc<str>` and resulting `String`. Both the native and Verus gates use
 installed Rust 1.98.1 (`48a229ceaefd4985c50990b14116b6d856af0985`).
@@ -101,7 +102,10 @@ preserves text under ToString's default width and precision
 Unicode text equality with vstd's existing generic contract alone. This
 library axiom is a new trusted boundary requiring independent review; no
 target/helper behavior is assumed, and no pointer or byte-encoding claim
-follows from it.
+follows from it. This is a pending Verus library change in the twin, tracked
+for human handoff and independent review in #13; relocating the axiom
+does not verify the standard-library implementation or reduce trust. The
+removal of the redundant OpenVMM-local axiom is tracked in #16.
 
 The production collection/match/return algorithm and private error fields
 are unchanged; the one callback call is now bound to a local before the

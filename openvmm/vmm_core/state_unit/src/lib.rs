@@ -42,9 +42,6 @@ mod anyhow_error;
 #[path = "../../../verification/specs/anyhow_error_example.rs"]
 mod anyhow_error_example;
 #[cfg(verus_only)]
-#[path = "../../../verification/assumptions/arc_str_display.rs"]
-mod arc_str_display;
-#[cfg(verus_only)]
 #[path = "../../../verification/assumptions/saved_state_blob.rs"]
 mod saved_state_blob;
 #[cfg(verus_only)]
@@ -548,7 +545,7 @@ fn saved_state_unit(
         ensures out.state == state, out.name@ == name@,
     {
         proof {
-            broadcast use arc_str_display::arc_str_display_text;
+            broadcast use vstd::string::group_string_axioms;
         }
         SavedStateUnit {
             name: name.to_string(),
