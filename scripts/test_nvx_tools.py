@@ -11247,6 +11247,18 @@ class SandboxTests(unittest.TestCase):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_benchmark_environment_controls_snapshot_profiling(self):
+        with patch.dict(
+            os.environ, {benchmark.SNAPSHOT_PROFILE_ENV: "inherited"}, clear=True
+        ):
+            self.assertEqual(
+                benchmark._benchmark_environment(False), {"OPENVMM_LOG": "off"}
+            )
+            self.assertEqual(
+                benchmark._benchmark_environment(True),
+                {"OPENVMM_LOG": "off", benchmark.SNAPSHOT_PROFILE_ENV: "1"},
+            )
+
     def test_kvm_worker_result_decoding(self):
         completed = subprocess.CompletedProcess(
             ["worker"],

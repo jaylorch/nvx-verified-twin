@@ -136,6 +136,13 @@ LEGACY_PYTHON_LOG_FILENAMES = ("snapshot.log", "snapshot-hello.log")
 BENCHMARK_METADATA_FILENAME = "benchmark-metadata.json"
 
 
+def _benchmark_environment(snapshot_profile: bool) -> dict[str, str]:
+    environment = {**os.environ, "OPENVMM_LOG": "off"}
+    environment.pop(SNAPSHOT_PROFILE_ENV, None)
+    environment.update({SNAPSHOT_PROFILE_ENV: "1"} if snapshot_profile else {})
+    return environment
+
+
 class ProfiledResult(TypedDict, total=False):
     profile: LifecycleProfileSummary
 
@@ -1976,11 +1983,7 @@ def benchmark(
     snapshot_profile: bool = False,
     before_each: Callable[[], None] | None = None,
 ) -> BenchmarkResult:
-    environment = os.environ.copy()
-    environment["OPENVMM_LOG"] = "off"
-    environment.pop(SNAPSHOT_PROFILE_ENV, None)
-    if snapshot_profile:
-        environment[SNAPSHOT_PROFILE_ENV] = "1"
+    environment = _benchmark_environment(snapshot_profile)
 
     def measure(
         profile_sink: list[dict[str, object]] | None = None,
@@ -3816,11 +3819,7 @@ def benchmark_snapshot_restore_memory_workload(
 ) -> None:
     snapshot_profile = bool(getattr(args, "snapshot_profile", False))
     capacity_mib = RESTORE_MEMORY_TARGETS_MIB[-1]
-    environment = os.environ.copy()
-    environment["OPENVMM_LOG"] = "off"
-    environment.pop(SNAPSHOT_PROFILE_ENV, None)
-    if snapshot_profile:
-        environment[SNAPSHOT_PROFILE_ENV] = "1"
+    environment = _benchmark_environment(snapshot_profile)
 
     print(
         "snapshot restore memory activation, "
