@@ -55,15 +55,29 @@ The `openvmm` package depends on `vstd` and opts into Cargo Verus verification,
 but it does not yet contain Verus specifications or proof annotations.
 
 `state_unit` is also opted in, but **a successful package-level command does
-not prove `extract`**. A direct `verus!` wrapper around the unchanged helper
-currently fails: Verus ignores `StateTransitionError` and `UnitErrorSet`,
-which are declared outside the macro, and reports `anyhow::Error` as an
-unsupported type. A local experiment with external type specifications for
-these types still failed because Verus does not support private fields in
-transparent external type specifications (it suggested `external_body`, which
-would introduce a trusted boundary). The iterator and `FnMut` proof obligations
-were therefore not reached. No production helper replacement or trusted
-assumption is retained.
+not prove `extract`**. The `anyhow::Error` type barrier is removed by the
+opaque external type specification in
+`verification/assumptions/anyhow_error.rs`. Its trusted source is anyhow
+1.0.99 (`src/lib.rs` and `src/error.rs`); Verus cannot inspect the private
+representation of that external crate, and a transparent external type
+specification fails on private fields. Opacity provides *only* type support:
+no error contents, constructors, conversion results, or panic freedom are
+assumed. The separate verified case in
+`verification/specs/anyhow_error_example.rs` conditionally collects a real
+`anyhow::Error` through a generic `Into` conversion and proves the resulting
+error count (1 verified, 0 errors). This uses vstd's existing generic `Into`
+contract; it does not establish that arbitrary user-defined conversions
+cannot panic, terminate, or safely unwind. Its postcondition applies on normal
+return. The example is not the production `extract` implementation, and its
+`verus_only` module is not exercised by ordinary package tests.
+
+The unchanged `extract` still cannot be wrapped directly in `verus!`:
+`StateTransitionError` and `UnitErrorSet` are outside the macro; moving the
+derived error type inside requires unsupported `thiserror`/formatting
+specifications, while opaque specifications for those types prohibit the
+production struct constructor. The iterator and `FnMut` obligations are
+unreached. No production helper replacement or `external_body` annotation
+on `extract` is retained.
 
 ## Verified LAPIC tick conversion
 

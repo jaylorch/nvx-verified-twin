@@ -33,6 +33,13 @@
 #[cfg(verus_only)]
 use vstd::prelude::*;
 
+#[cfg(verus_only)]
+#[path = "../../../verification/assumptions/anyhow_error.rs"]
+mod anyhow_error;
+#[cfg(verus_only)]
+#[path = "../../../verification/specs/anyhow_error_example.rs"]
+mod anyhow_error_example;
+
 mod advance_time;
 mod inventory;
 pub mod quiesce;
