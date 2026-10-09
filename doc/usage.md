@@ -667,7 +667,7 @@ python3 scripts/nvx.py benchmark [OPTIONS]
 | `--snapshot-profile` | off | Retain OpenVMM lifecycle phase samples and host counters; implied by the `snapshot-profile` suite. |
 | `--cache-state {warm,cold,both}` | `both` | Select artifact cache states for the `snapshot-profile` suite. |
 | `--output PATH` | none | Write the benchmark result as JSON. |
-| `--output-dir PATH` | none | Write canonical workload logs to a directory. |
+| `--output-dir PATH` | generated for `performance` and `device-io`; required for `device-restore-profile`; none otherwise | Write canonical workload logs to a directory. `performance` defaults to `data/runs/<platform>-microvm-v2-<processors>vcpu`; `device-io` defaults to `data/runs/<platform>/microvm-v2/1vcpu/device-io`. |
 | `--scratch-dir PATH` | system temporary directory | Select an existing directory for temporary snapshots, guest RAM backing, and workload files. |
 | `--keep-kvm-stage` | off | Keep temporary staged KVM benchmark binaries. |
 
