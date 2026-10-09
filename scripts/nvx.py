@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -1020,6 +1021,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         except ScriptError as error:
             raise argparse.ArgumentTypeError(str(error)) from error
 
+    def sandbox_timeout(value: str) -> float:
+        timeout = float(value)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise argparse.ArgumentTypeError(
+                "control operation timeout must be positive and finite"
+            )
+        return timeout
+
     sandbox.add_argument(
         "sandbox_operation",
         nargs="?",
@@ -1050,7 +1059,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sandbox.add_argument("--memory-mib", type=int, default=256)
     sandbox.add_argument(
         "--timeout",
-        type=float,
+        type=sandbox_timeout,
         default=60.0,
         help="control operation timeout in seconds (default: 60)",
     )

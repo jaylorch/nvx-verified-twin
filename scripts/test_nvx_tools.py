@@ -1079,6 +1079,19 @@ class CliTests(unittest.TestCase):
                     lifecycle.assert_not_called()
                     self.assertEqual(marker.read_text(encoding="utf-8"), "preserved")
 
+    def test_sandbox_rejects_nonpositive_and_nonfinite_control_timeouts(self):
+        for timeout in ("0", "-1", "nan", "inf"):
+            with self.subTest(timeout=timeout), self.assertRaises(SystemExit):
+                nvx.parse_args(
+                    ["sandbox", "start", "--state-dir", "state", "--timeout", timeout]
+                )
+        self.assertEqual(
+            nvx.parse_args(
+                ["sandbox", "start", "--state-dir", "state", "--timeout", "0.5"]
+            ).timeout,
+            0.5,
+        )
+
     def test_sandbox_exec_forwards_explicit_empty_environment_and_cwd(self):
         with tempfile.TemporaryDirectory() as temporary:
             environment_file = Path(temporary) / "environment.json"
