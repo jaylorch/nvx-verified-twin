@@ -481,15 +481,18 @@ def _count_line_suffix(output: bytes, marker: bytes) -> int:
     return sum(line.endswith(marker) for line in _output_lines(output))
 
 
+def _require_single_marker(values: Sequence[bytes], prefix: bytes) -> bytes:
+    count = len(values)
+    if count != 1:
+        raise RuntimeError(f"expected exactly one {prefix!r} marker, found {count}")
+    return values[0]
+
+
 def _single_marker_value(output: bytes, prefix: bytes) -> bytes:
     values = [
         line[len(prefix) :] for line in _output_lines(output) if line.startswith(prefix)
     ]
-    if len(values) != 1:
-        raise RuntimeError(
-            f"expected exactly one {prefix!r} marker, found {len(values)}"
-        )
-    return values[0]
+    return _require_single_marker(values, prefix)
 
 
 def _single_framed_marker_value(output: bytes, prefix: bytes, suffix: bytes) -> bytes:
@@ -505,11 +508,7 @@ def _single_framed_marker_value(output: bytes, prefix: bytes, suffix: bytes) -> 
             raise RuntimeError(f"malformed {prefix!r} marker")
         values.append(output[value_start:value_end])
         offset = value_end + len(suffix)
-    if len(values) != 1:
-        raise RuntimeError(
-            f"expected exactly one {prefix!r} marker, found {len(values)}"
-        )
-    return values[0]
+    return _require_single_marker(values, prefix)
 
 
 def _parse_marker_pair(output: bytes, prefix: bytes) -> tuple[int, int]:
