@@ -5,6 +5,8 @@
 use alloc::str::Chars;
 #[cfg(all(feature = "alloc", not(verus_verify_core)))]
 use alloc::string::{self, String, ToString};
+#[cfg(all(feature = "alloc", not(verus_verify_core)))]
+use alloc::sync::Arc;
 #[cfg(all(verus_keep_ghost, not(verus_verify_core)))]
 use core::ops::{Bound, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
 #[cfg(all(verus_keep_ghost, not(verus_verify_core)))]
@@ -178,6 +180,15 @@ pub broadcast proof fn to_string_from_display_ensures_for_str(t: &str, res: Stri
     admit();
 }
 
+/// Trusted standard-library text law: `Arc<str>` forwards `Display` to its
+/// inner `str`, whose default formatting preserves its Unicode text.
+/// This does not specify arbitrary `Display` values or the converse implication.
+#[cfg(all(feature = "alloc", not(verus_verify_core)))]
+pub broadcast axiom fn to_string_from_display_ensures_for_arc_str(t: &Arc<str>, res: String)
+    ensures
+        #[trigger] to_string_from_display_ensures::<Arc<str>>(t, res) ==> res@ == (**t)@,
+;
+
 #[cfg(all(feature = "alloc", not(verus_verify_core)))]
 pub assume_specification<T: core::fmt::Display + ?Sized>[ <T as ToString>::to_string ](
     t: &T,
@@ -333,6 +344,7 @@ pub broadcast group group_string_axioms {
     axiom_str_literal_len,
     axiom_str_literal_get_char,
     to_string_from_display_ensures_for_str,
+    to_string_from_display_ensures_for_arc_str,
     is_ascii_spec_bytes,
     is_ascii_concat,
 }

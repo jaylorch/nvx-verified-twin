@@ -572,6 +572,36 @@ test_verify_one_file! {
 }
 
 test_verify_one_file! {
+    #[test] test_arc_str_to_string_text verus_code! {
+        use std::sync::Arc;
+        use vstd::prelude::*;
+        use vstd::string::group_string_axioms;
+
+        fn arc_str_text(name: &Arc<str>) -> (rendered: String)
+            ensures rendered@ == (**name)@,
+        {
+            broadcast use group_string_axioms;
+            name.to_string()
+        }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_arc_str_to_string_false_postcondition verus_code! {
+        use std::sync::Arc;
+        use vstd::prelude::*;
+        use vstd::string::group_string_axioms;
+
+        fn wrong_arc_str_text(name: &Arc<str>) -> (rendered: String)
+            ensures rendered@ != (**name)@, // FAILS
+        {
+            broadcast use group_string_axioms;
+            name.to_string()
+        }
+    } => Err(err) => assert_one_fails(err)
+}
+
+test_verify_one_file! {
     #[test] test_string_1_pass verus_code! {
         use vstd::string::*;
         fn test() {
