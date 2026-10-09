@@ -75,6 +75,12 @@ value fits `u64`, and `None` when it does not. The proof also discharges the
 production arithmetic's intermediate overflow and division-by-zero obligations.
 The production body is unchanged apart from erased proof blocks.
 
+The reusable `lapic_ticks_fit_backend_rate` lemma proves that a valid divide
+and an LAPIC rate at most 1 GHz always yield `Some(ticks)` with
+`ticks <= downtime_ns`, for every `u64` downtime. This establishes the
+arithmetic no-overflow condition for the supported backend rates. The lemma
+does not yet verify that the snapshot caller supplies those validated inputs.
+
 The additional trusted boundary is the generic `u32::is_power_of_two` contract
 in `verification/assumptions/u32_is_power_of_two.rs`, necessary because the
 vendored `vstd` does not specify this method. It models Rust's standard-library
