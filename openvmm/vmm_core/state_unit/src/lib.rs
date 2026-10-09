@@ -41,6 +41,14 @@ mod anyhow_error;
 #[cfg(verus_only)]
 #[path = "../../../verification/specs/anyhow_error_example.rs"]
 mod anyhow_error_example;
+#[cfg(verus_only)]
+#[path = "../../../verification/specs/state_unit_extract.rs"]
+mod state_unit_extract;
+
+#[cfg(not(verus_only))]
+use std::iter::Iterator as ExtractIteratorSpec;
+#[cfg(verus_only)]
+use vstd::std_specs::iter::IteratorSpec as ExtractIteratorSpec;
 
 mod advance_time;
 mod inventory;
@@ -430,22 +438,63 @@ pub struct StateTransitionError {
 }
 }
 
-fn extract<T, E: Into<anyhow::Error>, U>(
+verus! {
+#[verifier::exec_allows_no_decreases_clause]
+fn extract<T, E: Into<anyhow::Error>, U, I, F>(
     op: &'static str,
-    iter: impl IntoIterator<Item = (Arc<str>, Result<T, E>)>,
-    mut f: impl FnMut(Arc<str>, T) -> Option<U>,
-) -> Result<Vec<U>, StateTransitionError> {
+    iter: I,
+    f: F,
+) -> (ret: Result<Vec<U>, StateTransitionError>)
+    where
+        I: Iterator<Item = (Arc<str>, Result<T, E>)> + ExtractIteratorSpec,
+        F: Fn(Arc<str>, T) -> Option<U>,
+    requires
+        iter.obeys_prophetic_iter_laws(),
+        forall |name: Arc<str>, value: T| #[trigger] f.requires((name, value)),
+    ensures
+        ret.is_ok() == (state_unit_extract::error_names(iter.remaining()).len() == 0),
+        match ret {
+            Ok(_) => true,
+            Err(ref failure) =>
+                failure.op == op &&
+                state_unit_extract::collected_names(failure.errors.0@)
+                    == state_unit_extract::error_names(iter.remaining()),
+        },
+{
+    let ghost input_seq = iter.remaining();
     let mut result = Vec::new();
     let mut errors = Vec::new();
-    for (name, item) in iter {
+    for (name, item) in loop_state: iter
+        invariant
+            loop_state.iter.obeys_prophetic_iter_laws(),
+            loop_state.seq() == input_seq,
+            loop_state.history() == input_seq.take(loop_state.index()),
+            state_unit_extract::collected_names(errors@)
+                == state_unit_extract::error_names(loop_state.history()),
+            state_unit_extract::collected_names(errors@)
+                == state_unit_extract::error_names(input_seq.take(loop_state.index())),
+            forall |n: Arc<str>, value: T| #[trigger] f.requires((n, value)),
+    {
+        let ghost before = loop_state.history();
         match item {
             Ok(t) => {
                 if let Some(u) = f(name, t) {
                     result.push(u);
                 }
-            }
+            },
             Err(err) => errors.push((name, err.into())),
         }
+        proof {
+            state_unit_extract::error_names_push(before, (name, item));
+            assert(loop_state.history().push((name, item)) =~=
+                input_seq.take(loop_state.index() + 1));
+            assert(state_unit_extract::collected_names(errors@)
+                == state_unit_extract::error_names(input_seq.take(loop_state.index() + 1)));
+        }
+    }
+    proof {
+        assert(state_unit_extract::collected_names(errors@)
+            == state_unit_extract::error_names(input_seq));
     }
     if errors.is_empty() {
         Ok(result)
@@ -456,12 +505,13 @@ fn extract<T, E: Into<anyhow::Error>, U>(
         })
     }
 }
+}
 
 fn check<E: Into<anyhow::Error>>(
     op: &'static str,
     iter: impl IntoIterator<Item = (Arc<str>, Result<(), E>)>,
 ) -> Result<(), StateTransitionError> {
-    extract(op, iter, |_, _| Some(()))?;
+    extract(op, iter.into_iter(), |_, _| Some(()))?;
     Ok(())
 }
 
@@ -604,7 +654,7 @@ impl StateUnits {
             )
             .await;
 
-        let states = extract("save", r, |name, state| {
+        let states = extract("save", r.into_iter(), |name, state| {
             state.map(|state| SavedStateUnit {
                 name: name.to_string(),
                 state,
@@ -1074,6 +1124,7 @@ impl Ready {
 
 #[cfg(test)]
 mod tests {
+    mod extract;
     mod inventory;
     mod quiesce;
     mod start;

@@ -54,8 +54,33 @@ PATH="../verus/source/target-verus/release:$PATH" \
 The `openvmm` package depends on `vstd` and opts into Cargo Verus verification,
 but it does not yet contain Verus specifications or proof annotations.
 
-`state_unit` is also opted in, but **a successful package-level command does
-not prove `extract`**. The `anyhow::Error` type barrier is removed by the
+`state_unit` verifies the actual `extract` loop for one bounded property:
+on normal return, the error case retains the original operation and the
+exact ordered sequence of failed input `Arc<str>` names, including duplicates;
+it returns `Ok` exactly when that sequence is empty. The reusable fold and
+error-name projection are in `verification/specs/state_unit_extract.rs`.
+Name equality here is Verus logical equality, not an `Arc::ptr_eq`
+allocation-identity theorem.
+The production collection/match/return algorithm and private error fields
+are unchanged. The private boundary was narrowed from `IntoIterator` to
+`Iterator` and from `FnMut` to `Fn`, with explicit `.into_iter()` at the
+`check` and `save` calls. This is a **modified-twin signature**, not a proof
+of the unchanged upstream signature; issue #16 tracks convergence. Native
+regression tests exercise callback effects after errors and real error
+conversion, but no callback invocation trace is exported by the theorem.
+
+The theorem requires `IteratorSpec::obeys_prophetic_iter_laws()` for the
+particular iterator and the callback's `Fn::requires` for every input name
+and success value; `Fn` alone does not imply purity or totality. A verified
+`Vec::into_iter()`/`Fn` witness calls the actual loop, with concrete ordered
+errors separated by a successful item and duplicate-name witnesses. The
+actual `check` and `save` caller obligations are **not** verified: in
+particular the `save` callback's preconditions and its saved blob output
+relation are not established here. The theorem neither proves a result
+vector, callback invocation history, error contents after `Into<anyhow::Error>`,
+termination, panic freedom, nor snapshot correctness.
+
+The `anyhow::Error` type barrier is removed by the
 opaque external type specification in
 `verification/assumptions/anyhow_error.rs`. Its trusted source is anyhow
 1.0.99 (`src/lib.rs` and `src/error.rs`); Verus cannot inspect the private
@@ -80,22 +105,9 @@ leaving their Rust behavior untouched. This is needed because thiserror's
 derived formatting invokes unsupported functions, and Verus does not
 recognize the generated `std::error::Error` trait implementation.
 
-**The production `extract` is not yet wrapped or proved.** A temporary
-wrapper around the actual body, with only a match-arm comma added for Verus
-parsing, got past the error types but failed two automatic loop invariants
-(at loop entry and exit). A minimal `fn consume<I: IntoIterator>` with an
-empty `for` body fails the same invariants; the same body over `Vec<u64>`
-verifies. Generic `IntoIterator::into_iter` currently supplies no contract
-that its resulting iterator satisfies vstd's prophetic iterator laws or has
-a decreasing measure. Suppressing the automatic invariants would not
-establish those requirements: arbitrary Rust iterators need not terminate,
-so this failure alone is not evidence of a verifier bug. Explicit lawful,
-finite-iterator preconditions and concrete caller witnesses are the next
-local proof avenue. The temporary wrapper was removed to keep
-the package gate green. Callback `FnMut` contracts and a postcondition
-relating results to the input sequence remain future proof work; no
-`external_body` annotation on `extract`, blanket iterator assumption,
-or shadow extraction implementation is retained.
+The `Iterator` narrowing avoids an uncontracted generic
+`IntoIterator::into_iter` step inside the proof. No `external_body` on
+`extract`, blanket iterator axiom, or substitute extraction body was added.
 
 ## Verified LAPIC tick conversion
 
