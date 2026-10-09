@@ -2,7 +2,7 @@
 name: orchestrate-verification
 description: "Coordinate a bounded OpenVMM verification campaign in the NVX verified twin. Use to triage verification issues, delegate independent Verus proof work, reconcile NVX or Verus divergence, and integrate validated results."
 argument-hint: "<issue, property, or synchronization objective>"
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # Orchestrate Verification
