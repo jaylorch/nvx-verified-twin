@@ -73,12 +73,26 @@ The theorem requires `IteratorSpec::obeys_prophetic_iter_laws()` for the
 particular iterator and the callback's `Fn::requires` for every input name
 and success value; `Fn` alone does not imply purity or totality. A verified
 `Vec::into_iter()`/`Fn` witness calls the actual loop, with concrete ordered
-errors separated by a successful item and duplicate-name witnesses. The
-actual `check` and `save` caller obligations are **not** verified: in
-particular the `save` callback's preconditions and its saved blob output
-relation are not established here. The theorem neither proves a result
-vector, callback invocation history, error contents after `Into<anyhow::Error>`,
-termination, panic freedom, nor snapshot correctness.
+errors separated by a successful item and duplicate-name witnesses.
+The actual `check` wrapper also verifies delegation to `extract`: on normal
+return it yields `Ok(())` iff its initial iterator has no failed items;
+otherwise it preserves `op` and the exact ordered failure names. The
+`|_, _| Some(())` closure's callable obligation is discharged in that proof.
+Precondition-free witnesses call the actual `check` with empty, ordered-error,
+and duplicate-name `Vec::into_iter()` inputs.
+
+`check` now takes a lawful `Iterator + IteratorSpec` rather than generic
+`IntoIterator` because the latter supplies no general conversion contract
+for the resulting iterator's sequence and prophetic laws. Three existing
+`Vec` call sites use `.into_iter()` explicitly. Existing mapped iterators in
+`advance_time` and restore remain streaming, without collection or added
+allocation. This is another **modified-twin private signature**; issue #16
+tracks convergence for both narrowed boundaries. The actual reset, restore,
+advance-time, and save caller obligations are **not** verified: in particular
+the mapped-iterator and `run_op` contracts and the `save` callback's
+preconditions and saved blob relation remain unproved. The theorems do not
+prove a result vector, callback invocation history, error contents after
+`Into<anyhow::Error>`, termination, panic freedom, or snapshot correctness.
 
 The `anyhow::Error` type barrier is removed by the
 opaque external type specification in

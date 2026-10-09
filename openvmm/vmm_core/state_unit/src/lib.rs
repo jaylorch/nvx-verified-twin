@@ -507,12 +507,18 @@ fn extract<T, E: Into<anyhow::Error>, U, I, F>(
 }
 }
 
-fn check<E: Into<anyhow::Error>>(
+verus! {
+fn check<E: Into<anyhow::Error>, I>(
     op: &'static str,
-    iter: impl IntoIterator<Item = (Arc<str>, Result<(), E>)>,
-) -> Result<(), StateTransitionError> {
-    extract(op, iter.into_iter(), |_, _| Some(()))?;
+    iter: I,
+) -> (ret: Result<(), StateTransitionError>)
+    where I: Iterator<Item = (Arc<str>, Result<(), E>)> + ExtractIteratorSpec,
+    requires iter.obeys_prophetic_iter_laws(),
+    ensures state_unit_extract::check_post(op, iter, ret),
+{
+    extract(op, iter, |_, _| Some(()))?;
     Ok(())
+}
 }
 
 verus! {
@@ -630,7 +636,7 @@ impl StateUnits {
             )
             .await;
 
-        check("reset", r)?;
+        check("reset", r.into_iter())?;
         Ok(())
     }
 
@@ -702,7 +708,7 @@ impl StateUnits {
             }
         }
 
-        check("restore", r)?;
+        check("restore", r.into_iter())?;
 
         let r = self
             .run_op(
@@ -726,7 +732,7 @@ impl StateUnits {
                 .map(|(_, (name, _))| (name, Err(RestoreUnitError::Unknown))),
         )?;
 
-        check("restore", r)?;
+        check("restore", r.into_iter())?;
 
         Ok(())
     }
