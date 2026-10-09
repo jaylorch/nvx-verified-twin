@@ -5,6 +5,12 @@
 
 use super::TimeAbiCode;
 use super::TimeAbiError;
+use vstd::prelude::*;
+
+#[path = "../../../../verification/specs/lapic_ticks.rs"]
+mod lapic_ticks_spec;
+#[path = "../../../../verification/assumptions/u32_is_power_of_two.rs"]
+mod u32_is_power_of_two;
 
 /// The accepted deviation of the destination TSC rate from the declared one.
 pub const TSC_TOLERANCE_PPM: u32 = 250;
@@ -16,8 +22,10 @@ pub const MAX_TSC_HZ: u64 = 10_000_000_000;
 pub const LAPIC_HZ_KVM: u64 = 1_000_000_000;
 /// The LAPIC timer rate on MSHV and WHP.
 pub const LAPIC_HZ_HYPERV: u64 = 200_000_000;
+verus! {
 /// The largest LAPIC divide-configuration value.
 pub const MAX_LAPIC_DIVIDE: u32 = 128;
+}
 
 /// Checks that `hz` is a plausible TSC rate.
 pub fn check_plausible_tsc_hz(hz: u64) -> Result<(), TimeAbiError> {
@@ -125,18 +133,32 @@ pub fn apply_rate_offset(native_hz: u64, offset_ppm: i32) -> Result<u64, TimeAbi
     })
 }
 
+verus! {
 /// Returns the LAPIC ticks of a counting-mode one-shot timer over
 /// `downtime_ns`: `floor(D * L / 1_000_000_000 / divide)`.
 ///
 /// `divide` is the divide-configuration value, a power of two from 1 to
 /// [`MAX_LAPIC_DIVIDE`]; other values return `None`.
-pub fn lapic_ticks(downtime_ns: u64, apic_hz: u64, divide: u32) -> Option<u64> {
+pub fn lapic_ticks(downtime_ns: u64, apic_hz: u64, divide: u32) -> (result: Option<u64>)
+    ensures lapic_ticks_spec::lapic_ticks_post(downtime_ns, apic_hz, divide, result)
+{
+    proof {
+        assert(
+            (divide != 0 && (divide & ((divide as int - 1) as u32)) == 0
+                && divide <= MAX_LAPIC_DIVIDE)
+                == lapic_ticks_spec::valid_lapic_divide(divide)
+        ) by (bit_vector);
+    }
     if !divide.is_power_of_two() || divide > MAX_LAPIC_DIVIDE {
         return None;
+    }
+    proof {
+        assert((downtime_ns as int) * (apic_hz as int) <= u128::MAX as int) by (nonlinear_arith);
     }
     let ticks =
         u128::from(downtime_ns) * u128::from(apic_hz) / (1_000_000_000 * u128::from(divide));
     u64::try_from(ticks).ok()
+}
 }
 
 /// Divides with rounding to nearest, ties away from zero. `den` must be
