@@ -324,8 +324,9 @@ starts in its requested working directory, or `/` without one, and that a
 missing, non-directory, or inaccessible working directory fails the launch.
 They also map temporary host directories read-only, read-write, and denied,
 and check egress defaults and
-rules against the network gateway, which needs no Internet access. The command requires
-Cargo and `openvmm/target/release/openvmm[.exe]`, and writes the OpenVMM log to
+rules against the network gateway, which needs no Internet access. The command uses
+the `cargo` executable by default; select another with `--cargo`. It also requires
+`openvmm/target/release/openvmm[.exe]` and writes the OpenVMM log to
 `--output-dir` (default `build/test-results/aci_edge_sandboxes`) when the test fails.
 The sandboxes keep their state in a temporary directory, which the command deletes
 only once every sandbox has been deprovisioned. If the test is interrupted or fails
