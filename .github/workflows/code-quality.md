@@ -8,7 +8,7 @@ on:
   skip-if-match:
     query: 'is:pr is:open "gh-aw-workflow-id: code-quality" in:body'
     max: 1
-if: github.event_name != 'workflow_dispatch' || github.ref_name == 'dev'
+if: github.event_name != 'workflow_dispatch' || github.ref_name == 'main'
 permissions:
   contents: read
   issues: read
@@ -100,3 +100,13 @@ belongs to `code-deduplication`, and reusing an existing helper belongs to
 
 In the pull request body, name the problem, the triggering input or code path,
 and the regression test or other evidence that proves the fix.
+
+## Incomplete runs
+
+If an infrastructure or tool failure prevents completion, including a failed
+`create_pull_request` submission, use the configured `report_incomplete` safe
+output with the specific failure reason and diagnostic details; do not use
+`noop` for a blocked run. Discover the available commands with
+`safeoutputs --help` and inspect `safeoutputs report_incomplete --help` before
+invoking it. Do not infer that the tool is missing from the compiled manifest
+or report it through `missing_tool` without checking the runtime CLI.
