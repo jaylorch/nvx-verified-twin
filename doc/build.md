@@ -103,6 +103,13 @@ build/ubuntu-distro.erofs
 build/ubuntu-distro.erofs.manifest.json
 ```
 
+Azure Linux adds:
+
+```text
+build/initramfs-azurelinux.cpio.gz
+build/initramfs-azurelinux.cpio.gz.packages.json
+```
+
 Prepare the Ubuntu sandbox layer separately on Linux without replacing an
 existing output:
 
