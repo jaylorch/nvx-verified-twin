@@ -454,7 +454,8 @@ fn extract<T, E: Into<anyhow::Error>, U, I, F>(
     ensures
         ret.is_ok() == (state_unit_extract::error_names(iter.remaining()).len() == 0),
         match ret {
-            Ok(_) => true,
+            Ok(ref values) =>
+                state_unit_extract::outputs_allowed(iter.remaining(), f, values@),
             Err(ref failure) =>
                 failure.op == op &&
                 state_unit_extract::collected_names(failure.errors.0@)
@@ -464,6 +465,7 @@ fn extract<T, E: Into<anyhow::Error>, U, I, F>(
     let ghost input_seq = iter.remaining();
     let mut result = Vec::new();
     let mut errors = Vec::new();
+    let ghost mut choices = Seq::<Option<U>>::empty();
     for (name, item) in loop_state: iter
         invariant
             loop_state.iter.obeys_prophetic_iter_laws(),
@@ -473,19 +475,36 @@ fn extract<T, E: Into<anyhow::Error>, U, I, F>(
                 == state_unit_extract::error_names(loop_state.history()),
             state_unit_extract::collected_names(errors@)
                 == state_unit_extract::error_names(input_seq.take(loop_state.index())),
+            state_unit_extract::choices_valid(loop_state.history(), f, choices),
+            state_unit_extract::choices_valid(input_seq.take(loop_state.index()), f, choices),
+            result@ == state_unit_extract::filtered_choices(choices),
             forall |n: Arc<str>, value: T| #[trigger] f.requires((n, value)),
     {
         let ghost before = loop_state.history();
+        let ghost before_choices = choices;
         match item {
             Ok(t) => {
-                if let Some(u) = f(name, t) {
+                let mapped = f(name, t);
+                proof {
+                    state_unit_extract::filtered_choices_push(before_choices, mapped);
+                    choices = choices.push(mapped);
+                }
+                if let Some(u) = mapped {
                     result.push(u);
                 }
             },
-            Err(err) => errors.push((name, err.into())),
+            Err(err) => {
+                errors.push((name, err.into()));
+                proof {
+                    state_unit_extract::filtered_choices_push(before_choices, None);
+                    choices = choices.push(None);
+                }
+            },
         }
         proof {
             state_unit_extract::error_names_push(before, (name, item));
+            assert(state_unit_extract::choices_valid(
+                input_seq.take(loop_state.index() + 1), f, choices));
             assert(loop_state.history().push((name, item)) =~=
                 input_seq.take(loop_state.index() + 1));
             assert(state_unit_extract::collected_names(errors@)
@@ -495,6 +514,8 @@ fn extract<T, E: Into<anyhow::Error>, U, I, F>(
     proof {
         assert(state_unit_extract::collected_names(errors@)
             == state_unit_extract::error_names(input_seq));
+        assert(state_unit_extract::choices_valid(input_seq, f, choices));
+        assert(state_unit_extract::outputs_allowed(input_seq, f, result@));
     }
     if errors.is_empty() {
         Ok(result)

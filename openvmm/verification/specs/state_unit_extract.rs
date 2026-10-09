@@ -39,6 +39,52 @@ verus! {
         errors.map(|_: int, pair: (Arc<str>, anyhow::Error)| pair.0)
     }
 
+    pub open spec fn filtered_choices<U>(choices: Seq<Option<U>>) -> Seq<U> {
+        choices.filter_map(|choice: Option<U>| choice)
+    }
+
+    pub proof fn filtered_choices_push<U>(choices: Seq<Option<U>>, choice: Option<U>)
+        ensures
+            filtered_choices(choices.push(choice)) ==
+                match choice {
+                    Some(value) => filtered_choices(choices).push(value),
+                    None => filtered_choices(choices),
+                },
+    {
+        reveal_with_fuel(Seq::filter_map, 2);
+        assert(choices.push(choice).drop_last() =~= choices);
+        assert(choices.push(choice).last() == choice);
+        if let Some(value) = choice {
+            assert(filtered_choices(choices) + seq![value] =~=
+                filtered_choices(choices).push(value));
+        }
+    }
+
+    pub open spec fn choices_valid<T, E, U, F>(
+        input: Seq<(Arc<str>, Result<T, E>)>,
+        f: F,
+        choices: Seq<Option<U>>,
+    ) -> bool
+        where F: Fn(Arc<str>, T) -> Option<U>,
+    {
+        choices.len() == input.len()
+        && forall |i: int| 0 <= i < input.len() ==> match input[i].1 {
+            Ok(value) => f.ensures((input[i].0, value), #[trigger] choices[i]),
+            Err(_) => #[trigger] choices[i] is None,
+        }
+    }
+
+    pub open spec fn outputs_allowed<T, E, U, F>(
+        input: Seq<(Arc<str>, Result<T, E>)>,
+        f: F,
+        outputs: Seq<U>,
+    ) -> bool
+        where F: Fn(Arc<str>, T) -> Option<U>,
+    {
+        exists |choices: Seq<Option<U>>| #![auto]
+            choices_valid(input, f, choices) && outputs == filtered_choices(choices)
+    }
+
     #[verifier::prophetic]
     pub(super) open spec fn check_post<E, I>(
         op: &'static str,
@@ -187,5 +233,95 @@ verus! {
             ]) == seq![name, repeated]) by (compute);
         }
         super::check("reset", input.into_iter())
+    }
+
+    fn empty_output_witness() -> (ret: Result<Vec<u64>, super::StateTransitionError>)
+        ensures ret matches Ok(ref values) && values@ == Seq::<u64>::empty(),
+    {
+        let input: Vec<(Arc<str>, Result<u64, anyhow::Error>)> = Vec::new();
+        let f = |_: Arc<str>, value: u64| -> (out: Option<u64>)
+            ensures out == if value % 2 == 0 { Some(value) } else { None },
+        {
+            if value % 2 == 0 { Some(value) } else { None }
+        };
+        super::extract("save", input.into_iter(), f)
+    }
+
+    fn some_none_output_witness(
+        odd_name: Arc<str>,
+        even_name: Arc<str>,
+    ) -> (ret: Result<Vec<u64>, super::StateTransitionError>)
+        ensures ret matches Ok(ref values) && values@ == seq![4u64],
+    {
+        let mut input: Vec<(Arc<str>, Result<u64, anyhow::Error>)> = Vec::new();
+        input.push((odd_name, Ok(3)));
+        input.push((even_name, Ok(4)));
+        let ghost initial = input@;
+        let f = |_: Arc<str>, value: u64| -> (out: Option<u64>)
+            ensures out == if value % 2 == 0 { Some(value) } else { None },
+        {
+            if value % 2 == 0 { Some(value) } else { None }
+        };
+        let ret = super::extract("save", input.into_iter(), f);
+        proof {
+            assert(initial =~= seq![(odd_name, Ok(3u64)), (even_name, Ok(4u64))]);
+            assert(error_names::<u64, anyhow::Error>(
+                seq![(odd_name, Ok(3u64)), (even_name, Ok(4u64))])
+                == Seq::<Arc<str>>::empty()) by (compute);
+            if let Ok(ref values) = ret {
+                let ghost choices = choose |choices: Seq<Option<u64>>| #![auto]
+                    choices_valid(initial, f, choices) && values@ == filtered_choices(choices);
+                assert(choices[0] == None);
+                assert(choices[1] == Some(4u64));
+                assert(choices =~= seq![None, Some(4u64)]);
+                assert(filtered_choices(seq![None, Some(4u64)]) == seq![4u64]) by (compute);
+                assert(values@ == seq![4u64]);
+            }
+        }
+        ret
+    }
+
+    fn ordered_values_witness(
+        first_name: Arc<str>,
+        skipped_name: Arc<str>,
+        last_name: Arc<str>,
+    ) -> (ret: Result<Vec<u64>, super::StateTransitionError>)
+        ensures ret matches Ok(ref values) && values@ == seq![8u64, 6u64],
+    {
+        let mut input: Vec<(Arc<str>, Result<u64, anyhow::Error>)> = Vec::new();
+        input.push((first_name, Ok(8)));
+        input.push((skipped_name, Ok(5)));
+        input.push((last_name, Ok(6)));
+        let ghost initial = input@;
+        let f = |_: Arc<str>, value: u64| -> (out: Option<u64>)
+            ensures out == if value % 2 == 0 { Some(value) } else { None },
+        {
+            if value % 2 == 0 { Some(value) } else { None }
+        };
+        let ret = super::extract("save", input.into_iter(), f);
+        proof {
+            assert(initial =~= seq![
+                (first_name, Ok(8u64)),
+                (skipped_name, Ok(5u64)),
+                (last_name, Ok(6u64)),
+            ]);
+            assert(error_names::<u64, anyhow::Error>(seq![
+                (first_name, Ok(8u64)),
+                (skipped_name, Ok(5u64)),
+                (last_name, Ok(6u64)),
+            ]) == Seq::<Arc<str>>::empty()) by (compute);
+            if let Ok(ref values) = ret {
+                let ghost choices = choose |choices: Seq<Option<u64>>| #![auto]
+                    choices_valid(initial, f, choices) && values@ == filtered_choices(choices);
+                assert(choices[0] == Some(8u64));
+                assert(choices[1] == None);
+                assert(choices[2] == Some(6u64));
+                assert(choices =~= seq![Some(8u64), None, Some(6u64)]);
+                assert(filtered_choices(seq![Some(8u64), None, Some(6u64)])
+                    == seq![8u64, 6u64]) by (compute);
+                assert(values@ == seq![8u64, 6u64]);
+            }
+        }
+        ret
     }
 }

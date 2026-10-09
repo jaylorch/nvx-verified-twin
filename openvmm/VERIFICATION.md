@@ -54,15 +54,24 @@ PATH="../verus/source/target-verus/release:$PATH" \
 The `openvmm` package depends on `vstd` and opts into Cargo Verus verification,
 but it does not yet contain Verus specifications or proof annotations.
 
-`state_unit` verifies the actual `extract` loop for one bounded property:
-on normal return, the error case retains the original operation and the
+`state_unit` verifies the actual `extract` loop for two bounded properties.
+On normal return, the error case retains the original operation and the
 exact ordered sequence of failed input `Arc<str>` names, including duplicates;
 it returns `Ok` exactly when that sequence is empty. The reusable fold and
 error-name projection are in `verification/specs/state_unit_extract.rs`.
+For a successful return, the Vec contains exactly the ordered `Some` choices
+from an input-length sequence: every failed input contributes `None`, and
+each successful input's choice satisfies `f.ensures` for its name and value.
+Thus callback results may vary between invocations; this is a relational
+contract, not a purity or determinism claim. Its strength depends on the
+caller's explicit `Fn` postcondition. Verified real-Vec/annotated-Fn witnesses
+establish exact empty, Some/None, and ordered `[8, 6]` output cases.
 Name equality here is Verus logical equality, not an `Arc::ptr_eq`
 allocation-identity theorem.
 The production collection/match/return algorithm and private error fields
-are unchanged. The private boundary was narrowed from `IntoIterator` to
+are unchanged; the one callback call is now bound to a local before the
+original `if let` to ghost-record its returned choice. The private boundary
+was narrowed from `IntoIterator` to
 `Iterator` and from `FnMut` to `Fn`, with explicit `.into_iter()` at the
 `check` and `save` calls. This is a **modified-twin signature**, not a proof
 of the unchanged upstream signature; issue #16 tracks convergence. Native
@@ -91,7 +100,7 @@ tracks convergence for both narrowed boundaries. The actual reset, restore,
 advance-time, and save caller obligations are **not** verified: in particular
 the mapped-iterator and `run_op` contracts and the `save` callback's
 preconditions and saved blob relation remain unproved. The theorems do not
-prove a result vector, callback invocation history, error contents after
+prove callback invocation/effect history, error contents after
 `Into<anyhow::Error>`, termination, panic freedom, or snapshot correctness.
 
 The `anyhow::Error` type barrier is removed by the
