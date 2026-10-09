@@ -68,6 +68,41 @@ caller's explicit `Fn` postcondition. Verified real-Vec/annotated-Fn witnesses
 establish exact empty, Some/None, and ordered `[8, 6]` output cases.
 Name equality here is Verus logical equality, not an `Arc::ptr_eq`
 allocation-identity theorem.
+The actual `save` callback expression is now factored into private
+`saved_state_unit`, with a verified None/Some contract: None remains None;
+Some produces a unit whose String has the same logical Unicode text as the
+original `Arc<str>` and whose opaque blob is the original logical value.
+A real Vec/that-function callback witness proves that two saved units remain
+ordered around a filtered None, including exact name text and logical blob equality.
+This helper is an active proof-enabling **twin-only source refactor**, tracked
+for convergence in #16, not verification of unchanged upstream source. It
+does not verify the async `save` invocation, `run_op`, or serialization.
+The native Unicode/None/blob regression additionally exercises actual
+encoding and parsing for two concrete saved states; that test is not a
+universal serialization proof.
+
+`SavedStateUnit` now uses `#[verifier::external_derive]` around its Protobuf
+derive; its real fields remain transparent but generated serialization is
+excluded. `verification/assumptions/saved_state_blob.rs` adds an opaque
+external type specification with `external_body` **only on the type shell**:
+`SavedStateBlob` has a private `ProtobufAny` field
+(`vm/vmcore/src/save_restore.rs`), so transparent type support failed.
+It grants no constructor, clone, bytes, parse, or encoding properties.
+`verification/assumptions/arc_str_display.rs` adds one narrow trusted
+stdlib contract connecting vstd's uninterpreted generic
+`to_string_from_display_ensures::<Arc<str>>` to logical text equality for
+every `Arc<str>` and resulting `String`. Both the native and Verus gates use
+installed Rust 1.98.1 (`48a229ceaefd4985c50990b14116b6d856af0985`).
+Its source shows Arc's
+`Display` delegates to the inner `str` (`alloc/src/sync.rs`), `str::Display`
+preserves text under ToString's default width and precision
+(`core/src/fmt/mod.rs`), and `ToString` formats via Display
+(`alloc/src/string.rs`). The unmodified `name.to_string()` could not prove
+Unicode text equality with vstd's existing generic contract alone. This
+library axiom is a new trusted boundary requiring independent review; no
+target/helper behavior is assumed, and no pointer or byte-encoding claim
+follows from it.
+
 The production collection/match/return algorithm and private error fields
 are unchanged; the one callback call is now bound to a local before the
 original `if let` to ghost-record its returned choice. The private boundary
@@ -99,7 +134,7 @@ allocation. This is another **modified-twin private signature**; issue #16
 tracks convergence for both narrowed boundaries. The actual reset, restore,
 advance-time, and save caller obligations are **not** verified: in particular
 the mapped-iterator and `run_op` contracts and the `save` callback's
-preconditions and saved blob relation remain unproved. The theorems do not
+application to actual `run_op` output remain unproved. The theorems do not
 prove callback invocation/effect history, error contents after
 `Into<anyhow::Error>`, termination, panic freedom, or snapshot correctness.
 

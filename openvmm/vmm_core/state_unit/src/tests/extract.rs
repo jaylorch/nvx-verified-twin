@@ -3,11 +3,14 @@
 
 //! Tests for ordered state-transition result extraction.
 
+use super::SavedState;
 use crate::extract;
+use crate::saved_state_unit;
 use std::cell::RefCell;
 use std::io;
 use std::sync::Arc;
 use test_with_tracing::test;
+use vmcore::save_restore::SavedStateBlob;
 
 #[test]
 fn extraction_filters_successes_in_input_order() {
@@ -61,4 +64,28 @@ fn extraction_preserves_duplicate_errors_and_later_callbacks() {
     assert!(Arc::ptr_eq(&failure.errors.0[1].0, &duplicate));
     assert_eq!(failure.errors.0[0].1.to_string(), "first failure");
     assert_eq!(failure.errors.0[1].1.to_string(), "second failure");
+}
+
+#[test]
+fn saved_callback_preserves_unicode_names_and_opaque_blobs() {
+    let input: Vec<(Arc<str>, Result<Option<SavedStateBlob>, io::Error>)> = vec![
+        (
+            Arc::from("caf\u{e9} \u{1f980}"),
+            Ok(Some(SavedStateBlob::new(SavedState(true)))),
+        ),
+        (Arc::from("omitted \u{96ea}"), Ok(None)),
+        (
+            Arc::from("\u{6771}\u{4eac} \u{1f1ef}\u{1f1f5}"),
+            Ok(Some(SavedStateBlob::new(SavedState(false)))),
+        ),
+    ];
+
+    let units = extract("save", input.into_iter(), saved_state_unit).unwrap();
+    assert_eq!(units.len(), 2);
+    assert_eq!(units[0].name, "caf\u{e9} \u{1f980}");
+    assert_eq!(units[1].name, "\u{6771}\u{4eac} \u{1f1ef}\u{1f1f5}");
+    let first: SavedState = units[0].state.parse().unwrap();
+    let last: SavedState = units[1].state.parse().unwrap();
+    assert!(first.0);
+    assert!(!last.0);
 }

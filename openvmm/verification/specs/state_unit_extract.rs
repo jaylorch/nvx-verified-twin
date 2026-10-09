@@ -2,9 +2,23 @@
 // Licensed under the MIT License.
 
 use std::sync::Arc;
+use vmcore::save_restore::SavedStateBlob;
 use vstd::prelude::*;
 
 verus! {
+    /// Relates the original name's Unicode text and opaque blob to one saved unit.
+    pub open spec fn saved_state_mapping(
+        name: Arc<str>,
+        state: Option<SavedStateBlob>,
+        mapped: Option<super::SavedStateUnit>,
+    ) -> bool {
+        match (state, mapped) {
+            (None, None) => true,
+            (Some(blob), Some(unit)) => unit.name@ == name@ && unit.state == blob,
+            _ => false,
+        }
+    }
+
     /// Names of every failed item, preserving the input order and duplicates.
     pub open spec fn error_names<T, E>(
         input: Seq<(Arc<str>, Result<T, E>)>,
@@ -320,6 +334,54 @@ verus! {
                 assert(filtered_choices(seq![Some(8u64), None, Some(6u64)])
                     == seq![8u64, 6u64]) by (compute);
                 assert(values@ == seq![8u64, 6u64]);
+            }
+        }
+        ret
+    }
+
+    fn saved_callback_vec_witness(
+        first_name: Arc<str>,
+        skipped_name: Arc<str>,
+        last_name: Arc<str>,
+        first_blob: SavedStateBlob,
+        last_blob: SavedStateBlob,
+    ) -> (ret: Result<Vec<super::SavedStateUnit>, super::StateTransitionError>)
+        ensures
+            ret matches Ok(ref units)
+                && units@.len() == 2
+                && units@[0].name@ == first_name@
+                && units@[0].state == first_blob
+                && units@[1].name@ == last_name@
+                && units@[1].state == last_blob,
+    {
+        let mut input: Vec<(Arc<str>, Result<Option<SavedStateBlob>, anyhow::Error>)> = Vec::new();
+        input.push((first_name, Ok(Some(first_blob))));
+        input.push((skipped_name, Ok(None)));
+        input.push((last_name, Ok(Some(last_blob))));
+        let ghost initial = input@;
+        let f = super::saved_state_unit;
+        let ret = super::extract("save", input.into_iter(), f);
+        proof {
+            assert(initial =~= seq![
+                (first_name, Ok(Some(first_blob))),
+                (skipped_name, Ok(None)),
+                (last_name, Ok(Some(last_blob))),
+            ]);
+            assert(error_names::<Option<SavedStateBlob>, anyhow::Error>(seq![
+                (first_name, Ok(Some(first_blob))),
+                (skipped_name, Ok(None)),
+                (last_name, Ok(Some(last_blob))),
+            ]) == Seq::<Arc<str>>::empty()) by (compute);
+            if let Ok(ref units) = ret {
+                let ghost choices = choose |choices: Seq<Option<super::SavedStateUnit>>| #![auto]
+                    choices_valid(initial, f, choices) && units@ == filtered_choices(choices);
+                assert(choices[0] is Some);
+                assert(choices[1] is None);
+                assert(choices[2] is Some);
+                assert(choices =~= seq![choices[0], None, choices[2]]);
+                reveal_with_fuel(Seq::filter_map, 4);
+                assert(filtered_choices(choices) =~= seq![choices[0]->0, choices[2]->0]);
+                assert(units@ =~= seq![choices[0]->0, choices[2]->0]);
             }
         }
         ret

@@ -42,6 +42,12 @@ mod anyhow_error;
 #[path = "../../../verification/specs/anyhow_error_example.rs"]
 mod anyhow_error_example;
 #[cfg(verus_only)]
+#[path = "../../../verification/assumptions/arc_str_display.rs"]
+mod arc_str_display;
+#[cfg(verus_only)]
+#[path = "../../../verification/assumptions/saved_state_blob.rs"]
+mod saved_state_blob;
+#[cfg(verus_only)]
 #[path = "../../../verification/specs/state_unit_extract.rs"]
 mod state_unit_extract;
 
@@ -414,8 +420,10 @@ impl Inspect for Inner {
     }
 }
 
+verus! {
 /// The saved state for an individual unit.
 #[derive(Protobuf)]
+#[verifier::external_derive]
 #[mesh(package = "state_unit")]
 pub struct SavedStateUnit {
     /// The name of the state unit.
@@ -424,6 +432,7 @@ pub struct SavedStateUnit {
     /// The opaque saved state blob.
     #[mesh(2)]
     pub state: SavedStateBlob,
+}
 }
 
 verus! {
@@ -525,6 +534,27 @@ fn extract<T, E: Into<anyhow::Error>, U, I, F>(
             errors: UnitErrorSet(errors),
         })
     }
+}
+}
+
+verus! {
+fn saved_state_unit(
+    name: Arc<str>,
+    state: Option<SavedStateBlob>,
+) -> (ret: Option<SavedStateUnit>)
+    ensures state_unit_extract::saved_state_mapping(name, state, ret),
+{
+    state.map(|state: SavedStateBlob| -> (out: SavedStateUnit)
+        ensures out.state == state, out.name@ == name@,
+    {
+        proof {
+            broadcast use arc_str_display::arc_str_display_text;
+        }
+        SavedStateUnit {
+            name: name.to_string(),
+            state,
+        }
+    })
 }
 }
 
@@ -681,12 +711,7 @@ impl StateUnits {
             )
             .await;
 
-        let states = extract("save", r.into_iter(), |name, state| {
-            state.map(|state| SavedStateUnit {
-                name: name.to_string(),
-                state,
-            })
-        })?;
+        let states = extract("save", r.into_iter(), saved_state_unit)?;
 
         Ok(states)
     }
