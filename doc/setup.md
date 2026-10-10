@@ -178,6 +178,7 @@ Run all lint and formatting checks before submitting a change:
 
 ```bash
 python3 -m ruff check scripts .github/specula
+python3 -m compileall -q .github/specula
 shellcheck --shell=sh \
   guest/common/init guest/alpine/nvx-container-enter \
   guest/alpine/nvx-container-launch \
