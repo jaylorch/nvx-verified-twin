@@ -256,7 +256,8 @@ against the public OpenVMM CLI. Repeat `--scenario` to select a subset; without
 it, every scenario supported by the selected guest runs, except `smp-lapic`,
 which runs only when named: it repeats `smp` and also asserts that every CPU
 uses the one-shot counting LAPIC. Alpine remains the
-default. Ubuntu and Azure Linux cannot act as sandbox control, so they reject
+default. Guest RAM defaults to 128 MiB for Alpine and 512 MiB for Ubuntu or
+Azure Linux. Ubuntu and Azure Linux cannot act as sandbox control, so they reject
 the Alpine-control-only `sandbox-blocks` and `scratch-snapshot` scenarios and
 the sandbox-control-dependent `snapshot-tiers` scenario. Ubuntu also rejects
 the Alpine-prompt-specific `console-snapshot` scenario. `--debug-kernel` boots
