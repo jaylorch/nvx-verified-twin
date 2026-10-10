@@ -101,7 +101,10 @@ def load_package_lock(path: Path | None = None) -> tuple[AzureLinuxLockedPackage
 
 def package_lock_sha256(path: Path | None = None) -> str:
     path = path or package_lock_path()
-    contents = path.read_bytes().replace(b"\r\n", b"\n")
+    try:
+        contents = path.read_bytes().replace(b"\r\n", b"\n")
+    except OSError as error:
+        raise ScriptError(f"failed to read Azure Linux package lock: {path}") from error
     if b"\r" in contents:
         raise ScriptError(f"{path} contains unsupported carriage returns")
     return hashlib.sha256(contents).hexdigest()

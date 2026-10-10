@@ -6162,6 +6162,21 @@ class BuildTests(unittest.TestCase):
         )
         self.assertEqual(len(downloaded), len(packages))
 
+    def test_package_lock_hash_read_errors_are_actionable(self):
+        missing = Path("missing-package-lock.json")
+        cases = (
+            ("Azure Linux", azurelinux.package_lock_sha256),
+            ("Ubuntu", ubuntu.package_lock_sha256),
+        )
+        for label, package_lock_hash in cases:
+            with (
+                self.subTest(distribution=label),
+                self.assertRaisesRegex(
+                    common.ScriptError, f"failed to read {label} package lock"
+                ),
+            ):
+                package_lock_hash(missing)
+
     def test_ubuntu_manifest_and_package_lock_match_build_pins(self):
         manifest = json.loads(
             (BuildConstants.REPO_ROOT / "SOURCE-MANIFEST.json").read_text(
