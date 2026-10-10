@@ -499,6 +499,14 @@ class CliTests(unittest.TestCase):
             "initramfs-azurelinux.cpio.gz",
         )
 
+    def test_doctor_rejects_invalid_probe_timeouts(self):
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                nvx.parse_args(["doctor", "--backend", "kvm", "--timeout", value])
+
+        args = nvx.parse_args(["doctor", "--backend", "kvm", "--timeout", "0.25"])
+        self.assertEqual(args.timeout, 0.25)
+
     def test_run_help_and_usage_state_each_guest_memory_default(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit):

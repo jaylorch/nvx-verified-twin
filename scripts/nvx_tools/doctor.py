@@ -13,6 +13,7 @@ import argparse
 import ctypes
 import hashlib
 import itertools
+import math
 import os
 import platform
 import re
@@ -1105,6 +1106,13 @@ def default_probe_directory() -> Path:
     return BuildConstants.BUILD_DIR / "host-time-probe"
 
 
+def _positive_timeout(value: str) -> float:
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return timeout
+
+
 def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.description = (
         "Qualify this host for the NVX time ABI (doc/design/time-abi.md, "
@@ -1156,7 +1164,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=_positive_timeout,
         default=120.0,
         help="seconds allowed for each probe or guest (default: 120)",
     )
