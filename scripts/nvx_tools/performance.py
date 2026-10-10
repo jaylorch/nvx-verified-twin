@@ -1305,22 +1305,10 @@ def collect_openvmm_results(
     if not commit:
         raise PerformanceError("commit must not be empty")
     lifecycle = read_lifecycle_data(platform, input_path)
-    results = [
-        Result(
-            commit,
-            metric,
-            unit,
-            direction,
-            p50,
-            platform,
-            lifecycle.microvm_abi_version,
-            lifecycle.processors,
-        )
-        for metric, (unit, direction, p50) in sorted(lifecycle.metrics.items())
-    ]
     dimensions = BenchmarkDimensions(
         platform, lifecycle.microvm_abi_version, lifecycle.processors
     )
+    results = _build_results(commit, lifecycle.metrics, dimensions)
     output_path = output_dir / _result_filename(dimensions)
     write_results(output_path, results)
     if summary_path is not None:
@@ -1584,19 +1572,7 @@ def collect_results(
             + ")"
         )
 
-    results = [
-        Result(
-            commit,
-            metric,
-            unit,
-            direction,
-            p50,
-            platform,
-            dimensions.microvm_abi_version,
-            dimensions.processors,
-        )
-        for metric, (unit, direction, p50) in sorted(collected.items())
-    ]
+    results = _build_results(commit, collected, dimensions)
     output_path = output_dir / _result_filename(dimensions)
     write_results(output_path, results)
     if summary_path is not None:
@@ -1611,6 +1587,26 @@ def collect_results(
             )
     print(f"Collected {len(results)} p50 metric(s) for {platform}: {output_path}")
     return output_path
+
+
+def _build_results(
+    commit: str,
+    metrics: dict[str, MetricValue],
+    dimensions: BenchmarkDimensions,
+) -> list[Result]:
+    return [
+        Result(
+            commit,
+            metric,
+            unit,
+            direction,
+            p50,
+            dimensions.platform,
+            dimensions.microvm_abi_version,
+            dimensions.processors,
+        )
+        for metric, (unit, direction, p50) in sorted(metrics.items())
+    ]
 
 
 def _validate_current_results(path: Path, results: Sequence[Result]) -> None:
