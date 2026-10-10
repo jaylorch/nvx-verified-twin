@@ -850,7 +850,7 @@ python3 scripts/nvx.py package
 | Option | Description |
 | --- | --- |
 | `--version VERSION` | Override the packaged version. |
-| `--destination PATH` | Override the staging destination. |
+| `--destination PATH` | Override the staging destination, which defaults to `dist/<packaged-version>`. |
 | `--include-source` | Include the corresponding source artifacts in the package and omit the Azure Linux guest artifacts. |
 | `--binary-only` | Stage binaries only; publish corresponding source separately. |
 | `--force` | Replace an existing staging destination. |
