@@ -6303,6 +6303,18 @@ class BuildTests(unittest.TestCase):
                 ubuntu.erofs_uuid(second_digest),
             )
 
+    def test_ubuntu_rootfs_inventory_uses_relative_path_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "z").write_bytes(b"z")
+            (root / "a").mkdir()
+            (root / "a" / "nested").write_bytes(b"a")
+
+            self.assertEqual(
+                list(ubuntu.rootfs_inventory(root)),
+                ["a", "a/nested", "z"],
+            )
+
     def test_ubuntu_prepare_root_normalizes_root_directory_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             temporary_root = Path(temporary)
