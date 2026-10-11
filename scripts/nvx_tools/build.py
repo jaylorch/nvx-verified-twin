@@ -81,7 +81,12 @@ def _run_openvmm_command(
 def _assert_kernel_config(
     path: Path, required: tuple[str, ...], error_prefix: str
 ) -> None:
-    configured = set(path.read_text(encoding="utf-8").splitlines())
+    try:
+        configured = set(path.read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError) as error:
+        raise ScriptError(
+            f"failed to read kernel configuration {path}: {error}"
+        ) from error
     missing = [setting for setting in required if setting not in configured]
     if missing:
         raise ScriptError(error_prefix + ", ".join(missing))

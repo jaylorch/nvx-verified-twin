@@ -7267,6 +7267,16 @@ class BuildTests(unittest.TestCase):
                     with self.assertRaisesRegex(common.ScriptError, missing):
                         build._assert_sandbox_kernel_config(config)
 
+    def test_kernel_config_read_failure_is_script_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / ".config"
+            config.write_bytes(b"\xff")
+
+            with self.assertRaisesRegex(
+                common.ScriptError, f"failed to read kernel configuration {config}"
+            ):
+                build._assert_sandbox_kernel_config(config)
+
     def test_checked_in_config_preserves_generic_sandbox_capabilities(self):
         config = BuildConstants.REPO_ROOT / "kernel" / "config-microvm"
         build._assert_sandbox_kernel_config(config)
