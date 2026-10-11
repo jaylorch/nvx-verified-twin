@@ -101,7 +101,6 @@ nvx/
 |-- .dockerignore                Docker build-context exclusions
 |-- .gitattributes               Git path attributes
 |-- .gitignore                   Generated-file exclusions
-|-- .gitmodules                  OpenVMM submodule definition
 |-- LICENSE                      Repository license
 |-- pyproject.toml               Pyright and Ruff configuration
 |-- README.md                    Project overview and documentation index
@@ -214,7 +213,6 @@ covering those utilities.
 | `requirements-dev.txt` | Pinned Python tools used by contributors and CI |
 | `SOURCE-MANIFEST.json` | Exact Linux, Alpine, and Ubuntu source identities and output locations |
 | `VERSION` | Distribution version consumed by packaging tools |
-| `.gitmodules` | OpenVMM repository URL, path, and tracking branch |
 | `.gitignore` | Excludes build products, caches, virtual environments, logs, and platform metadata |
 | `.dockerignore` | Limits files sent to the Docker build context |
 | `.gitattributes` | Repository-specific Git attributes |
