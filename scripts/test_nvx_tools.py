@@ -1974,6 +1974,21 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             nvx.parse_args(["run", "--machine", "microvm-v3", "--dry-run"])
 
+    def test_run_rejects_nonpositive_memory_sizes(self):
+        for option, arguments in (
+            ("--memory-mib", ["--memory-mib", "0"]),
+            (
+                "--restore-memory-mib",
+                ["--restore-snapshot", "snapshot", "--restore-memory-mib", "-1"],
+            ),
+        ):
+            with self.subTest(option=option):
+                args = nvx.parse_args(["run", *arguments, "--dry-run"])
+                with self.assertRaisesRegex(
+                    common.ScriptError, rf"{option} must be positive"
+                ):
+                    nvx.command_run(args)
+
     def test_openvmm_command_passes_restore_choice_in_build_config(self):
         with patch.object(nvx, "build_openvmm") as build_openvmm:
             nvx.command_build_openvmm(argparse.Namespace(skip_restore=True))

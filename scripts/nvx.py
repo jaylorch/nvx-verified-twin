@@ -385,6 +385,8 @@ def command_run(args: argparse.Namespace) -> None:
         raise ScriptError("--restore-processors requires --restore-snapshot")
     if args.restore_memory_mib is not None and args.restore_snapshot is None:
         raise ScriptError("--restore-memory-mib requires --restore-snapshot")
+    if args.restore_memory_mib is not None and args.restore_memory_mib <= 0:
+        raise ScriptError("--restore-memory-mib must be positive")
     if args.memory_capacity_mib is not None and args.restore_snapshot is not None:
         raise ScriptError("--memory-capacity-mib is only valid for a fresh boot")
     descriptor = guest_descriptor(args.guest)
@@ -395,6 +397,8 @@ def command_run(args: argparse.Namespace) -> None:
     memory_mib = (
         descriptor.default_memory_mib if args.memory_mib is None else args.memory_mib
     )
+    if memory_mib <= 0:
+        raise ScriptError("--memory-mib must be positive")
     if args.memory_capacity_mib is not None and args.memory_capacity_mib < memory_mib:
         raise ScriptError("--memory-capacity-mib cannot be below --memory-mib")
     if args.restore_processors is not None:
