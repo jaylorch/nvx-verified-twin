@@ -80,6 +80,7 @@ nvx/
 |   |-- nvx_tools/               Python implementation behind the NVX CLI
 |   |   |-- benchmark.py         OpenVMM benchmark coordinator
 |   |   |-- benchmark_scripts/   Shell programs and benchmark templates
+|   |   |-- microvm_test_scripts/ Guest workloads for microVM test scenarios
 |   |   |-- build.py             Artifact build workflows
 |   |   |-- build_config.py      Per-invocation build configuration
 |   |   |-- build_constants.py   Grouped build pins, paths, and fixed defaults
