@@ -96,6 +96,7 @@ nvx/
 |   |   |-- ubuntu.py           Verified Ubuntu rootfs and EROFS preparation
 |   |   `-- create_linux_source_archive.py Linux source packaging
 |   |-- nvx_adversarial_executor.py Restricted adversarial executor entry point
+|   |-- publish_development_release.py CI development prerelease publisher
 |   |-- nvx.py                   Supported command-line entry point
 |   `-- test_*.py                Python tooling tests
 |-- .dockerignore                Docker build-context exclusions
