@@ -451,7 +451,7 @@ workspace there. A failed step would make Copilot skip every later setup step,
 so each step after checkout continues on error. The last step sets
 `NVX_COPILOT_SETUP` to `complete` or `incomplete`, lists failed step IDs in
 `NVX_COPILOT_SETUP_FAILED`, and fails the run when setup is incomplete.
-Copilot always runs the version on `dev`, even for sessions based on other
+Copilot always runs the version on `main`, even for sessions based on other
 branches, so changes reach agent sessions only after they merge. Pushes run it
 as a normal workflow for validation when they change the workflow or a file
 that its steps take versions, requirements, metadata, or code from: the
