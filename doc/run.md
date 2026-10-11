@@ -245,6 +245,7 @@ wrapper performs these translations and additions:
 | `--memory-mib N` | `--memory NM` |
 | `--memory-capacity-mib N` | `--memory-capacity NM` on a fresh boot |
 | `--restore-memory-mib N` | `--restore-memory NM` |
+| `--outcome-report PATH` | `--microvm-report PATH` |
 | `--dry-run` | No equivalent; this only prints the generated command |
 
 Always include `--single-process`. When restoring, omit `--memory`, `--kernel`,
