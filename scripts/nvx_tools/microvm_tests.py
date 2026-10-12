@@ -587,6 +587,19 @@ def _append_endpoint_policy(command: list[str], endpoints: tuple[str, ...]) -> N
         command.extend(("--allow-endpoint", endpoint))
 
 
+def _restore_without_policy_is_rejected(
+    executable: Path, backend: str, snapshot_path: Path, log_path: Path, timeout: float
+) -> bool:
+    command = snapshot_restore_command(
+        executable, backend, snapshot_path, network_profile="portable"
+    )
+    with OpenvmmProcess(command, log_path) as process:
+        result = process.wait(timeout)
+    return result.returncode != 0 and (
+        b"restore-time egress policy does not match" in result.output
+    )
+
+
 def _snapshot_fingerprint(snapshot_path: Path) -> tuple[str, str, str]:
     return (
         sha256_file(
@@ -3718,19 +3731,12 @@ def run_endpoint_policy_snapshot(
             raise RuntimeError("endpoint-policy source crossed the capture boundary")
         fingerprint = _snapshot_fingerprint(snapshot_path)
 
-        missing_policy_command = snapshot_restore_command(
+        if not _restore_without_policy_is_rejected(
             executable,
             backend,
             snapshot_path,
-            network_profile="portable",
-        )
-        with OpenvmmProcess(
-            missing_policy_command,
             output_dir / "endpoint-policy-missing.log",
-        ) as process:
-            missing_policy = process.wait(timeout)
-        if missing_policy.returncode == 0 or (
-            b"restore-time egress policy does not match" not in missing_policy.output
+            timeout,
         ):
             raise RuntimeError(
                 "endpoint-policy restore without policy was not rejected"
@@ -3898,20 +3904,12 @@ def run_network_snapshot(
                 raise RuntimeError(f"unexpected guest UDP payload: {udp_payload!r}")
             fingerprint = _snapshot_fingerprint(snapshot_path)
 
-            missing_policy_command = snapshot_restore_command(
+            if not _restore_without_policy_is_rejected(
                 executable,
                 backend,
                 snapshot_path,
-                network_profile="portable",
-            )
-            with OpenvmmProcess(
-                missing_policy_command,
                 output_dir / "network-snapshot-missing-policy.log",
-            ) as process:
-                missing_policy = process.wait(timeout)
-            if missing_policy.returncode == 0 or (
-                b"restore-time egress policy does not match"
-                not in missing_policy.output
+                timeout,
             ):
                 raise RuntimeError("network restore without policy was not rejected")
 

@@ -1370,6 +1370,46 @@ class ControlSessionTests(unittest.TestCase):
 
 
 class MicrovmTests(unittest.TestCase):
+    def test_restore_without_policy_requires_mismatch_failure(self):
+        cases = (
+            (1, b"restore-time egress policy does not match", True),
+            (0, b"restore-time egress policy does not match", False),
+            (1, b"another restore error", False),
+        )
+        for returncode, output, expected in cases:
+            with (
+                self.subTest(returncode=returncode, output=output),
+                patch.object(
+                    microvm_tests,
+                    "snapshot_restore_command",
+                    return_value=["openvmm", "restore"],
+                ) as command,
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+            ):
+                wait = process.return_value.__enter__.return_value.wait
+                wait.return_value = openvmm_process.OpenvmmProcessResult(
+                    returncode, output
+                )
+                rejected = microvm_tests._restore_without_policy_is_rejected(
+                    Path("openvmm"),
+                    "kvm",
+                    Path("snapshot"),
+                    Path("missing-policy.log"),
+                    30,
+                )
+
+            self.assertEqual(rejected, expected)
+            command.assert_called_once_with(
+                Path("openvmm"),
+                "kvm",
+                Path("snapshot"),
+                network_profile="portable",
+            )
+            process.assert_called_once_with(
+                ["openvmm", "restore"], Path("missing-policy.log")
+            )
+            wait.assert_called_once_with(30)
+
     def test_host_loopback_listener_pair_retries_protocol_port_conflict(self):
         first_udp = MagicMock()
         first_udp.getsockname.return_value = ("127.0.0.1", 50000)
