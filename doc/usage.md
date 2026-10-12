@@ -31,7 +31,7 @@ python3 scripts/nvx.py performance gate --help
 | `build-openvmm` | Build the OpenVMM release binary. |
 | `record-openvmm-provenance` | Bind an existing OpenVMM binary to the pinned source revision. |
 | `materialize-kernel-provenance-inputs` | Write kernel provenance inputs from raw run-head blobs. |
-| `setup-cross-os-cache` | Install GNU tar and zstd for GitHub Actions cross-OS caches. |
+| `setup-cross-os-cache` | Expose Git for Windows' GNU tar and install zstd for GitHub Actions cross-OS caches. |
 | `check-required-ci` | Validate required GitHub Actions job results. |
 | `test-openvmm-unit` | Run the OpenVMM workspace unit and documentation tests. |
 | `test-openvmm` | Run OpenVMM Petri VMM tests. |
@@ -77,7 +77,8 @@ Verifies the repository's pinned source inputs and submodule state.
 python3 scripts/nvx.py setup-cross-os-cache
 ```
 
-Installs the GNU tar and zstd tools used by GitHub Actions cross-OS caches.
+On Windows GitHub Actions runners, adds Git for Windows' existing GNU tar to
+`PATH` and installs zstd for cross-OS caches.
 
 ### `check-required-ci`
 
