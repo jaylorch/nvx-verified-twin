@@ -904,6 +904,17 @@ fn text_at(payload: &[u8], offset: usize, length: usize) -> Option<String> {
     String::from_utf8(bytes.to_vec()).ok()
 }
 
+fn decode_bounded_text(payload: &[u8], offset: &mut usize) -> Option<String> {
+    let length = u32_at(payload.get(*offset..*offset + 4)?, 0) as usize;
+    *offset += 4;
+    if length == 0 || length > MAX_ARGUMENT_BYTES {
+        return None;
+    }
+    let text = text_at(payload, *offset, length)?;
+    *offset += length;
+    Some(text)
+}
+
 fn decode_exec(payload: &[u8]) -> Option<Exec> {
     if payload.len() < 8 {
         return None;
@@ -939,13 +950,7 @@ fn decode_exec(payload: &[u8]) -> Option<Exec> {
     };
     let mut argv = Vec::with_capacity(count);
     for _ in 0..count {
-        let length = u32_at(payload.get(offset..offset + 4)?, 0) as usize;
-        offset += 4;
-        if length == 0 || length > MAX_ARGUMENT_BYTES {
-            return None;
-        }
-        argv.push(text_at(payload, offset, length)?);
-        offset += length;
+        argv.push(decode_bounded_text(payload, &mut offset)?);
     }
     let cwd = if flags & EXEC_CWD_PRESENT == 0 {
         None
@@ -960,13 +965,7 @@ fn decode_exec(payload: &[u8]) -> Option<Exec> {
     let mut environment = Vec::with_capacity(environment_count);
     let mut names = BTreeSet::new();
     for _ in 0..environment_count {
-        let length = u32_at(payload.get(offset..offset + 4)?, 0) as usize;
-        offset += 4;
-        if length == 0 || length > MAX_ARGUMENT_BYTES {
-            return None;
-        }
-        let entry = text_at(payload, offset, length)?;
-        offset += length;
+        let entry = decode_bounded_text(payload, &mut offset)?;
         // Like the guest agent, refuse entries without a name and repeated names.
         let (name, _) = entry.split_once('=').filter(|(name, _)| !name.is_empty())?;
         if !names.insert(name.to_owned()) {
