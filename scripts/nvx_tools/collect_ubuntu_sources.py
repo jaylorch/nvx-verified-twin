@@ -110,6 +110,15 @@ def _source_requirements(manifests: list[Path]) -> tuple[SourceRequirement, ...]
     return tuple(requirements[key] for key in sorted(requirements))
 
 
+def _checksum_size(raw_size: str, label: str, name: str) -> int:
+    try:
+        if (size := int(raw_size, 10)) < 0:
+            raise ScriptError(f"{label} has negative size for {name}")
+    except ValueError as error:
+        raise ScriptError(f"{label} has invalid size for {name}") from error
+    return size
+
+
 def _checksum_records(value: str, label: str) -> list[SourceChecksum]:
     records: list[SourceChecksum] = []
     names: set[str] = set()
@@ -127,12 +136,7 @@ def _checksum_records(value: str, label: str) -> list[SourceChecksum]:
             or name in names
         ):
             raise ScriptError(f"{label} has invalid source member {name!r}")
-        try:
-            size = int(raw_size, 10)
-        except ValueError as error:
-            raise ScriptError(f"{label} has invalid size for {name}") from error
-        if size < 0:
-            raise ScriptError(f"{label} has negative size for {name}")
+        size = _checksum_size(raw_size, label, name)
         names.add(name)
         records.append({"name": name, "size": size, "sha256": digest})
     if not records:
@@ -172,12 +176,7 @@ def _release_checksum(
             or path.as_posix() != name
         ):
             raise ScriptError(f"{label} has invalid release member {name!r}")
-        try:
-            size = int(raw_size, 10)
-        except ValueError as error:
-            raise ScriptError(f"{label} has invalid size for {name}") from error
-        if size < 0:
-            raise ScriptError(f"{label} has negative size for {name}")
+        size = _checksum_size(raw_size, label, name)
         if name == relative:
             matches.append({"name": name, "size": size, "sha256": digest})
     if len(matches) != 1:

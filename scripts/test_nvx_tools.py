@@ -6429,6 +6429,24 @@ class BuildTests(unittest.TestCase):
             ),
         )
 
+    def test_ubuntu_checksum_sizes_preserve_validation_errors(self):
+        digest = "a" * 64
+        for raw_size, reason in (("invalid", "invalid"), ("-1", "negative")):
+            expected = f"metadata has {reason} size for member"
+            with self.subTest(raw_size=raw_size, metadata="Checksums-Sha256"):
+                with self.assertRaisesRegex(common.ScriptError, expected):
+                    collect_ubuntu_sources._checksum_records(
+                        f"{digest} {raw_size} member",
+                        "metadata",
+                    )
+            with self.subTest(raw_size=raw_size, metadata="SHA256"):
+                with self.assertRaisesRegex(common.ScriptError, expected):
+                    collect_ubuntu_sources._release_checksum(
+                        {"SHA256": f"{digest} {raw_size} member"},
+                        "member",
+                        "metadata",
+                    )
+
     def test_ubuntu_dsc_validation_matches_source_index(self):
         payload = b"source"
         digest = hashlib.sha256(payload).hexdigest()
