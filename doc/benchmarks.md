@@ -179,10 +179,11 @@ python3 scripts/nvx.py benchmark --suite device-restore-profile --backend kvm --
 python scripts\nvx.py benchmark --suite device-restore-profile --backend whp --platform windows-whp-baremetal --processors 1 --warmups 1 --runs 5 --skip-build --output-dir data\runs\device-restore-whp
 ```
 
-By default the suite runs console, network, and virtio-fs in both active and deferred modes. Use
-`--restore-devices` and `--restore-modes` to select a subset. Deferred capture unbinds the selected
-built-in guest driver before `nvx-snapshot`; restore rebinds it and verifies I/O. Devices are
-located by the microVM ABI slots and virtio device IDs, not by unstable `virtioN` numbering:
+The suite requires exactly one vCPU. By default it runs console, network, and virtio-fs in both
+active and deferred modes. Use `--restore-devices` and `--restore-modes` to select a subset.
+Deferred capture unbinds the selected built-in guest driver before `nvx-snapshot`; restore rebinds
+it and verifies I/O. Devices are located by the microVM ABI slots and virtio device IDs, not by
+unstable `virtioN` numbering:
 network at `0xd0000000`/ID 1, virtio-fs at `0xd0001000`/ID 26, and console at
 `0xd0002000`/ID 3. Probe control markers use port-B (`/dev/hvc0`) independently of the selected
 device. Before rebinding, deferred mode sends a descriptor-free queue-0 MMIO notification through
