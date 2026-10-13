@@ -147,7 +147,10 @@ def _number(value: str) -> float:
 
 
 def _read_log(path: Path) -> str:
-    data = path.read_bytes()
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise PerformanceError(f"cannot read benchmark log {path}: {error}") from error
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         encoding = "utf-16"
     elif b"\x00" in data[:128]:

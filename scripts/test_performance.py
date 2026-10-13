@@ -948,6 +948,17 @@ class PerformanceTests(unittest.TestCase):
             )
             self.assertIn("## Linux / KVM lifecycle diagnostics", markdown)
 
+    def test_read_log_wraps_read_errors(self):
+        path = Path("unreadable.log")
+        with (
+            patch.object(Path, "read_bytes", side_effect=OSError("access denied")),
+            self.assertRaisesRegex(
+                performance.PerformanceError,
+                r"cannot read benchmark log unreadable\.log: access denied",
+            ),
+        ):
+            performance._read_log(path)
+
     def test_collects_mshv_shared_suite_with_network(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
