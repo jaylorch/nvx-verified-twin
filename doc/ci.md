@@ -373,8 +373,9 @@ available for interactive qualification.
 The required `aci-edge-sandboxes` job checks the [`aci_edge_sandboxes` crate](../aci_edge_sandboxes/README.md) on
 GitHub-hosted Ubuntu and Windows runners through the
 [`check-aci-edge-sandboxes`](../.github/actions/check-aci-edge-sandboxes/action.yml) action. The action
-runs rustfmt, Clippy with warnings denied, and rustdoc, all on the Rust
-toolchain that MXC pins. It also runs the unit, mock, and fake-OpenVMM
+runs rustfmt, Clippy with warnings denied for all targets and features and for
+the library without default features, and rustdoc, all on the Rust toolchain
+that MXC pins. It also runs the unit, mock, and fake-OpenVMM
 integration tests, checks the declared minimum Rust version, and cross-checks
 the macOS build that MXC compiles. The fake-OpenVMM tests drive the real
 OpenVMM backend through its control protocol without a hypervisor.
