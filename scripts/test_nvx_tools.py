@@ -10827,6 +10827,63 @@ class SandboxTests(unittest.TestCase):
             sandbox_lifecycle.deprovision(state)
             self.assertFalse(state.exists())
 
+    def test_managed_lifecycle_rejects_non_integer_numeric_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            layer.write_bytes(b"layer")
+            scratch.write_bytes(b"scratch")
+            config = {
+                "format": sandbox_lifecycle.CONFIG_FORMAT,
+                "layers": [
+                    {
+                        "role": "distro",
+                        "path": str(layer),
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                    }
+                ],
+                "scratch": str(scratch),
+                "hostname": "nvx-sandbox",
+                "workload_uid": 65534,
+                "workload_gid": 65534,
+                "memory_max": None,
+                "pids_max": None,
+                "memory_mib": 256,
+                "mount": None,
+                "hypervisor": "whp",
+                "cmdline": "quiet",
+            }
+            for name, value in (
+                ("workload_uid", True),
+                ("workload_gid", 1.5),
+                ("memory_max", True),
+                ("pids_max", 1.5),
+            ):
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(
+                        common.ScriptError, "sandbox configuration is malformed"
+                    ),
+                ):
+                    sandbox_lifecycle._deserialize_launch({**config, name: value})
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            (state / sandbox_lifecycle.CONFIG_NAME).write_text(
+                json.dumps({**config, "memory_mib": True}), encoding="utf-8"
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                self.assertRaisesRegex(
+                    common.ScriptError, "sandbox configuration is malformed"
+                ),
+                patch.object(sandbox_lifecycle, "require_file", side_effect=require),
+            ):
+                sandbox_lifecycle.start(state, 10)
+
     def test_managed_lifecycle_start_requests_openvmm_outcome(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

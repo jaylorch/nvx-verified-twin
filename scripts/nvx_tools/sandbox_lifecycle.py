@@ -271,6 +271,20 @@ def _deserialize_mounts(config: dict[str, Any]) -> tuple[SandboxMount, ...]:
     return () if mount is None else (_deserialize_mount(mount),)
 
 
+def _required_config_int(config: dict[str, Any], name: str) -> int:
+    value = config[name]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ScriptError("sandbox configuration is malformed")
+    return value
+
+
+def _optional_config_int(config: dict[str, Any], name: str) -> int | None:
+    value = config[name]
+    if value is None:
+        return None
+    return _required_config_int(config, name)
+
+
 def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
     try:
         layers = tuple(
@@ -281,16 +295,17 @@ def _deserialize_launch(config: dict[str, Any]) -> SandboxLaunch:
             )
             for layer in config["layers"]
         )
-        identity = (int(config["workload_uid"]), int(config["workload_gid"]))
+        identity = (
+            _required_config_int(config, "workload_uid"),
+            _required_config_int(config, "workload_gid"),
+        )
         launch = SandboxLaunch(
             layers=layers,
             scratch=Path(str(config["scratch"])),
             hostname=str(config["hostname"]),
             workload_identity=identity,
-            memory_max=(
-                None if config["memory_max"] is None else int(config["memory_max"])
-            ),
-            pids_max=None if config["pids_max"] is None else int(config["pids_max"]),
+            memory_max=_optional_config_int(config, "memory_max"),
+            pids_max=_optional_config_int(config, "pids_max"),
             mounts=_deserialize_mounts(config),
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -518,7 +533,7 @@ def start(state_path: Path, timeout: float) -> None:
         "--hypervisor",
         str(config["hypervisor"]),
         "--memory",
-        f"{int(config['memory_mib'])}M",
+        f"{_required_config_int(config, 'memory_mib')}M",
         "--kernel",
         os.fspath(kernel),
         "--initrd",
