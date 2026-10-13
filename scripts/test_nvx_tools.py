@@ -4834,6 +4834,25 @@ class UbuntuSourceCollectionTests(unittest.TestCase):
 
         self.assertIn("cannot read Ubuntu package manifest", str(context.exception))
 
+    def test_non_utf8_inrelease_is_reported_as_script_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            release = Path(temporary) / "InRelease"
+            release.write_bytes(b"\xff")
+
+            with (
+                patch.object(
+                    collect_ubuntu_sources, "require_tool", return_value="gpgv"
+                ),
+                patch.object(collect_ubuntu_sources, "run_checked"),
+                self.assertRaisesRegex(
+                    collect_ubuntu_sources.ScriptError,
+                    "cannot read authenticated Ubuntu release metadata",
+                ),
+            ):
+                collect_ubuntu_sources._verify_inrelease(
+                    release, Path("ubuntu-keyring.gpg"), "noble"
+                )
+
 
 class AlpineSourceCollectionTests(unittest.TestCase):
     INSTALL_SCRIPT = b"#!/bin/sh\nexit 0\n"

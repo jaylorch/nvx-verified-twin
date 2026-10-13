@@ -198,7 +198,13 @@ def _verify_inrelease(
     )
     with TemporaryDirectory(prefix="nvx-gpgv-") as homedir:
         run_checked([gpgv, "--homedir", homedir, "--keyring", keyring, path])
-    payload = _clearsigned_payload(path.read_text(encoding="utf-8"), path.name)
+    try:
+        release_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ScriptError(
+            f"cannot read authenticated Ubuntu release metadata {path}: {error}"
+        ) from error
+    payload = _clearsigned_payload(release_text, path.name)
     documents = parse_deb822(payload)
     if len(documents) != 1:
         raise ScriptError(f"{path} has invalid Ubuntu release metadata")
