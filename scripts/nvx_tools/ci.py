@@ -367,12 +367,14 @@ def _prepare_openvmm_test_environment(
     return environment
 
 
-def run_openvmm_unit_tests() -> None:
-    require_file(
-        OpenVMMBuildConstants.DIRECTORY / "Cargo.toml", "initialized OpenVMM submodule"
-    )
-    cargo = require_tool("cargo")
+def _require_openvmm_test_cargo() -> str:
+    manifest = OpenVMMBuildConstants.DIRECTORY / "Cargo.toml"
+    require_file(manifest, "initialized OpenVMM submodule")
+    return require_tool("cargo")
 
+
+def run_openvmm_unit_tests() -> None:
+    cargo = _require_openvmm_test_cargo()
     fuzz_crates = run_capture(
         [cargo, "xtask", "fuzz", "list", "--crates"],
         cwd=OpenVMMBuildConstants.DIRECTORY,
@@ -419,10 +421,7 @@ def run_openvmm_unit_tests() -> None:
 def run_openvmm_tests(backend: str) -> None:
     validate_openvmm_test_backend(backend)
 
-    require_file(
-        OpenVMMBuildConstants.DIRECTORY / "Cargo.toml", "initialized OpenVMM submodule"
-    )
-    cargo = require_tool("cargo")
+    cargo = _require_openvmm_test_cargo()
     rustup = require_tool("rustup")
     kernel = require_file(
         artifact_path(KernelBuildConstants.BINARY_NAME),
