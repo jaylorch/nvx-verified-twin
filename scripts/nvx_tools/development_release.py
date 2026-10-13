@@ -163,6 +163,7 @@ def _parse_release(payload: str) -> _DevelopmentRelease:
             not isinstance(name, str)
             or not isinstance(size, int)
             or isinstance(size, bool)
+            or size < 0
             or not isinstance(state, str)
             or not (digest_value is None or isinstance(digest_value, str))
         ):

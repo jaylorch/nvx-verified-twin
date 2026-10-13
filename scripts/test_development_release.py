@@ -2,6 +2,7 @@
 # pyright: reportPrivateUsage=false
 
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -70,6 +71,33 @@ class DevelopmentReleaseTests(unittest.TestCase):
             elapsed,
             timed_out,
         )
+
+    def test_release_asset_size_must_be_nonnegative(self):
+        def payload(size: int) -> str:
+            return json.dumps(
+                {
+                    "tagName": "v1",
+                    "targetCommitish": "a" * 40,
+                    "isDraft": True,
+                    "isPrerelease": True,
+                    "assets": [
+                        {
+                            "name": "nvx-linux.tar.gz",
+                            "size": size,
+                            "digest": None,
+                            "state": "uploaded",
+                        }
+                    ],
+                }
+            )
+
+        self.assertEqual(
+            development_release._parse_release(payload(0)).assets[0].size, 0
+        )
+        with self.assertRaisesRegex(
+            development_release.ScriptError, "incomplete release asset"
+        ):
+            development_release._parse_release(payload(-1))
 
     def test_transient_upload_failure_retries_and_succeeds(self):
         with tempfile.TemporaryDirectory() as temporary:
