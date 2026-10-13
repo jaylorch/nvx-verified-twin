@@ -203,6 +203,24 @@ shfmt -d -ln bash -i 4 -ci \
 
 Pyright runs in strict mode for both Linux and Windows platform APIs.
 
+PowerShell changes also require the syntax check used in CI:
+
+```powershell
+$tokens = $null
+$errors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile(
+  (Resolve-Path "scripts/setup/setup-windows-whp.ps1"),
+  [ref]$tokens,
+  [ref]$errors
+)
+foreach ($error in $errors) {
+  Write-Error $error -ErrorAction Continue
+}
+if ($errors.Count -ne 0) {
+  exit 1
+}
+```
+
 ### Adversarial campaign controller
 
 The optional `test-adversarial` command additionally requires GitHub Copilot
