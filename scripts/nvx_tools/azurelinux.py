@@ -13,7 +13,7 @@ from .build_constants import (
     BuildConstants,
     DockerBuildConstants,
 )
-from .common import ScriptError, download_verified, sha256_file
+from .common import ScriptError, download_verified, sha256_file, validate_lock_header
 
 _RPM_FIELD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~^-]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -51,9 +51,7 @@ def load_package_lock(path: Path | None = None) -> tuple[AzureLinuxLockedPackage
         "architecture": AzureLinuxBuildConstants.ARCHITECTURE,
         "image": AzureLinuxBuildConstants.IMAGE,
     }
-    for field, expected in expected_header.items():
-        if document.get(field) != expected:
-            raise ScriptError(f"{path} {field} must be {expected!r}")
+    validate_lock_header(document, path, expected_header)
     raw_packages = document.get("packages")
     if not isinstance(raw_packages, list) or not raw_packages:
         raise ScriptError(f"{path} must contain a nonempty packages array")

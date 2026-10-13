@@ -30,6 +30,16 @@ class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
 
 
+def validate_lock_header(
+    document: Mapping[str, object],
+    path: Path,
+    expected_header: Mapping[str, object],
+) -> None:
+    for field, expected in expected_header.items():
+        if document.get(field) != expected:
+            raise ScriptError(f"{path} {field} must be {expected!r}")
+
+
 def strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:

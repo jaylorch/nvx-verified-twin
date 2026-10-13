@@ -6221,6 +6221,18 @@ class BuildTests(unittest.TestCase):
             ):
                 ubuntu.load_package_lock(path)
 
+    def test_ubuntu_package_lock_rejects_mismatched_header(self):
+        document = json.loads(
+            UbuntuBuildConstants.PACKAGE_LOCK.read_text(encoding="utf-8")
+        )
+        document["codename"] = "unexpected"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "packages.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+
+            with self.assertRaisesRegex(common.ScriptError, "codename must be"):
+                ubuntu.load_package_lock(path)
+
     def test_ubuntu_safe_extractor_rejects_archive_symlink_escape(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

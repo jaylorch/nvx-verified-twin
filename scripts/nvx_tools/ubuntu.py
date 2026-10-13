@@ -30,6 +30,7 @@ from .common import (
     download_verified,
     require_tool,
     sha256_file,
+    validate_lock_header,
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -122,9 +123,7 @@ def load_package_lock(
         "codename": UbuntuBuildConstants.CODENAME,
         "architecture": UbuntuBuildConstants.ARCHITECTURE,
     }
-    for field, expected in expected_header.items():
-        if document.get(field) != expected:
-            raise ScriptError(f"{path} {field} must be {expected!r}")
+    validate_lock_header(document, path, expected_header)
     raw_packages = document.get("packages")
     if not isinstance(raw_packages, list) or not raw_packages:
         raise ScriptError(f"{path} must contain a nonempty packages array")
