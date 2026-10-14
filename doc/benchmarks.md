@@ -255,6 +255,7 @@ python3 scripts/nvx.py performance collect --platform linux-kvm-baremetal --comm
 | Virtual file system | `benchmark --suite virtfs` | Measures live host-directory throughput and verifies host-to-guest plus guest-to-host visibility in one running VM. |
 | Shell snapshot | `benchmark --suite shell-snapshot` | Compares cold boot with lifecycle-aligned snapshot restore at 128, 256, and 512 MiB. |
 | Shell snapshot restore | `benchmark --suite shell-snapshot-restore` | Captures an unmeasured lifecycle-aligned snapshot and measures only restore latency for the selected memory sizes. |
+| Restore-time memory activation | `benchmark --suite snapshot-restore-memory` | Restores one 512 MiB snapshot at 512 MiB, 1 GiB, and 2 GiB targets and reports activation latency, launch-to-ready latency, and peak RSS. |
 | Restore-time vCPU activation | `benchmark --suite snapshot-restore-vcpu --processors 8` | Restores one boot-online-1, capacity-8 snapshot at online targets 1/2/4/8 and reports latency plus peak RSS. |
 | Network snapshot | `benchmark --suite network-snapshot` | Compares a network-ready cold boot with snapshot restore and verifies gateway connectivity. |
 | Snapshot lifecycle profile | `benchmark --suite snapshot-profile` | Retains raw capture and restore phase records and summarizes 128/256/512/1024 MiB warm/cold restores. |
