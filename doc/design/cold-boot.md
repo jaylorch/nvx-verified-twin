@@ -53,7 +53,7 @@ flowchart LR
    Low["Low RAM<br/>0x00000000 through 0xbfffffff<br/>up to 3 GiB"]
    Gap["Fixed MMIO gap<br/>0xc0000000 through 0xffffffff<br/>1 GiB"]
    High["High RAM<br/>0x100000000 and above"]
-   Slots["Reserved virtio-mmio slots<br/>0xd0000000 through 0xd0007fff"]
+   Slots["Reserved virtio-mmio slots<br/>0xd0000000 through 0xd0008fff"]
 
    Low --- Gap
    Gap --- High
