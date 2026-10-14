@@ -7244,6 +7244,23 @@ class BuildTests(unittest.TestCase):
                 common.sha256_file(source),
             )
 
+    def test_device_io_provenance_rejects_non_utf8_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "nvx"
+            source = checkout / "guest" / "common" / "nvx-device-io.c"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"shared helper source")
+            initrd = root / "initramfs.cpio.gz"
+            manifest = initrd.with_name(f"{initrd.name}.packages.json")
+            manifest.write_bytes(b"\xff")
+
+            with self.assertRaisesRegex(ValueError, "invalid nvx-device-io provenance"):
+                benchmark._device_io_helper_provenance(
+                    argparse.Namespace(nvx_dir=checkout),
+                    initrd,
+                )
+
     def test_sandbox_kernel_config_requires_every_feature(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / ".config"

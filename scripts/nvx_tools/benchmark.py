@@ -4380,7 +4380,7 @@ def _device_io_helper_provenance(
         helper = manifest["helpers"]["nvx-device-io"]
         source_sha256 = helper["source_sha256"]
         binary_sha256 = helper["binary_sha256"]
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise ValueError(
             f"invalid nvx-device-io provenance in {manifest_path}"
         ) from error
