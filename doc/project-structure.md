@@ -35,6 +35,7 @@ nvx/
 |   |-- specula/                 Incremental formal verification integration
 |   |-- workflows/adversarial.yml Trusted scheduled/manual adversarial campaigns
 |   |-- workflows/ci.yml         Main build, test, and benchmark workflow
+|   |-- workflows/run-nvx-microvm-tests.yml Reusable backend microVM and sandbox test job
 |   `-- workflows/copilot-setup-steps.yml Copilot cloud agent environment
 |-- guest/                       Guest-owned scripts and static helpers
 |   |-- common/                  Shared init, lifecycle, console, and test helpers
