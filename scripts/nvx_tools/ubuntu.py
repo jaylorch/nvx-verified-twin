@@ -150,6 +150,12 @@ def load_package_lock(
             )
         ):
             raise ScriptError(f"{path} package {name} has invalid required_by")
+        dependency_fields: dict[str, str] = {}
+        for field in ("depends", "pre_depends"):
+            value = package_document.get(field, "")
+            if not isinstance(value, str):
+                raise ScriptError(f"{path} package {name} has invalid {field}")
+            dependency_fields[field] = value
         package = cast(
             UbuntuLockedPackage,
             {
@@ -175,8 +181,7 @@ def load_package_lock(
                 "required_by": [
                     cast(str, item) for item in cast(list[object], required_by)
                 ],
-                "depends": str(package_document.get("depends", "")),
-                "pre_depends": str(package_document.get("pre_depends", "")),
+                **dependency_fields,
             },
         )
         if package["architecture"] != UbuntuBuildConstants.ARCHITECTURE:

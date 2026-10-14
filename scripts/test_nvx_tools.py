@@ -6221,6 +6221,21 @@ class BuildTests(unittest.TestCase):
             ):
                 ubuntu.load_package_lock(path)
 
+    def test_ubuntu_package_lock_rejects_non_string_dependencies(self):
+        document = json.loads(UbuntuBuildConstants.PACKAGE_LOCK.read_text("utf-8"))
+        packages = document["packages"]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "packages.json"
+            for field in ("depends", "pre_depends"):
+                with self.subTest(field=field):
+                    packages[0][field] = False
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        common.ScriptError, f"package .* has invalid {field}"
+                    ):
+                        ubuntu.load_package_lock(path)
+                    packages[0][field] = ""
+
     def test_ubuntu_safe_extractor_rejects_archive_symlink_escape(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
