@@ -310,7 +310,10 @@ def parse_fields(text: str) -> dict[str, str]:
                     digits = text[index + 2 : index + 4]
                     if len(digits) != 2:
                         raise ValueError(f"truncated escape in {key!r}")
-                    value.append(chr(int(digits, 16)))
+                    try:
+                        value.append(chr(int(digits, 16)))
+                    except ValueError:
+                        raise ValueError(f"invalid hex escape in {key!r}") from None
                     index += 4
                 else:
                     raise ValueError(f"invalid escape in {key!r}")

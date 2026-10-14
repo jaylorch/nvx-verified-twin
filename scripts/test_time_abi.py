@@ -90,6 +90,8 @@ class FieldParsingTests(unittest.TestCase):
         ):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 time_abi.parse_fields(text)
+        with self.assertRaisesRegex(ValueError, "invalid hex escape in 'detail'"):
+            time_abi.parse_fields('detail="\\xGG"')
 
     def test_parses_markers_and_violations(self):
         marker = time_abi.parse_marker(BOOT_LINE)
