@@ -16245,6 +16245,24 @@ class SharedFileTests(unittest.TestCase):
 
 
 class DownloadTests(unittest.TestCase):
+    def test_reports_destination_setup_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "not-a-directory"
+            parent.write_text("payload", encoding="utf-8")
+            destination = parent / "archive.tar.xz"
+            with (
+                patch("nvx_tools.common.urllib.request.urlopen") as urlopen,
+                self.assertRaisesRegex(
+                    common.ScriptError, "failed to prepare download destination"
+                ),
+            ):
+                common.download(
+                    "https://example.invalid/archive.tar.xz",
+                    destination,
+                )
+
+            urlopen.assert_not_called()
+
     def test_rejects_nonpositive_attempts(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "archive.tar.xz"
