@@ -182,7 +182,10 @@ shellcheck --shell=sh \
   guest/common/init guest/alpine/nvx-container-enter \
   guest/alpine/nvx-container-launch \
   guest/common/nvx-hostmount guest/common/nvx-identity-probe \
-  guest/common/nvx-init-agent guest/common/nvx-sandbox-smoke \
+  guest/common/nvx-init-agent \
+  guest/common/nvx-container-enter-azurelinux \
+  guest/common/nvx-container-launch-azurelinux \
+  guest/common/nvx-sandbox-smoke \
   guest/common/nvx-snapshot guest/common/nvx-virtio-restore-probe \
   scripts/setup/setup-linux-mshv.sh scripts/setup/setup-linux-runner.sh
 shellcheck --shell=bash \
@@ -194,7 +197,10 @@ shfmt -d -ln posix -i 4 -ci \
   guest/common/init guest/alpine/nvx-container-enter \
   guest/alpine/nvx-container-launch \
   guest/common/nvx-hostmount guest/common/nvx-identity-probe \
-  guest/common/nvx-init-agent guest/common/nvx-sandbox-smoke \
+  guest/common/nvx-init-agent \
+  guest/common/nvx-container-enter-azurelinux \
+  guest/common/nvx-container-launch-azurelinux \
+  guest/common/nvx-sandbox-smoke \
   guest/common/nvx-snapshot guest/common/nvx-virtio-restore-probe \
   scripts/setup/setup-linux-mshv.sh scripts/setup/setup-linux-runner.sh
 shfmt -d -ln bash -i 4 -ci \
