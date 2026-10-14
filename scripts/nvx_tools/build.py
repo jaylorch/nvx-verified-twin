@@ -11,7 +11,7 @@ import ssl
 import subprocess
 import sys
 from pathlib import Path
-from typing import TypedDict
+from typing import IO, TypedDict
 
 from . import ubuntu
 from .build_config import (
@@ -676,6 +676,35 @@ def _normalize_initramfs_metadata(root: Path) -> None:
                 ) from error
 
 
+def _start_initramfs_pipeline_process(
+    processes: list[subprocess.Popen[bytes]],
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    stdin: int | IO[bytes] | None = None,
+    stdout: int | IO[bytes] | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.Popen[bytes]:
+    try:
+        process = subprocess.Popen(
+            command, cwd=cwd, stdin=stdin, stdout=stdout, env=env
+        )
+    except OSError:
+        for existing in reversed(processes):
+            if existing.stdout is not None:
+                existing.stdout.close()
+            if existing.poll() is None:
+                try:
+                    existing.kill()
+                except ProcessLookupError:
+                    pass
+        for existing in reversed(processes):
+            existing.wait()
+        raise
+    processes.append(process)
+    return process
+
+
 def _pack_initramfs(root: Path, output: Path) -> None:
     require_tool("find")
     require_tool("sort")
@@ -684,13 +713,15 @@ def _pack_initramfs(root: Path, output: Path) -> None:
     _normalize_initramfs_metadata(root)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as archive:
-        finder = subprocess.Popen(
-            ["find", ".", "-print0"], cwd=root, stdout=subprocess.PIPE
+        processes: list[subprocess.Popen[bytes]] = []
+        finder = _start_initramfs_pipeline_process(
+            processes, ["find", ".", "-print0"], cwd=root, stdout=subprocess.PIPE
         )
         assert finder.stdout is not None
         sort_environment = os.environ.copy()
         sort_environment["LC_ALL"] = "C"
-        sorter = subprocess.Popen(
+        sorter = _start_initramfs_pipeline_process(
+            processes,
             ["sort", "-z"],
             cwd=root,
             stdin=finder.stdout,
@@ -699,7 +730,8 @@ def _pack_initramfs(root: Path, output: Path) -> None:
         )
         finder.stdout.close()
         assert sorter.stdout is not None
-        cpio = subprocess.Popen(
+        cpio = _start_initramfs_pipeline_process(
+            processes,
             [
                 "cpio",
                 "--null",
@@ -716,7 +748,8 @@ def _pack_initramfs(root: Path, output: Path) -> None:
         )
         sorter.stdout.close()
         assert cpio.stdout is not None
-        gzip = subprocess.Popen(
+        gzip = _start_initramfs_pipeline_process(
+            processes,
             ["gzip", "-n", f"-{InitramfsBuildConstants.GZIP_COMPRESSION_LEVEL}"],
             stdin=cpio.stdout,
             stdout=archive,

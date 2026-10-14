@@ -5346,6 +5346,29 @@ class AlpineSourceCollectionTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def test_pack_initramfs_reaps_pipeline_after_spawn_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "initramfs.cpio.gz"
+            finder = MagicMock()
+            finder.stdout = MagicMock()
+            finder.poll.return_value = None
+            with (
+                patch.object(build, "require_tool"),
+                patch.object(build, "_normalize_initramfs_metadata"),
+                patch.object(
+                    build.subprocess,
+                    "Popen",
+                    side_effect=(finder, OSError("cannot start sort")),
+                ),
+                self.assertRaisesRegex(OSError, "cannot start sort"),
+            ):
+                build._pack_initramfs(root, output)
+
+            finder.stdout.close.assert_called_once_with()
+            finder.kill.assert_called_once_with()
+            finder.wait.assert_called_once_with()
+
     def test_build_config_owns_standard_runtime_paths(self):
         config = build_config.BuildConfig()
         alpine = config.initramfs_config("alpine")
