@@ -447,7 +447,7 @@ def _download_json(url: str, path: Path) -> object:
     download(url, path)
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ScriptError(f"invalid Launchpad response from {url}: {error}") from error
 
 

@@ -4824,6 +4824,21 @@ class BuildConstantsTests(unittest.TestCase):
 
 
 class UbuntuSourceCollectionTests(unittest.TestCase):
+    def test_launchpad_response_read_error_is_reported_as_script_error(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(collect_ubuntu_sources, "download"),
+            patch.object(Path, "read_text", side_effect=OSError("read failed")),
+            self.assertRaisesRegex(
+                collect_ubuntu_sources.ScriptError,
+                "invalid Launchpad response",
+            ),
+        ):
+            collect_ubuntu_sources._download_json(
+                "https://api.launchpad.test/response",
+                Path(temporary) / "response.json",
+            )
+
     def test_malformed_package_manifest_is_reported_as_script_error(self):
         with tempfile.TemporaryDirectory() as temporary:
             manifest = Path(temporary) / "packages.json"
