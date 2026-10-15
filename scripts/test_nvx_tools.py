@@ -12580,6 +12580,30 @@ class BenchmarkTests(unittest.TestCase):
                     timeout=1,
                 )
 
+    def test_output_reader_initializes_shared_runner_state(self):
+        interaction = MagicMock()
+        interaction.process.pid = 123
+        reader_thread = MagicMock()
+        cpus = {1, 2}
+        with (
+            patch.object(benchmark, "set_windows_affinity") as set_affinity,
+            patch.object(
+                benchmark.threading, "Thread", return_value=reader_thread
+            ) as thread,
+            patch.object(benchmark.time, "monotonic", return_value=10.0),
+        ):
+            chunks, deadline, output = benchmark._start_output_reader(
+                interaction, 2.5, cpus
+            )
+
+        set_affinity.assert_called_once_with(123, cpus)
+        thread.assert_called_once_with(
+            target=interaction.read_output, args=(chunks,), daemon=True
+        )
+        reader_thread.start.assert_called_once_with()
+        self.assertEqual(deadline, 12.5)
+        self.assertEqual(output, bytearray())
+
     def test_live_peak_rss_samples_linux_process_without_reaping(self):
         process = MagicMock(pid=123)
         with (

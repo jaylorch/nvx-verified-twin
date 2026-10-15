@@ -2462,6 +2462,20 @@ def _raise_guest_script_failure(
         raise error
 
 
+def _start_output_reader(
+    interaction: InteractiveProcess,
+    timeout: float,
+    windows_cpus: set[int] | None,
+) -> tuple[queue.Queue[bytes | None], float, bytearray]:
+    if windows_cpus is not None:
+        set_windows_affinity(interaction.process.pid, windows_cpus)
+    chunks: queue.Queue[bytes | None] = queue.Queue()
+    threading.Thread(
+        target=interaction.read_output, args=(chunks,), daemon=True
+    ).start()
+    return chunks, time.monotonic() + timeout, bytearray()
+
+
 def run_guest_script(
     command: Sequence[str],
     script: str,
@@ -2493,15 +2507,7 @@ def run_guest_script(
     process = interaction.process
     monitor = TimeAbiMonitor(command)
     query_status = time_abi_status and monitor.cold_boot
-    if windows_cpus is not None:
-        set_windows_affinity(process.pid, windows_cpus)
-
-    chunks: queue.Queue[bytes | None] = queue.Queue()
-    threading.Thread(
-        target=interaction.read_output, args=(chunks,), daemon=True
-    ).start()
-    deadline = time.monotonic() + timeout
-    output = bytearray()
+    chunks, deadline, output = _start_output_reader(interaction, timeout, windows_cpus)
     status_sent = False
     input_sent = False
     completed = False
@@ -2615,15 +2621,7 @@ def capture_automatic_snapshot(
     interaction = InteractiveProcess(command, environment)
     process = interaction.process
     monitor = TimeAbiMonitor(command)
-    if windows_cpus is not None:
-        set_windows_affinity(process.pid, windows_cpus)
-
-    chunks: queue.Queue[bytes | None] = queue.Queue()
-    threading.Thread(
-        target=interaction.read_output, args=(chunks,), daemon=True
-    ).start()
-    deadline = time.monotonic() + timeout
-    output = bytearray()
+    chunks, deadline, output = _start_output_reader(interaction, timeout, windows_cpus)
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -2703,14 +2701,7 @@ def capture_device_restore_snapshot(
     interaction = InteractiveProcess(command, environment)
     process = interaction.process
     monitor = TimeAbiMonitor(command)
-    if windows_cpus is not None:
-        set_windows_affinity(process.pid, windows_cpus)
-    chunks: queue.Queue[bytes | None] = queue.Queue()
-    threading.Thread(
-        target=interaction.read_output, args=(chunks,), daemon=True
-    ).start()
-    deadline = time.monotonic() + timeout
-    output = bytearray()
+    chunks, deadline, output = _start_output_reader(interaction, timeout, windows_cpus)
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -2771,14 +2762,7 @@ def run_device_restore_sample(
     interaction = InteractiveProcess(command, environment)
     process = interaction.process
     monitor = TimeAbiMonitor(command)
-    if windows_cpus is not None:
-        set_windows_affinity(process.pid, windows_cpus)
-    chunks: queue.Queue[bytes | None] = queue.Queue()
-    threading.Thread(
-        target=interaction.read_output, args=(chunks,), daemon=True
-    ).start()
-    deadline = time.monotonic() + timeout
-    output = bytearray()
+    chunks, deadline, output = _start_output_reader(interaction, timeout, windows_cpus)
     pending = bytearray()
     markers: list[dict[str, str]] = []
     events: list[dict[str, object]] = []
