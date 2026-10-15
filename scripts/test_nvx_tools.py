@@ -15838,6 +15838,14 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(destination.read_bytes(), name.encode("ascii"))
 
 
+class CanonicalJsonSha256Tests(unittest.TestCase):
+    def test_sorts_keys_and_uses_compact_encoding(self):
+        self.assertEqual(
+            common.canonical_json_sha256({"b": 1, "a": 2}),
+            "d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772",
+        )
+
+
 class PositiveIntTests(unittest.TestCase):
     def test_accepts_positive_integer(self):
         self.assertEqual(common.positive_int("1"), 1)

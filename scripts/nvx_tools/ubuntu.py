@@ -27,6 +27,7 @@ from .build_constants import (
 from .common import (
     ScriptError,
     cache_root,
+    canonical_json_sha256,
     download_verified,
     require_tool,
     sha256_file,
@@ -1036,12 +1037,7 @@ def converter_input_sha256(customization_files: Sequence[Path]) -> str:
             for path in sorted(customization_files)
         ],
     }
-    encoded = json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return canonical_json_sha256(document)
 
 
 def erofs_uuid(input_sha256: str) -> str:

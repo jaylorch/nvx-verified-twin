@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import json
 import os
 import re
@@ -13,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from nvx_tools.common import ScriptError
+from nvx_tools.common import ScriptError, canonical_json_sha256
 from nvx_tools.common import strict_json_object as _strict_object
 
 SCHEMA_VERSION = 1
@@ -324,12 +323,7 @@ def catalog_digest(cases: Iterable[CaseDefinition]) -> str:
         }
         for case in sorted(cases, key=lambda item: item.case_id)
     ]
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return canonical_json_sha256(payload)
 
 
 @dataclass(frozen=True, slots=True)
