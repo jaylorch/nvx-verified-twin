@@ -69,6 +69,12 @@ impl From<io::Error> for SessionError {
     }
 }
 
+fn validate_response_id(expected: u64, actual: u64) -> Result<(), SessionError> {
+    (actual == expected).then_some(()).ok_or_else(|| {
+        SessionError::Protocol("the guest agent returned a mismatched request ID".to_owned())
+    })
+}
+
 /// Connects to the control endpoint of OpenVMM process `pid`, retrying until `deadline` while
 /// the endpoint is not yet available and the process is still alive.
 pub(crate) fn connect(
@@ -190,11 +196,7 @@ impl ControlSession {
         let request_id = request_id()?;
         self.send_app(APP_FEATURES, request_id, &[], Some(deadline))?;
         let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
-        if response_id != request_id {
-            return Err(SessionError::Protocol(
-                "the guest agent returned a mismatched request ID".to_owned(),
-            ));
-        }
+        validate_response_id(request_id, response_id)?;
         match kind {
             APP_READY if status == 0 => Ok(GuestFeatures::decode(&payload)?),
             APP_ERROR if payload == UNSUPPORTED_OPERATION => Ok(GuestFeatures::NONE),
@@ -223,11 +225,7 @@ impl ControlSession {
         deadline: Option<Instant>,
     ) -> Result<ExecEvent, SessionError> {
         let (kind, response_id, status, payload) = self.read_app(deadline)?;
-        if response_id != request_id {
-            return Err(SessionError::Protocol(
-                "the guest agent returned a mismatched request ID".to_owned(),
-            ));
-        }
+        validate_response_id(request_id, response_id)?;
         match kind {
             APP_STDOUT => Ok(ExecEvent::Stdout(payload)),
             APP_STDERR => Ok(ExecEvent::Stderr(payload)),
@@ -627,6 +625,20 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn mismatched_exec_request_id_fails_closed() {
+        let (transport, _) = scripted(&[outer(OUTER_READY, 1, 0, &[])]);
+        let mut session =
+            ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline()).unwrap();
+        session.transport =
+            scripted(&[outer(OUTER_DATA, 1, 1, &encode_app(APP_STDOUT, 2, 0, b"x"))]).0;
+        assert!(matches!(
+            session.next_exec_event(1, Some(deadline())),
+            Err(SessionError::Protocol(message))
+                if message == "the guest agent returned a mismatched request ID"
+        ));
     }
 
     #[test]
