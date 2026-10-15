@@ -1269,6 +1269,20 @@ class AdversarialOracleTests(unittest.TestCase):
         self.assertEqual(canary.connections, 1)
         self.assertIsNone(canary.error)
 
+    def test_network_canary_closes_socket_when_setup_fails(self) -> None:
+        listener = MagicMock()
+        listener.bind.side_effect = OSError("address unavailable")
+        with (
+            patch(
+                "nvx_tools.adversarial_oracles.socket.socket",
+                return_value=listener,
+            ),
+            self.assertRaisesRegex(OSError, "address unavailable"),
+        ):
+            NetworkCanary(Path("network-canary.jsonl"))
+
+        listener.close.assert_called_once_with()
+
     def test_filesystem_and_network_canaries_detect_policy_violations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session = OracleSession.create(

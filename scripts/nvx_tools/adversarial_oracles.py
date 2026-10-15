@@ -82,10 +82,14 @@ class NetworkCanary:
     def __init__(self, log_path: Path) -> None:
         self._log_path = log_path
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind(("127.0.0.1", 0))
-        self._listener.listen()
-        self._listener.settimeout(WATCHDOG_INTERVAL_SECONDS)
+        try:
+            self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._listener.bind(("127.0.0.1", 0))
+            self._listener.listen()
+            self._listener.settimeout(WATCHDOG_INTERVAL_SECONDS)
+        except OSError:
+            self._listener.close()
+            raise
         self._connections = 0
         self._error: str | None = None
         self._lock = threading.Lock()
