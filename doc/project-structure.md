@@ -132,7 +132,8 @@ runner setup for incremental formal verification of the pinned OpenVMM release.
 and Ubuntu initramfs builds. `init` controls early boot, emits a stable
 distribution marker, and launches either the normal guest shell or the
 Alpine-only `nvx-init-agent` sandbox profile. `guest/alpine` contains the
-musl-linked container-entry helpers that are not installed in the Ubuntu
+Alpine-specific container-entry shell helpers, which copy the musl loader and
+linked libraries into the workload and are not installed in the Ubuntu
 initramfs. The sandbox helpers resolve fixed virtio-blk roles through
 sysfs, assemble EROFS lower layers over ext4 scratch, place the workload in its
 cgroup before release, construct its mount/PID/UTS namespaces, enter its
