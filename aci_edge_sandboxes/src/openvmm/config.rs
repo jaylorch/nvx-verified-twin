@@ -100,8 +100,8 @@ impl FromStr for Hypervisor {
 ///
 /// Construct it with [`OpenVmmConfig::discover`], [`OpenVmmConfig::from_artifacts`],
 /// [`OpenVmmConfig::new`], [`OpenVmmConfig::from_release_dir`], or
-/// [`OpenVmmConfig::from_repo_layout`], then adjust the public fields. Defaults match
-/// `scripts/nvx.py sandbox`.
+/// [`OpenVmmConfig::from_repo_layout`], then adjust the public fields. The memory, workload
+/// identity, and hostname defaults match `scripts/nvx.py sandbox`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OpenVmmConfig {
