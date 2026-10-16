@@ -19,7 +19,7 @@ are build products or caches and are not part of the tracked source tree. The
 | `openvmm` | Private OpenVMM submodule pinned to `microvm/mshv` |
 | `data` | Tracked performance history and generated benchmark data |
 | `scripts/nvx_tools` | Retained NVX build and benchmark implementation |
-| `scripts/nvx.py` | Canonical build, run, benchmark, and packaging CLI |
+| `scripts/nvx.py` | Canonical CLI for builds, runtime, tests, performance, source collection, and releases |
 | `scripts/nvx_adversarial_executor.py` | Credential-free adversarial executor protocol entry point |
 | `.cache/linux` | Generated verified/patched Linux tree; ignored by Git |
 | `build/sources` | Generated Linux, Alpine, and Ubuntu release sources; ignored by Git |
