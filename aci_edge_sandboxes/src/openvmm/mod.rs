@@ -437,6 +437,10 @@ fn read_report(path: &Path) -> Option<Metadata> {
     Some(metadata)
 }
 
+fn effective_memory_mib(request: &ProvisionRequest, default: u32) -> u32 {
+    request.microvm.provision.memory_mib.unwrap_or(default)
+}
+
 impl Backend for OpenVmmBackend {
     fn name(&self) -> &str {
         BACKEND_KEY
@@ -489,11 +493,7 @@ impl Backend for OpenVmmBackend {
     }
 
     fn validate_provision(&self, request: &ProvisionRequest) -> Result<()> {
-        let memory_mib = request
-            .microvm
-            .provision
-            .memory_mib
-            .unwrap_or(self.config.memory_mib);
+        let memory_mib = effective_memory_mib(request, self.config.memory_mib);
         if memory_mib == 0 {
             return Err(Error::policy_validation(
                 "microvm.provision.memoryMib must be positive",
@@ -510,11 +510,7 @@ impl Backend for OpenVmmBackend {
     fn provision(&self, request: &ProvisionRequest) -> Result<ProvisionResult> {
         self.validate_provision(request)?;
         self.probe()?;
-        let memory_mib = request
-            .microvm
-            .provision
-            .memory_mib
-            .unwrap_or(self.config.memory_mib);
+        let memory_mib = effective_memory_mib(request, self.config.memory_mib);
         let filesystem = match &request.filesystem {
             Some(policy) => filesystem::plan(policy)?,
             None => None,
