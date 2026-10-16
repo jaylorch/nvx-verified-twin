@@ -14460,6 +14460,31 @@ AUTHORIZATION_VALUE = "Bearer placeholder-value"
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_package_release_reports_version_read_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "VERSION").mkdir()
+
+            with (
+                patch.object(BuildConstants, "REPO_ROOT", root),
+                patch.object(
+                    release,
+                    "_guest_release_inputs",
+                    return_value=((), [], [], []),
+                ),
+                patch("sys.stderr", io.StringIO()),
+                self.assertRaisesRegex(
+                    common.ScriptError,
+                    "failed to read NVX version",
+                ),
+            ):
+                release.package_release(
+                    version=None,
+                    destination=root / "release",
+                    include_source=False,
+                    force=False,
+                )
+
     def test_alpine_source_validation_rejects_malformed_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
             source_dir = Path(temporary)
