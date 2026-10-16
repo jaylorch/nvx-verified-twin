@@ -197,6 +197,20 @@ def lifecycle_document(
 
 
 class PerformanceTests(unittest.TestCase):
+    def test_write_results_removes_staging_file_when_publish_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                patch.object(performance.os, "replace", side_effect=OSError("publish")),
+                self.assertRaisesRegex(OSError, "publish"),
+            ):
+                performance.write_results(
+                    root / "results.csv",
+                    [performance.Result("commit", "latency", "ms", "lower", 1.0)],
+                )
+
+            self.assertEqual(list(root.iterdir()), [])
+
     def test_ci_one_vcpu_metric_count_matches_collectors(self):
         expected = len(
             performance.SHARED_METRICS | performance.LIFECYCLE_METRICS

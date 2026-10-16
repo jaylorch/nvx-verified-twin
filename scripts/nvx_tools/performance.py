@@ -672,7 +672,10 @@ def write_results(path: Path, results: Iterable[Result]) -> None:
                 }
             )
         temporary_path = Path(output.name)
-    os.replace(temporary_path, path)
+    try:
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def read_results(path: Path) -> list[Result]:
