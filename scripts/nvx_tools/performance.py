@@ -1332,6 +1332,17 @@ def collect_openvmm_results(
     return output_path
 
 
+def _metric_difference_details(actual: Iterable[str], expected: Iterable[str]) -> str:
+    actual_metrics = set(actual)
+    expected_metrics = set(expected)
+    details: list[str] = []
+    if missing := sorted(expected_metrics - actual_metrics):
+        details.append("missing: " + ", ".join(missing))
+    if extra := sorted(actual_metrics - expected_metrics):
+        details.append("unexpected: " + ", ".join(extra))
+    return "; ".join(details)
+
+
 def collect_results(
     platform: str,
     commit: str,
@@ -1536,16 +1547,10 @@ def collect_results(
     if require_shell_snapshot_restore_512:
         expected_restore_metrics = {"shell_snapshot_restore_512_mib"}
         if collected.keys() != expected_restore_metrics:
-            missing = sorted(expected_restore_metrics - collected.keys())
-            extra = sorted(collected.keys() - expected_restore_metrics)
-            details: list[str] = []
-            if missing:
-                details.append("missing: " + ", ".join(missing))
-            if extra:
-                details.append("unexpected: " + ", ".join(extra))
+            details = _metric_difference_details(collected, expected_restore_metrics)
             raise PerformanceError(
                 "512 MiB shell restore result must contain exactly "
-                "shell_snapshot_restore_512_mib (" + "; ".join(details) + ")"
+                "shell_snapshot_restore_512_mib (" + details + ")"
             )
         if dimensions.processors not in {2, 4, 8}:
             raise PerformanceError(
@@ -1571,16 +1576,10 @@ def collect_results(
         SHARED_METRICS | LIFECYCLE_METRICS if lifecycle is not None else SHARED_METRICS
     )
     if require_shared_suite and collected.keys() != expected_metrics:
-        missing = sorted(expected_metrics - collected.keys())
-        extra = sorted(collected.keys() - expected_metrics)
-        details: list[str] = []
-        if missing:
-            details.append("missing: " + ", ".join(missing))
-        if extra:
-            details.append("unexpected: " + ", ".join(extra))
+        details = _metric_difference_details(collected.keys(), expected_metrics)
         raise PerformanceError(
             f"shared benchmark suite must contain exactly {len(expected_metrics)} metrics ("
-            + "; ".join(details)
+            + details
             + ")"
         )
 
