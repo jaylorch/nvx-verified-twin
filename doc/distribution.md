@@ -18,8 +18,8 @@ python3 scripts/nvx.py collect-sources
 This produces a patched Linux corresponding-source archive under
 `build/sources/linux`, exact Alpine recipes/upstream sources under
 `build/sources/alpine`, and exact Ubuntu `.dsc` plus referenced source members
-under `build/sources/ubuntu`. Then stage the binary release with four separate
-source artifacts:
+under `build/sources/ubuntu`. The project-source archive is created later by
+`package --include-source` while it stages the four source artifacts:
 
 ```bash
 python3 scripts/nvx.py package --include-source
