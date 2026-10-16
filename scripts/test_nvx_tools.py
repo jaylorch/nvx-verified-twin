@@ -13405,6 +13405,22 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires at least 8"):
             benchmark.validate_benchmark_cpu_set(set(range(7)), 8, 0)
 
+    def test_benchmark_cpus_validates_range_and_guest_capacity(self):
+        args = argparse.Namespace(cpus="0,2", processors=2, host_cpu_reserve=1)
+        with (
+            patch.object(benchmark.os, "cpu_count", return_value=3),
+            patch.object(benchmark, "validate_benchmark_cpu_set") as validate,
+        ):
+            self.assertEqual(benchmark._benchmark_cpus(args, run_guest=False), {0, 2})
+            validate.assert_not_called()
+            benchmark._benchmark_cpus(args, run_guest=True)
+            validate.assert_called_once_with({0, 2}, 2, 1)
+            args.cpus = "0,3"
+            with self.assertRaisesRegex(
+                ValueError, "exceeds the 3 available logical CPUs"
+            ):
+                benchmark._benchmark_cpus(args, run_guest=False)
+
     def test_snapshot_capture_runs_smp_probe_for_selected_count(self):
         args = argparse.Namespace(
             warmups=0,

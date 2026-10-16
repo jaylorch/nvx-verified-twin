@@ -701,6 +701,18 @@ def validate_benchmark_cpu_set(
         )
 
 
+def _benchmark_cpus(args: argparse.Namespace, *, run_guest: bool) -> set[int]:
+    cpus = parse_cpu_set(args.cpus)
+    available_cpus = os.cpu_count() or 1
+    if max(cpus) >= available_cpus:
+        raise ValueError(
+            f"CPU set {args.cpus!r} exceeds the {available_cpus} available logical CPUs"
+        )
+    if run_guest:
+        validate_benchmark_cpu_set(cpus, args.processors, args.host_cpu_reserve)
+    return cpus
+
+
 def set_windows_affinity(pid: int, cpus: set[int]) -> None:
     if os.name != "nt":
         return
@@ -5960,14 +5972,7 @@ def run_native_linux(args: argparse.Namespace) -> int:
                 "Linux phase 2 benchmark executable",
             )
 
-    cpus = parse_cpu_set(args.cpus)
-    available_cpus = os.cpu_count() or 1
-    if max(cpus) >= available_cpus:
-        raise ValueError(
-            f"CPU set {args.cpus!r} exceeds the {available_cpus} available logical CPUs"
-        )
-    if run_guest:
-        validate_benchmark_cpu_set(cpus, args.processors, args.host_cpu_reserve)
+    _benchmark_cpus(args, run_guest=run_guest)
     prefix = ["taskset", "-c", args.cpus]
     if run_workloads:
         assert executable is not None and kernel is not None and initrd is not None
@@ -6391,14 +6396,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             nvx_dir / "build" / AlpineBuildConstants.INITRAMFS_NAME,
             "NVX initramfs",
         )
-    cpus = parse_cpu_set(args.cpus)
-    available_cpus = os.cpu_count() or 1
-    if max(cpus) >= available_cpus:
-        raise ValueError(
-            f"CPU set {args.cpus!r} exceeds the {available_cpus} available logical CPUs"
-        )
-    if run_guest:
-        validate_benchmark_cpu_set(cpus, args.processors, args.host_cpu_reserve)
+    cpus = _benchmark_cpus(args, run_guest=run_guest)
 
     selected = ("whp", "kvm") if args.backend == "both" else (args.backend,)
     boot_binaries: dict[str, Path] = {}
