@@ -15159,6 +15159,17 @@ class ReleaseTests(unittest.TestCase):
             binary, build_dir / OpenVMMBuildConstants.PROVENANCE_NAME
         )
 
+    def test_package_rejects_non_utf8_openvmm_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provenance = Path(temporary) / OpenVMMBuildConstants.PROVENANCE_NAME
+            provenance.write_bytes(b"\xff")
+
+            with self.assertRaisesRegex(
+                common.ScriptError,
+                "invalid OpenVMM build provenance",
+            ):
+                release._validate_openvmm_provenance(Path("openvmm"), provenance)
+
     def test_package_rejects_dirty_openvmm_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
