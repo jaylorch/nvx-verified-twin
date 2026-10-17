@@ -4489,7 +4489,7 @@ def write_benchmark_metadata(
     if device_io and path.is_file():
         try:
             existing = json.loads(path.read_text(encoding="utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise ValueError(f"invalid resumable benchmark metadata {path}") from error
         if existing != document:
             raise ValueError(

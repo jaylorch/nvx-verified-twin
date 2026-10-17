@@ -14395,6 +14395,36 @@ class BenchmarkTests(unittest.TestCase):
             )
             self.assertEqual(metadata.call_args.args[1], output)
 
+    def test_device_io_resume_metadata_read_errors_are_actionable(self):
+        args = nvx.parse_args(["benchmark", "--suite", "device-io"])
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / benchmark.BENCHMARK_METADATA_FILENAME).write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(benchmark, "sha256_file", return_value="0" * 64),
+                patch.object(
+                    benchmark, "_device_io_helper_provenance", return_value={}
+                ),
+                patch.object(benchmark, "_git_revision", return_value=None),
+                patch.object(benchmark, "_git_status", return_value=[]),
+                patch.object(Path, "read_text", side_effect=PermissionError("denied")),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "invalid resumable benchmark metadata",
+                ),
+            ):
+                benchmark.write_benchmark_metadata(
+                    args,
+                    output,
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initramfs"),
+                    "kvm",
+                )
+
     def test_package_command_forwards_parsed_options(self):
         args = nvx.parse_args(
             [
