@@ -29,6 +29,9 @@ python3 scripts/nvx.py init
 
 Python 3.10 or newer and Git are required on every platform.
 
+Building OpenVMM locally also requires Rust stable. Running
+`scripts/nvx.py test-openvmm-unit` additionally requires cargo-nextest 0.9.133.
+
 By default, a microVM boots on the built-in
 [CPU profile](usage.md#cpu-profiles) of its host's CPU, so the host needs a CPU
 that one of OpenVMM's built-in profiles serves, four Intel generations and
@@ -100,8 +103,8 @@ from an elevated PowerShell session and reboot:
 Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All
 ```
 
-Building NVX locally also requires Rust stable, Visual Studio 2022 C++ build tools, the Windows
-SDK, and Docker Desktop using Linux containers.
+Building NVX locally on Windows also requires Visual Studio 2022 C++ build
+tools, the Windows SDK, and Docker Desktop using Linux containers.
 
 ## Automated environment bootstrap
 
