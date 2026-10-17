@@ -9426,6 +9426,17 @@ class AciSandboxRunnerTests(unittest.TestCase):
         self.assertTrue((sandbox / "launch.json").is_file())
         self.assertIn(f"{sandbox} (OpenVMM pid 77)", stderr)
 
+    def test_handler_ignores_invalid_recorded_process_ids(self):
+        for value in (True, 0, -1):
+            with self.subTest(value=value):
+                _state_root, stderr = self._run_leaving(
+                    {
+                        "runtime.json": {"pid": value},
+                        "launch.json": {"process": {"pid": 77}},
+                    }
+                )
+                self.assertIn("OpenVMM pid 77", stderr)
+
 
 def _write_managed_runtime(state: Path, pid: int, start_time: int | None) -> None:
     runtime: dict[str, object] = {

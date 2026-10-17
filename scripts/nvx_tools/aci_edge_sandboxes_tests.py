@@ -102,7 +102,7 @@ def recorded_pid(sandbox: Path) -> int | None:
                 value = None
                 break
             value = cast(dict[str, object], value).get(key)
-        if isinstance(value, int):
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
     return None
 
