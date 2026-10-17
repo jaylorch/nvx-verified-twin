@@ -1,4 +1,4 @@
-"""Helpers for creating reproducible source archives."""
+"""Helpers for creating reproducible source and release archives."""
 
 from __future__ import annotations
 
