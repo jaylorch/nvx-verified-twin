@@ -15889,6 +15889,22 @@ class GitOutputTests(unittest.TestCase):
         )
 
 
+class RunCheckedTests(unittest.TestCase):
+    def test_command_launch_failure_is_a_script_error(self):
+        with (
+            patch.object(
+                common.subprocess,
+                "run",
+                side_effect=FileNotFoundError("missing tool"),
+            ),
+            self.assertRaisesRegex(
+                common.ScriptError,
+                r"failed to run command missing-command: missing tool",
+            ),
+        ):
+            common.run_checked(["missing-command"])
+
+
 class SharedFileTests(unittest.TestCase):
     def test_checksum_manifest_detects_modified_file(self):
         with tempfile.TemporaryDirectory() as temporary:
