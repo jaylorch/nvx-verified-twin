@@ -538,7 +538,7 @@ the eight lifecycle metrics, producing a 29-metric one-vCPU result. CI collects 
 operation-rate metrics from their separate raw-log directory and merges them by ABI, processor
 count, commit, and metric, producing the final 34-metric ABI-2 one-vCPU result. Higher-vCPU
 collection uses `--require-shell-snapshot-restore-512`, which requires exactly
-`shell_snapshot_restore_512_mib` plus canonical one-warmup/five-sample metadata for a 2-, 4-, or
+`shell_snapshot_restore_512_mib` plus canonical one-warmup/ten-sample metadata for a 2-, 4-, or
 8-vCPU guest. A `device-io` directory is recognized from metadata and must contain exactly its five
 metrics and every configured attempt. Each backend job publishes its p50 tables and one-vCPU lifecycle diagnostics to
 `$GITHUB_STEP_SUMMARY`. Pull-request regression checks compare KVM, MSHV, and WHP results with the
