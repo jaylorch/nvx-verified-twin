@@ -364,7 +364,7 @@ post-campaign boot.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--backend` | required | Select KVM or MSHV on Linux, or WHP on Windows. |
-| `--campaign` | required | Select workload, privileged-guest, or snapshot boundary probes. |
+| `--campaign` | required | Select workload, guest, or snapshot isolation probes. |
 | `--budget-seconds` | `900` | Bound preflight, actions, canary boot, and minimization wall time. |
 | `--budget-actions` | `8` | Bound accepted and executed broker actions. |
 | `--budget-ai-credits` | `300` | Bound charged Copilot usage; the minimum is 60 credits so authentication preflight and at least one action each retain a 30-credit CLI cap. |
