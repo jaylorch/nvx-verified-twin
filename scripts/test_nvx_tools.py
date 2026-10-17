@@ -2288,6 +2288,23 @@ class CiTests(unittest.TestCase):
         )
         run_checked.assert_not_called()
 
+    def test_openvmm_tests_reject_non_utf8_installed_targets(self):
+        installed_targets = common.CommandResult(
+            args=("rustup", "target", "list"),
+            returncode=0,
+            stdout=b"\xff",
+            stderr=b"",
+        )
+
+        with (
+            patch.object(ci, "run_capture", return_value=installed_targets),
+            self.assertRaisesRegex(
+                common.ScriptError,
+                "installed Rust target query returned non-UTF-8 output",
+            ),
+        ):
+            ci._prepare_openvmm_test_environment("whp", "rustup")
+
     def test_openvmm_tests_prepare_job_local_toolchain_for_missing_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

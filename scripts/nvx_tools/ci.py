@@ -325,7 +325,12 @@ def _prepare_openvmm_test_environment(
         ]
     )
     require_success(installed, "installed Rust target query")
-    installed_targets = set(installed.stdout.decode("utf-8").splitlines())
+    try:
+        installed_targets = set(installed.stdout.decode("utf-8").splitlines())
+    except UnicodeDecodeError as error:
+        raise ScriptError(
+            "installed Rust target query returned non-UTF-8 output"
+        ) from error
 
     environment = os.environ.copy()
     environment["RUSTUP_TOOLCHAIN"] = OpenVMMBuildConstants.RUST_TOOLCHAIN
