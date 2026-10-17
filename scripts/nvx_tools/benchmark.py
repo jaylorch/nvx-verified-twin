@@ -1266,7 +1266,7 @@ def drain_exited_output(
     deadline = time.monotonic() + timeout
     while not output.closed:
         try:
-            stream, chunk = output.get(timeout=max(0.0, deadline - time.monotonic()))
+            stream, chunk = output.get(timeout=common.remaining_timeout(deadline))
         except queue.Empty:
             return
         if stream != "console":
