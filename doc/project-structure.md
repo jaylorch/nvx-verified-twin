@@ -77,6 +77,7 @@ nvx/
 |   `-- artifacts.json           Release package pinned for the bundled artifacts
 |-- openvmm/                     Private OpenVMM Git submodule
 |-- scripts/                     Build, run, benchmark, and release tooling
+|   |-- setup/                   Host preparation scripts for supported platforms
 |   |-- nvx_tools/               Python implementation behind the NVX CLI
 |   |   |-- benchmark.py         OpenVMM benchmark coordinator
 |   |   |-- benchmark_scripts/   Shell programs and benchmark templates
