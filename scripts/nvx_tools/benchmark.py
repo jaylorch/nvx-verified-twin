@@ -930,7 +930,7 @@ def parse_snapshot_profile_line(line: bytes) -> dict[str, object] | None:
 
 def _profile_int(record: dict[str, object], name: str) -> int:
     value = record[name]
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"snapshot profile field {name!r} is not an integer")
     return value
 

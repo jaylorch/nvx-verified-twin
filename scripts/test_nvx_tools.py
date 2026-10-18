@@ -11455,6 +11455,7 @@ class BenchmarkTests(unittest.TestCase):
             ([gate, gate, publication], "exactly one 'input_gate'"),
             ([gate, publication, publication], "exactly one 'publication_commit'"),
             ([gate, {**publication, "pid": 43}], "different process"),
+            ([{**gate, "duration_ns": True}, publication], "not an integer"),
             ([{**gate, "duration_ns": -1}, publication], "not monotonic"),
             ([{**gate, "process_elapsed_ns": 10}, publication], "not monotonic"),
             ([gate, {**publication, "process_elapsed_ns": 125}], "not monotonic"),
