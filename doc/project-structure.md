@@ -128,8 +128,8 @@ runner setup for incremental formal verification of the pinned OpenVMM release.
 
 ### `guest/` and `ubuntu/`
 
-`guest/common` contains scripts and static helper sources shared by the Alpine
-and Ubuntu initramfs builds. `init` controls early boot, emits a stable
+`guest/common` contains scripts and static helper sources shared by the Alpine,
+Ubuntu, and Azure Linux initramfs builds. `init` controls early boot, emits a stable
 distribution marker, and launches either the normal guest shell or the
 Alpine-only `nvx-init-agent` sandbox profile. `guest/alpine` contains the
 musl-linked container-entry helpers that are not installed in the Ubuntu
