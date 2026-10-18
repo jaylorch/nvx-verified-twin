@@ -76,8 +76,8 @@ recording its provenance. Host OS detection and backend validation live in
 
 Fixed build inputs and defaults live in
 [`build_constants.py`](../scripts/nvx_tools/build_constants.py). Its namespace
-classes group kernel, OpenVMM, Alpine, Ubuntu, initramfs, Docker, cache-tool,
-and release settings. For example, Python callers use
+classes group kernel, OpenVMM, Alpine, Ubuntu, Azure Linux, initramfs, Docker,
+Zstandard, and release settings. For example, Python callers use
 `KernelBuildConstants.VERSION` and `AlpineBuildConstants.MINIROOTFS_SHA256`;
 the previous module-level constants are not re-exported. Shared repository
 and artifact directories belong to `BuildConstants`.
