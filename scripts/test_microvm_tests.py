@@ -4198,6 +4198,7 @@ class MicrovmTests(unittest.TestCase):
                 ) as boot_command,
                 patch.object(microvm_tests, "capture_snapshot") as capture,
                 patch.object(microvm_tests, "OpenvmmProcess") as process,
+                patch.object(common, "time", fake_time),
                 patch.object(microvm_tests, "time", fake_time),
             ):
                 active = process.return_value.__enter__.return_value

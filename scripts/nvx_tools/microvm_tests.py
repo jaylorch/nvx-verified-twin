@@ -52,6 +52,7 @@ from .common import (
     ScriptError,
     artifact_path,
     openvmm_binary_path,
+    remaining_timeout,
     require_file,
     sha256_file,
 )
@@ -3199,7 +3200,7 @@ def run_restore_downtime(
             snapshots.append((name, processors, snapshot_path))
         restore_after = time.monotonic() + RESTORE_DOWNTIME_SECONDS
         for name, processors, snapshot_path in snapshots:
-            time.sleep(max(0.0, restore_after - time.monotonic()))
+            time.sleep(remaining_timeout(restore_after))
             context = f"{name} restore after a {RESTORE_DOWNTIME_SECONDS:g} s downtime"
             with OpenvmmProcess(
                 snapshot_restore_command(
