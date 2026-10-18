@@ -50,7 +50,8 @@ Networking requires the explicit `portable` capability profile. It uses the
 same in-process data plane on KVM, MSHV, and WHP; omitting either `--net` or
 `--network-profile portable` is rejected before OpenVMM starts.
 
-Select an explicit processor count after building the matching specialized guest kernel:
+Select an explicit processor count; the same built guest kernel supports every
+permitted count:
 
 ```bash
 python3 scripts/nvx.py run --machine microvm --processors 8
