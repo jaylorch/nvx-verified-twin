@@ -17,14 +17,13 @@ These seven-day artifacts are named
 does not replace the failed attempt's diagnostics. Linux collects them from
 `openvmm/target/vmm_tests/test_results`; Windows uses
 `<runner-temp>/<backend>/test_results`.
-The `nvx-microvm-tests-{kvm,mshv,whp}` jobs consume the NVX Linux kernel and
-the NVX Linux kernel plus the selected Alpine or Ubuntu initramfs and exercises
-Linux, SMP, virtio, sandbox, and snapshot behavior through the public OpenVMM
-CLI. Alpine-control-only scenarios remain explicit and are rejected for the
-Ubuntu initramfs. Each job also boots the Azure Linux initramfs through its
-one-vCPU smoke set, under the same time ABI checks; the debug-kernel jobs skip
-it, as they skip the Ubuntu tests. Failure logs from the NVX layer are uploaded
-per backend.
+The `nvx-microvm-tests-{kvm,mshv,whp}` jobs consume the NVX Linux kernel with
+the Alpine, Ubuntu, and Azure Linux initramfs. They exercise Linux, SMP, virtio,
+sandbox, and snapshot behavior through the public OpenVMM CLI.
+Alpine-control-only scenarios remain explicit and are rejected for the Ubuntu
+initramfs. Each job boots Azure Linux through its one-vCPU smoke set under the
+same time ABI checks; the debug-kernel jobs skip it, as they skip the Ubuntu
+tests. Failure logs from the NVX layer are uploaded per backend.
 Every harness launch, in the tests and the benchmarks, scans the OpenVMM
 console for the guest's [time ABI](design/time-abi.md) output, and the tests
 scan every virtio console they read over TCP the same way, to its end. An
