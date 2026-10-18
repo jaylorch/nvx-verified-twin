@@ -459,6 +459,17 @@ def _read_outcome_report(path: Path) -> dict[str, Any]:
         "host_loopback",
     }:
         raise RuntimeError("structured outcome report has an invalid network policy")
+    numeric_values = (
+        outcome["status_code"],
+        policy["status_code"],
+        policy["allow_rule_count"],
+        policy["deny_rule_count"],
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in numeric_values
+    ):
+        raise RuntimeError("structured outcome report has invalid numeric fields")
     if not isinstance(teardown_value, dict):
         raise RuntimeError("structured outcome report has an invalid teardown outcome")
     teardown = cast(dict[str, object], teardown_value)

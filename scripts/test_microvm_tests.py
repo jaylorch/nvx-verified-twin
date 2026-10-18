@@ -1748,6 +1748,39 @@ class MicrovmTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unsupported version"):
                 microvm_tests._read_outcome_report(path)
 
+    def test_structured_outcome_rejects_boolean_numeric_fields(self):
+        report = self._outcome_report(
+            "whp",
+            outcome={
+                "operation": "run",
+                "category": "guest-exit",
+                "status_code": 0,
+            },
+            policy={
+                "status": "applied",
+                "status_code": 0,
+                "mode": "rules",
+                "allow_rule_count": 0,
+                "deny_rule_count": 0,
+                "host_loopback": "deny",
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "outcome.json"
+            for section, field in (
+                ("outcome", "status_code"),
+                ("network_policy", "status_code"),
+                ("network_policy", "allow_rule_count"),
+                ("network_policy", "deny_rule_count"),
+            ):
+                with self.subTest(section=section, field=field):
+                    values = cast(dict[str, object], report[section])
+                    values[field] = True
+                    path.write_text(json.dumps(report), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "numeric fields"):
+                        microvm_tests._read_outcome_report(path)
+                    values[field] = 0
+
     def test_structured_outcome_preserves_invalid_primary_report(self):
         report = self._outcome_report(
             "whp",
