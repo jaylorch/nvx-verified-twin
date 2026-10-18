@@ -696,7 +696,12 @@ def read_results(path: Path) -> list[Result]:
                     raise PerformanceError(
                         f"p50 must be positive and finite in {path}:{line_number}"
                     )
-                if not row["commit"] or not row["metric"] or not row["unit"]:
+                if (
+                    (not legacy and row["platform"] and not row["platform"].strip())
+                    or not row["commit"]
+                    or not row["metric"]
+                    or not row["unit"]
+                ):
                     raise PerformanceError(
                         f"empty required field in {path}:{line_number}"
                     )

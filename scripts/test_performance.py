@@ -1690,6 +1690,20 @@ class PerformanceTests(unittest.TestCase):
             self.assertEqual(result.microvm_abi_version, 1)
             self.assertEqual(result.processors, 1)
 
+    def test_rejects_whitespace_platform_in_dimensioned_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "linux-kvm-baremetal.csv"
+            path.write_text(
+                ",".join(performance.CSV_FIELDS)
+                + "\n   ,2,1,commit,latency,ms,lower,10\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                performance.PerformanceError, "empty required field"
+            ):
+                performance.read_results(path)
+
     def test_collects_dimensioned_microvm_v2_results(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
