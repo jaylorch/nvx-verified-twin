@@ -14620,6 +14620,21 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(asset.url, "https://api.example.invalid/linux")
         self.assertEqual(asset.size, 300)
 
+    def test_invalid_release_query_json_is_reported_as_script_error(self):
+        for payload in (b"not json", b'["\xff"]'):
+            with (
+                self.subTest(payload=payload),
+                patch(
+                    "nvx_tools.release.urllib.request.OpenerDirector.open",
+                    return_value=io.BytesIO(payload),
+                ),
+                self.assertRaisesRegex(
+                    release.ScriptError,
+                    "GitHub release query returned invalid JSON",
+                ),
+            ):
+                release._latest_release_asset("example/nvx", "linux-kvm", None)
+
     def test_forbidden_release_query_reports_github_message_and_hint(self):
         error = urllib.error.HTTPError(
             "https://api.github.invalid/releases",
