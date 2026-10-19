@@ -2435,11 +2435,20 @@ class DoctorTests(unittest.TestCase):
             Path(command[command.index("-o") + 1]).write_bytes(b"probe")
             return completed("")
 
-        with patch.object(doctor.shutil, "which", return_value=None):
+        with patch.object(
+            doctor,
+            "require_tool",
+            side_effect=doctor.ScriptError(
+                "rustc is required to build the host time probe"
+            ),
+        ) as require_tool:
             with self.assertRaisesRegex(doctor.ScriptError, "rustc is required"):
                 doctor.build_probe(self.root)
+        require_tool.assert_called_once_with(
+            "rustc", "rustc is required to build the host time probe"
+        )
         with (
-            patch.object(doctor.shutil, "which", return_value="rustc"),
+            patch.object(doctor, "require_tool", return_value="rustc"),
             patch.object(doctor.subprocess, "run", side_effect=rustc) as run,
         ):
             self.assertEqual(doctor.build_probe(self.root), target)
@@ -2448,7 +2457,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"probe")
         target.unlink()
         with (
-            patch.object(doctor.shutil, "which", return_value="rustc"),
+            patch.object(doctor, "require_tool", return_value="rustc"),
             patch.object(
                 doctor.subprocess, "run", return_value=completed("", 1, "error[E0425]")
             ),
