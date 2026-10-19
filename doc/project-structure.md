@@ -8,6 +8,7 @@ are build products or caches and are not part of the tracked source tree. The
 
 | Path | Purpose |
 | --- | --- |
+| `.github/aw` | Pinned gh-aw actions and verified-twin workflow regression tests |
 | `.github/skills` | Copilot agent skills for common development workflows |
 | `.github/agents` | Bounded Copilot strategist definitions |
 | `.github/specula` | Incremental formal verification adapter and runner setup |
