@@ -9257,6 +9257,9 @@ class AciSandboxRunnerTests(unittest.TestCase):
 
         self.assertEqual(args.backend, "mshv")
         self.assertEqual(args.cargo, "cargo")
+        self.assertEqual(
+            args.output_dir, common.artifact_path("test-results") / "aci_edge_sandboxes"
+        )
         self.assertFalse(hasattr(args, "scratch_template"))
         self.assertIs(
             args.handler, aci_edge_sandboxes_tests.command_test_aci_edge_sandboxes

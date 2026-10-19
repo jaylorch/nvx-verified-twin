@@ -34,7 +34,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=BuildConstants.BUILD_DIR / "test-results" / "aci_edge_sandboxes",
+        default=artifact_path("test-results") / "aci_edge_sandboxes",
         help="directory that receives the OpenVMM log on failure",
     )
     parser.add_argument(
