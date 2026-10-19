@@ -6131,15 +6131,19 @@ def _kvm_worker_scratch_arguments(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def _stage_kvm_worker(executable: Path, kernel: Path, initrd: Path) -> tuple[str, str]:
+    stage_dir = "/tmp/openvmm-microvm-benchmark"
+    stage_kvm(executable, kernel, initrd, stage_dir)
+    return stage_dir, windows_to_wsl(NVX_SCRIPT)
+
+
 def benchmark_kvm(
     args: argparse.Namespace,
     executable: Path,
     kernel: Path,
     initrd: Path,
 ) -> BenchmarkResult:
-    stage_dir = "/tmp/openvmm-microvm-benchmark"
-    stage_kvm(executable, kernel, initrd, stage_dir)
-    script_wsl = windows_to_wsl(NVX_SCRIPT)
+    stage_dir, script_wsl = _stage_kvm_worker(executable, kernel, initrd)
     command = [
         "wsl.exe",
         "--exec",
@@ -6184,9 +6188,7 @@ def benchmark_e2e_kvm(
     kernel: Path,
     initrd: Path,
 ) -> KvmE2EResult:
-    stage_dir = "/tmp/openvmm-microvm-benchmark"
-    stage_kvm(executable, kernel, initrd, stage_dir)
-    script_wsl = windows_to_wsl(NVX_SCRIPT)
+    stage_dir, script_wsl = _stage_kvm_worker(executable, kernel, initrd)
     command = [
         "wsl.exe",
         "--exec",
@@ -6231,9 +6233,7 @@ def benchmark_snapshot_restore_kvm(
     kernel: Path,
     initrd: Path,
 ) -> BenchmarkResult:
-    stage_dir = "/tmp/openvmm-microvm-benchmark"
-    stage_kvm(executable, kernel, initrd, stage_dir)
-    script_wsl = windows_to_wsl(NVX_SCRIPT)
+    stage_dir, script_wsl = _stage_kvm_worker(executable, kernel, initrd)
     command = [
         "wsl.exe",
         "--exec",
@@ -6278,9 +6278,7 @@ def benchmark_snapshot_kvm(
     kernel: Path,
     initrd: Path,
 ) -> SnapshotCaptureResult:
-    stage_dir = "/tmp/openvmm-microvm-benchmark"
-    stage_kvm(executable, kernel, initrd, stage_dir)
-    script_wsl = windows_to_wsl(NVX_SCRIPT)
+    stage_dir, script_wsl = _stage_kvm_worker(executable, kernel, initrd)
     command = [
         "wsl.exe",
         "--exec",
