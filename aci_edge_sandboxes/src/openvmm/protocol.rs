@@ -148,9 +148,13 @@ pub(crate) struct AppFrame<'a> {
     pub(crate) payload: &'a [u8],
 }
 
+fn append_length_prefixed(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
 /// Encodes one application frame.
 pub(crate) fn encode_app(kind: u8, request_id: u64, status: i32, payload: &[u8]) -> Vec<u8> {
-    let length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
     let mut frame = Vec::with_capacity(APP_HEADER_LEN + payload.len());
     frame.extend_from_slice(&APP_MAGIC);
     frame.push(APP_VERSION);
@@ -158,8 +162,7 @@ pub(crate) fn encode_app(kind: u8, request_id: u64, status: i32, payload: &[u8])
     frame.extend_from_slice(&0u16.to_le_bytes());
     frame.extend_from_slice(&request_id.to_le_bytes());
     frame.extend_from_slice(&status.to_le_bytes());
-    frame.extend_from_slice(&length.to_le_bytes());
-    frame.extend_from_slice(payload);
+    append_length_prefixed(&mut frame, payload);
     frame
 }
 
@@ -280,9 +283,7 @@ pub(crate) fn encode_exec_payload(workload: &Workload<'_>) -> Result<Vec<u8>, Pr
                 "exec arguments must be 1 to {MAX_ARGUMENT_BYTES} bytes without NUL characters"
             )));
         }
-        let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        payload.extend_from_slice(&length.to_le_bytes());
-        payload.extend_from_slice(bytes);
+        append_length_prefixed(&mut payload, bytes);
     }
     payload.extend_from_slice(cwd.unwrap_or_default());
     let mut names = BTreeSet::new();
@@ -305,9 +306,7 @@ pub(crate) fn encode_exec_payload(workload: &Workload<'_>) -> Result<Vec<u8>, Pr
                 "exec environment names must be unique, but {name:?} repeats"
             )));
         }
-        let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        payload.extend_from_slice(&length.to_le_bytes());
-        payload.extend_from_slice(bytes);
+        append_length_prefixed(&mut payload, bytes);
     }
     if APP_HEADER_LEN + payload.len() > OUTER_MAX_PAYLOAD {
         return Err(violation("exec request exceeds the control protocol limit"));
