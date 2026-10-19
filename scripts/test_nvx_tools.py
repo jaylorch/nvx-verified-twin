@@ -6476,6 +6476,15 @@ class BuildTests(unittest.TestCase):
             ):
                 collect_ubuntu_sources._validate_dsc(dsc, record)
 
+    def test_ubuntu_dsc_rejects_non_utf8_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dsc = Path(temporary) / "example_1.0.dsc"
+            dsc.write_bytes(b"\xff")
+            with self.assertRaisesRegex(
+                common.ScriptError, "cannot read Ubuntu source metadata"
+            ):
+                collect_ubuntu_sources._dsc_document(dsc)
+
     def test_ubuntu_source_index_is_authenticated_by_signed_release(self):
         dsc_payload = b"dsc"
         source_payload = b"source"

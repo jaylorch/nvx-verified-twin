@@ -404,8 +404,12 @@ def _clearsigned_payload(text: str, label: str) -> str:
 
 def _dsc_document(path: Path) -> dict[str, str]:
     # The signed Release -> Sources.xz -> .dsc digest chain authenticates this file.
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ScriptError(f"cannot read Ubuntu source metadata {path}") from error
     payload = _clearsigned_payload(
-        path.read_text(encoding="utf-8"),
+        text,
         path.name,
     )
     documents = parse_deb822(payload)
