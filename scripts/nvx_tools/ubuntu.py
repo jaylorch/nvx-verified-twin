@@ -15,6 +15,7 @@ import stat
 import subprocess
 import tarfile
 import uuid
+import zlib
 from collections.abc import Iterable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
@@ -399,10 +400,15 @@ def safe_extract_tar(path: Path, destination: Path, *, label: str) -> None:
 
 
 def _decompress_tar_member(name: str, data: bytes) -> bytes:
-    if name.endswith(".gz"):
-        return gzip.decompress(data)
-    if name.endswith(".xz"):
-        return lzma.decompress(data)
+    try:
+        if name.endswith(".gz"):
+            return gzip.decompress(data)
+        if name.endswith(".xz"):
+            return lzma.decompress(data)
+    except (EOFError, gzip.BadGzipFile, lzma.LZMAError, zlib.error) as error:
+        raise ScriptError(
+            f"invalid compressed Debian package member {name}: {error}"
+        ) from error
     if name.endswith(".zst"):
         zstd = require_tool(
             "zstd",

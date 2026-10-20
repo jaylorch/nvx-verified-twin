@@ -6221,6 +6221,17 @@ class BuildTests(unittest.TestCase):
             ):
                 ubuntu.load_package_lock(path)
 
+    def test_ubuntu_invalid_compressed_package_member_is_actionable(self):
+        for name in ("data.tar.gz", "data.tar.xz"):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    common.ScriptError,
+                    f"invalid compressed Debian package member {name}",
+                ),
+            ):
+                ubuntu._decompress_tar_member(name, b"not compressed")
+
     def test_ubuntu_safe_extractor_rejects_archive_symlink_escape(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
