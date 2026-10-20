@@ -10937,6 +10937,15 @@ class SandboxTests(unittest.TestCase):
             with self.assertRaisesRegex(common.ScriptError, "failed to read"):
                 sandbox_lifecycle._read_json(path, "sandbox configuration")
 
+    def test_versioned_json_writer_reports_filesystem_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            with (
+                patch.object(Path, "write_text", side_effect=OSError("disk full")),
+                self.assertRaisesRegex(common.ScriptError, "failed to write"),
+            ):
+                sandbox_lifecycle._write_json(path, {"format": 1})
+
     def test_managed_exec_outcome_excludes_workload_data(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "outcome.json"

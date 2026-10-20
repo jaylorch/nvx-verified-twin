@@ -62,6 +62,8 @@ def _write_json(path: Path, value: dict[str, Any], mode: int = 0o600) -> None:
         )
         os.chmod(temporary, mode)
         temporary.replace(path)
+    except OSError as error:
+        raise ScriptError(f"failed to write sandbox state: {path}") from error
     finally:
         temporary.unlink(missing_ok=True)
 
