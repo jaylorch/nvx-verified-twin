@@ -468,7 +468,7 @@ class TcpConsole:
         before = self._monitor.status_queries
         deadline = time.monotonic() + timeout
         while self._monitor.status_queries == before:
-            remaining = deadline - time.monotonic()
+            remaining = remaining_timeout(deadline)
             if remaining <= 0:
                 raise TimeoutError(
                     f"nvx-time status did not exit within {timeout:g}s on the TCP console"
