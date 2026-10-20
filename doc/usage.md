@@ -264,6 +264,7 @@ the CI debug kernel, `build/vmlinux-debug`, whose soft-lockup and hung-task
 detectors the guest's time ABI watcher reports; without `--scenario`, it runs
 only the same-host restore scenarios `smp`, `smp-snapshot`,
 `restore-processors`, `restore-downtime`, and `snapshot-tiers`. The command
+allows 60 seconds for each scenario phase by default. It
 requires `build/vmlinux` (with `--debug-kernel`, `build/vmlinux-debug` and its
 `build/vmlinux-debug.config`), the selected initramfs, and
 `openvmm/target/release/openvmm[.exe]`.
