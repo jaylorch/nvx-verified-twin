@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import hashlib
 import itertools
 import os
 import platform
@@ -26,7 +25,7 @@ from pathlib import Path
 from .benchmark import run_guest_script, workload_boot_command
 from .build_constants import AlpineBuildConstants, BuildConstants, KernelBuildConstants
 from .ci import OPENVMM_TEST_BACKENDS
-from .common import ScriptError, artifact_path, openvmm_binary_path
+from .common import ScriptError, artifact_path, openvmm_binary_path, sha256_file
 from .time_abi import (
     CI_WARP_GAPS,
     LAPIC_HZ,
@@ -155,7 +154,7 @@ def _escape_markdown(text: str) -> str:
 
 def probe_path(directory: Path) -> Path:
     """Return the cached host probe binary for the current probe source."""
-    digest = hashlib.sha256(PROBE_SOURCE.read_bytes()).hexdigest()[:16]
+    digest = sha256_file(PROBE_SOURCE)[:16]
     suffix = ".exe" if os.name == "nt" else ""
     return directory / f"nvx-host-time-probe-{digest}{suffix}"
 

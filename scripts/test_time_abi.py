@@ -2427,6 +2427,14 @@ class DoctorTests(unittest.TestCase):
                 ["--backend", "kvm", "--no-openvmm", "--cpu-fingerprint", "x"]
             )
 
+    def test_probe_path_uses_shared_source_hash(self):
+        with patch.object(doctor, "sha256_file", return_value="1" * 64) as sha256:
+            target = doctor.probe_path(self.root)
+
+        suffix = ".exe" if doctor.os.name == "nt" else ""
+        self.assertEqual(target, self.root / f"nvx-host-time-probe-{'1' * 16}{suffix}")
+        sha256.assert_called_once_with(doctor.PROBE_SOURCE)
+
     def test_builds_the_host_probe_once_per_source_version(self):
         target = doctor.probe_path(self.root)
         self.assertRegex(target.name, r"^nvx-host-time-probe-[0-9a-f]{16}(\.exe)?$")
