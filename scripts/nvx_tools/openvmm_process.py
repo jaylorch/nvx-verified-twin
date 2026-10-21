@@ -137,7 +137,7 @@ class OpenvmmProcess:
         self._interaction.write_input(status_script().encode())
         deadline = time.monotonic() + STATUS_TIMEOUT_SECONDS
         while self._monitor.status_queries == 0:
-            remaining = deadline - time.monotonic()
+            remaining = remaining_timeout(deadline)
             if remaining <= 0:
                 self._fail(
                     TimeoutError(
