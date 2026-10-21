@@ -553,6 +553,24 @@ class PerformanceTests(unittest.TestCase):
                     "linux-kvm", "abc123", source, root / "results"
                 )
 
+    def test_openvmm_json_rejects_oversized_numbers(self):
+        for field, value in (
+            ("p50_ms", 10**400),
+            ("samples_ms", [10**400]),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary) / "linux-kvm.json"
+                document = lifecycle_document()
+                backends = cast(dict[str, object], document["backends"])
+                kvm = cast(dict[str, object], backends["kvm"])
+                kvm[field] = value
+                source.write_text(json.dumps(document), encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    performance.PerformanceError, r"positive(?: and)? finite"
+                ):
+                    performance.read_lifecycle_data("linux-kvm", source)
+
     def test_openvmm_json_rejects_unstable_snapshot_generation(self):
         unstable = [
             739.1318,

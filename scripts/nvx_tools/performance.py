@@ -850,7 +850,12 @@ def _openvmm_value(
         raise PerformanceError(
             f"expected a number at {source}:{section}.{backend}.{field}"
         )
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError as error:
+        raise PerformanceError(
+            f"value at {source}:{section}.{backend}.{field} must be positive and finite"
+        ) from error
     if not math.isfinite(value) or value <= 0:
         raise PerformanceError(
             f"value at {source}:{section}.{backend}.{field} must be positive and finite"
@@ -890,17 +895,24 @@ def _openvmm_samples(
     typed_samples = cast(list[object], samples)
     parsed: list[float] = []
     for index, value in enumerate(typed_samples):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value <= 0
-        ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise PerformanceError(
                 f"expected a positive finite sample at "
                 f"{source}:{section}.{backend}.{field}[{index}]"
             )
-        parsed.append(float(value))
+        try:
+            parsed_value = float(value)
+        except OverflowError as error:
+            raise PerformanceError(
+                f"expected a positive finite sample at "
+                f"{source}:{section}.{backend}.{field}[{index}]"
+            ) from error
+        if not math.isfinite(parsed_value) or parsed_value <= 0:
+            raise PerformanceError(
+                f"expected a positive finite sample at "
+                f"{source}:{section}.{backend}.{field}[{index}]"
+            )
+        parsed.append(parsed_value)
     return parsed
 
 
