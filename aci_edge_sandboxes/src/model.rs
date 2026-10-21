@@ -18,8 +18,8 @@ pub type Metadata = serde_json::Map<String, serde_json::Value>;
 /// to the caller's wire layer and are rejected here. Every field is optional, so `{}` provisions a
 /// sandbox with the backend defaults.
 ///
-/// The sandbox runs the guest's own Alpine Linux userland directly; there are no image layers or
-/// scratch disks. Guest state lives in memory and lasts until the sandbox stops.
+/// With the OpenVMM backend, the sandbox runs the guest's own Alpine Linux userland directly;
+/// there are no image layers or scratch disks. Guest state lives in memory until the sandbox stops.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProvisionRequest {
