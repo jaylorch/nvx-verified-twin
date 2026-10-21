@@ -162,10 +162,6 @@ impl Error {
         Self::new(ErrorCode::BackendUnavailable, message)
     }
 
-    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::Unsupported, message)
-    }
-
     pub(crate) fn backend_error(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::BackendError, message)
     }
@@ -204,7 +200,7 @@ mod tests {
 
     #[test]
     fn bodies_of_unsupported_errors_serialize_the_wire_code() {
-        let error = Error::unsupported("cancellation is not supported");
+        let error = Error::new(ErrorCode::Unsupported, "cancellation is not supported");
         assert_eq!(error.code(), ErrorCode::Unsupported);
         let body = error.body();
         assert_eq!(body.code, ErrorCode::BackendError);
