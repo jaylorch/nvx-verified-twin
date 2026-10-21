@@ -276,8 +276,7 @@ def _join_openvmm_tests(
     excluded_tests: tuple[str, ...] = (),
 ) -> str:
     test_filter = " | ".join(_exact_openvmm_test(test) for test in tests)
-    exclusions = "".join(f" & !{_exact_openvmm_test(test)}" for test in excluded_tests)
-    return f"({test_filter}){exclusions}"
+    return _exclude_openvmm_tests(test_filter, excluded_tests)
 
 
 OPENVMM_TEST_FILTERS = {
