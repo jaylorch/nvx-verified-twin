@@ -10,6 +10,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import TypedDict
 
@@ -676,6 +677,16 @@ def _normalize_initramfs_metadata(root: Path) -> None:
                 ) from error
 
 
+def _cleanup_initramfs_process(process: subprocess.Popen[bytes]) -> None:
+    if process.stdout is not None:
+        with suppress(OSError):
+            process.stdout.close()
+    with suppress(OSError):
+        process.kill()
+    with suppress(OSError):
+        process.wait()
+
+
 def _pack_initramfs(root: Path, output: Path) -> None:
     require_tool("find")
     require_tool("sort")
@@ -683,10 +694,12 @@ def _pack_initramfs(root: Path, output: Path) -> None:
     require_tool("gzip")
     _normalize_initramfs_metadata(root)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("wb") as archive:
+    with ExitStack() as cleanup, output.open("wb") as archive:
+        cleanup.callback(output.unlink, missing_ok=True)
         finder = subprocess.Popen(
             ["find", ".", "-print0"], cwd=root, stdout=subprocess.PIPE
         )
+        cleanup.callback(_cleanup_initramfs_process, finder)
         assert finder.stdout is not None
         sort_environment = os.environ.copy()
         sort_environment["LC_ALL"] = "C"
@@ -697,6 +710,7 @@ def _pack_initramfs(root: Path, output: Path) -> None:
             stdout=subprocess.PIPE,
             env=sort_environment,
         )
+        cleanup.callback(_cleanup_initramfs_process, sorter)
         finder.stdout.close()
         assert sorter.stdout is not None
         cpio = subprocess.Popen(
@@ -714,6 +728,7 @@ def _pack_initramfs(root: Path, output: Path) -> None:
             stdin=sorter.stdout,
             stdout=subprocess.PIPE,
         )
+        cleanup.callback(_cleanup_initramfs_process, cpio)
         sorter.stdout.close()
         assert cpio.stdout is not None
         gzip = subprocess.Popen(
@@ -721,11 +736,13 @@ def _pack_initramfs(root: Path, output: Path) -> None:
             stdin=cpio.stdout,
             stdout=archive,
         )
+        cleanup.callback(_cleanup_initramfs_process, gzip)
         cpio.stdout.close()
         gzip_code = gzip.wait()
         cpio_code = cpio.wait()
         sorter_code = sorter.wait()
         finder_code = finder.wait()
+        cleanup.pop_all()
     if finder_code or sorter_code or cpio_code or gzip_code:
         output.unlink(missing_ok=True)
         raise ScriptError(
