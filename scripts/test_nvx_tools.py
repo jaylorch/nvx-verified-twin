@@ -11247,6 +11247,24 @@ class SandboxTests(unittest.TestCase):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_phase2_affinity_failure_reaps_child(self):
+        process = MagicMock()
+        process.pid = 1234
+        process.poll.return_value = None
+        with (
+            patch.object(benchmark.subprocess, "Popen", return_value=process),
+            patch.object(
+                benchmark,
+                "set_windows_affinity",
+                side_effect=OSError("affinity failed"),
+            ),
+            self.assertRaisesRegex(OSError, "affinity failed"),
+        ):
+            benchmark.run_phase2_benchmark(["phase2"], windows_cpus={0})
+
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with()
+
     def test_kvm_worker_result_decoding(self):
         completed = subprocess.CompletedProcess(
             ["worker"],

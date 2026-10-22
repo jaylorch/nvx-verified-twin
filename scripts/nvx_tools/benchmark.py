@@ -5625,7 +5625,13 @@ def run_phase2_benchmark(
         env=environment,
     )
     if windows_cpus is not None:
-        set_windows_affinity(process.pid, windows_cpus)
+        try:
+            set_windows_affinity(process.pid, windows_cpus)
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            raise
 
     assert process.stdout is not None
     output: list[str] = []
