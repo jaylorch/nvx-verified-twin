@@ -14476,6 +14476,35 @@ class ReleaseTests(unittest.TestCase):
             ):
                 release._validate_alpine_sources([])
 
+    def test_alpine_source_validation_rejects_invalid_packages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source_dir = Path(temporary)
+            alpine_dir = source_dir / "alpine"
+            alpine_dir.mkdir()
+            current = AlpineBuildConstants.SOURCE_MANIFEST_FORMAT
+            cases: dict[str, object | None] = {
+                "missing": None,
+                "non-list": {},
+                "non-object": [1],
+                "missing field": [{"package": "foo"}],
+            }
+            for name, packages in cases.items():
+                document: dict[str, object] = {
+                    "format": current,
+                    "executables": [],
+                }
+                if packages is not None:
+                    document["packages"] = packages
+                (alpine_dir / "manifest.json").write_text(
+                    json.dumps(document), encoding="utf-8"
+                )
+                with (
+                    self.subTest(case=name),
+                    patch.object(BuildConstants, "SOURCE_DIR", source_dir),
+                    self.assertRaisesRegex(common.ScriptError, "invalid packages list"),
+                ):
+                    release._validate_alpine_sources([])
+
     def test_alpine_source_validation_checks_recorded_executables(self):
         with tempfile.TemporaryDirectory() as temporary:
             source_dir = Path(temporary)
