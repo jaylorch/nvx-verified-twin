@@ -248,7 +248,7 @@ impl fmt::Debug for Execution {
     }
 }
 
-type Collector = Option<thread::JoinHandle<io::Result<Vec<u8>>>>;
+pub(crate) type Collector = Option<thread::JoinHandle<io::Result<Vec<u8>>>>;
 
 fn spawn_collector(reader: Option<PipeReader>) -> Result<Collector> {
     let Some(mut reader) = reader else {
@@ -267,7 +267,7 @@ fn spawn_collector(reader: Option<PipeReader>) -> Result<Collector> {
         })
 }
 
-fn join_collector(collector: Collector) -> Result<Vec<u8>> {
+pub(crate) fn join_collector(collector: Collector) -> Result<Vec<u8>> {
     let Some(collector) = collector else {
         return Ok(Vec::new());
     };

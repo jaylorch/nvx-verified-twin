@@ -13,7 +13,7 @@ use crate::backend::{ExecControl, ExecIo};
 use crate::capabilities::Capabilities;
 use crate::client::AciEdgeSandbox;
 use crate::error::{Error, Result};
-use crate::exec::{Canceller, ExecOutcome, ExecOutput};
+use crate::exec::{Canceller, ExecOutcome, ExecOutput, join_collector};
 use crate::id::SandboxId;
 use crate::input::InputSource;
 use crate::model::{
@@ -234,7 +234,7 @@ impl AsyncExecution {
                 Some(stream) => Some(
                     thread::Builder::new()
                         .name("nvx-exec-collect".to_owned())
-                        .spawn(move || stream.reader.read_to_end_blocking())
+                        .spawn(move || Ok(stream.reader.read_to_end_blocking()))
                         .map_err(|error| {
                             Error::backend_error("failed to start an output collector thread")
                                 .with_source(error)
@@ -246,12 +246,7 @@ impl AsyncExecution {
                 .map(|stream| stream.reader.read_to_end_blocking())
                 .unwrap_or_default();
             let outcome = control.wait();
-            let stderr = match stderr {
-                Some(collector) => collector
-                    .join()
-                    .map_err(|_| Error::backend_error("output collector thread panicked"))?,
-                None => Vec::new(),
-            };
+            let stderr = join_collector(stderr)?;
             Ok(ExecOutput {
                 outcome: outcome?,
                 stdout,
