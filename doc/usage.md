@@ -646,7 +646,7 @@ python3 scripts/nvx.py benchmark [OPTIONS]
 | `--warmups N` | `5` for `device-io`; `1` for `device-restore-profile`; `3` otherwise | Set the number of excluded warmup attempts; zero is allowed. |
 | `--runs N` | `30` for `device-io`; `5` for `device-restore-profile`; `11` otherwise | Set the number of retained attempts. |
 | `--memory-mib MIB` | `128` | Set guest memory for the general suites. |
-| `--processors {1,2,4,8}` | `1` | Run every cold, capture, restore, and workload launch with this microVM count. |
+| `--processors {1,2,4,8}` | `1` | Run every cold, capture, restore, and workload launch with this vCPU count. |
 | `--virtfs-runs N` | `3` | Set the number of virtio-fs workload samples. |
 | `--virtfs-memory-mib MIB` | `512` | Set guest memory for the virtio-fs workload. |
 | `--payload-mib MIB` | `64` | Set the virtio-fs sequential I/O payload size. |
