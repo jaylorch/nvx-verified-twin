@@ -12747,6 +12747,21 @@ class BenchmarkTests(unittest.TestCase):
             str(Path(tempfile.gettempdir()).resolve()),
         )
 
+    def test_benchmark_result_document_writer_creates_parent_and_json(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "nested" / "result.json"
+            results = cast(benchmark.ResultDocument, {"metric": 1})
+
+            with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                status = benchmark._finish_result_document(output, results)
+
+            self.assertEqual(status, 0)
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                '{\n  "metric": 1\n}\n',
+            )
+            self.assertEqual(stdout.getvalue(), f"Wrote {output.resolve()}\n")
+
     def test_benchmark_scratch_directory_must_exist(self):
         with tempfile.TemporaryDirectory() as temporary:
             missing = Path(temporary) / "missing"

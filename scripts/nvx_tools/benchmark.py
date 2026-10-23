@@ -5890,6 +5890,15 @@ def result_document(
     }
 
 
+def _finish_result_document(output: Path | None, results: ResultDocument) -> int:
+    if output is not None:
+        output = output.resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+        print(f"Wrote {output}")
+    return 0
+
+
 def run_native_linux(args: argparse.Namespace) -> int:
     apply_benchmark_suite_defaults(args)
     if args.backend not in ("kvm", "mshv"):
@@ -6479,12 +6488,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             make_whp_profile_command,
             windows_cpus=cpus,
         )
-        if args.output:
-            output = args.output.resolve()
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-            print(f"Wrote {output}")
-        return 0
+        return _finish_result_document(args.output, results)
     kvm_e2e = None
     if args.suite == "e2e" and "kvm" in selected:
         assert kernel is not None and initrd is not None
@@ -6652,9 +6656,4 @@ def run_benchmark(args: argparse.Namespace) -> int:
             e2e_comparisons[backend] = comparison
             print_e2e_comparison(backend, comparison)
 
-    if args.output:
-        output = args.output.resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-        print(f"Wrote {output}")
-    return 0
+    return _finish_result_document(args.output, results)
