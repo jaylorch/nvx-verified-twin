@@ -15888,6 +15888,14 @@ class GitOutputTests(unittest.TestCase):
             timeout=30.0,
         )
 
+    def test_reports_non_utf8_output_as_script_error(self):
+        decoding_error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+        with patch.object(common.subprocess, "run", side_effect=decoding_error):
+            with self.assertRaisesRegex(
+                common.ScriptError, "^git output is not valid UTF-8$"
+            ):
+                common.git_output("status", "--short")
+
 
 class SharedFileTests(unittest.TestCase):
     def test_checksum_manifest_detects_modified_file(self):

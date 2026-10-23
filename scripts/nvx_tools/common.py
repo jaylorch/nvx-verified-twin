@@ -130,15 +130,18 @@ def run_capture(
 
 
 def git_output(*arguments: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(BuildConstants.REPO_ROOT), *arguments],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-        timeout=30.0,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(BuildConstants.REPO_ROOT), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=30.0,
+        )
+    except UnicodeDecodeError as error:
+        raise ScriptError("git output is not valid UTF-8") from error
     return completed.stdout.strip()
 
 
