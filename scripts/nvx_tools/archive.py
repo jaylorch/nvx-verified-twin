@@ -18,6 +18,18 @@ from .common import ScriptError
 ArchiveInput = tuple[Path, str]
 
 
+def _reject_output_in_inputs(output: Path, inputs: Sequence[ArchiveInput]) -> None:
+    resolved_output = output.resolve()
+    for source, _ in inputs:
+        resolved_source = source.resolve()
+        if resolved_output == resolved_source or (
+            source.is_dir() and resolved_output.is_relative_to(resolved_source)
+        ):
+            raise ScriptError(
+                f"archive output is inside an input: {output} is within {source}"
+            )
+
+
 def _normalize_member(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
     path = PurePosixPath(member.name)
     if "__pycache__" in path.parts or path.suffix in (".pyc", ".pyo"):
@@ -41,6 +53,7 @@ def create_reproducible_tar_gz(
         raise ScriptError(
             "cannot create source archive; missing: " + ", ".join(missing)
         )
+    _reject_output_in_inputs(output, inputs)
 
     def normalize(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
         normalized = _normalize_member(member)
@@ -109,6 +122,7 @@ def _release_members(source: Path) -> list[tuple[Path, str, int, bool]]:
 
 def create_reproducible_release_archive(source: Path, output: Path) -> None:
     members = _release_members(source)
+    _reject_output_in_inputs(output, [(source, source.name)])
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.name.endswith(".tar.gz"):
         with output.open("wb") as raw:

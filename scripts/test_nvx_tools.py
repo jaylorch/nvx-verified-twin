@@ -16243,6 +16243,31 @@ class SharedFileTests(unittest.TestCase):
             self.assertTrue(all(member.mtime == 0 for member in members))
             self.assertTrue(all(member.uid == member.gid == 0 for member in members))
 
+    def test_archive_output_cannot_be_inside_an_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            (source / "payload.txt").write_text("payload", encoding="ascii")
+
+            def create_source(path: Path) -> None:
+                archive.create_reproducible_tar_gz(path, [(source, "bundle")])
+
+            def create_release(path: Path) -> None:
+                archive.create_reproducible_release_archive(source, path)
+
+            for output, create in (
+                (source / "source.tar.gz", create_source),
+                (source / "release.zip", create_release),
+            ):
+                with (
+                    self.subTest(output=output),
+                    self.assertRaisesRegex(
+                        common.ScriptError, "archive output is inside an input"
+                    ),
+                ):
+                    create(output)
+                self.assertFalse(output.exists())
+
 
 class DownloadTests(unittest.TestCase):
     def test_rejects_nonpositive_attempts(self):
