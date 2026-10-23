@@ -1748,6 +1748,15 @@ class MicrovmTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unsupported version"):
                 microvm_tests._read_outcome_report(path)
 
+    def test_structured_outcome_rejects_non_utf8_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "outcome.json"
+            path.write_bytes(b"\xff")
+            with self.assertRaisesRegex(
+                RuntimeError, "failed to read structured outcome report"
+            ):
+                microvm_tests._read_outcome_report(path)
+
     def test_structured_outcome_preserves_invalid_primary_report(self):
         report = self._outcome_report(
             "whp",

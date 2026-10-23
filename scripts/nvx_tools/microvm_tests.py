@@ -410,7 +410,7 @@ def _output_lines(output: bytes) -> list[bytes]:
 def _read_outcome_report(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError(
             f"failed to read structured outcome report {path}"
         ) from error
