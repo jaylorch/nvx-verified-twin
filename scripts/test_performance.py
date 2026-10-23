@@ -505,6 +505,17 @@ class PerformanceTests(unittest.TestCase):
                     Path(temporary) / "results",
                 )
 
+    def test_openvmm_json_reports_unreadable_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "acceptance.json"
+            source.mkdir()
+
+            with self.assertRaisesRegex(
+                performance.PerformanceError,
+                r"cannot read benchmark result .*acceptance\.json",
+            ):
+                performance.read_lifecycle_data("linux-kvm-baremetal", source)
+
     def test_openvmm_json_requires_guest_exit_without_timeouts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

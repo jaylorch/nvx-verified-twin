@@ -990,6 +990,10 @@ def read_lifecycle_data(platform: str, input_path: Path) -> LifecycleData:
         )
     except FileNotFoundError as error:
         raise PerformanceError(f"benchmark result not found: {input_path}") from error
+    except OSError as error:
+        raise PerformanceError(
+            f"cannot read benchmark result {input_path}: {error}"
+        ) from error
     except (UnicodeError, json.JSONDecodeError) as error:
         raise PerformanceError(
             f"invalid benchmark JSON {input_path}: {error}"
