@@ -6221,6 +6221,27 @@ class BuildTests(unittest.TestCase):
             ):
                 ubuntu.load_package_lock(path)
 
+    def test_ubuntu_debian_archive_rejects_non_ascii_member_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "invalid.deb"
+            header = (
+                b"\xff"
+                + b" " * 15
+                + b"0" * 12
+                + b"0" * 6
+                + b"0" * 6
+                + b"0" * 8
+                + b"0" * 10
+                + b"`\n"
+            )
+            package.write_bytes(b"!<arch>\n" + header)
+
+            with self.assertRaisesRegex(
+                common.ScriptError,
+                "invalid ar member name",
+            ):
+                ubuntu._read_ar_members(package)
+
     def test_ubuntu_safe_extractor_rejects_archive_symlink_escape(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

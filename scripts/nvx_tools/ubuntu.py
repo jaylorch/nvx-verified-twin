@@ -435,7 +435,10 @@ def _read_ar_members(path: Path) -> dict[str, bytes]:
         header = data[offset : offset + 60]
         if len(header) != 60 or header[58:60] != b"`\n":
             raise ScriptError(f"{path} has an invalid ar header at offset {offset}")
-        raw_name = header[:16].decode("ascii", errors="strict").strip()
+        try:
+            raw_name = header[:16].decode("ascii", errors="strict").strip()
+        except UnicodeDecodeError as error:
+            raise ScriptError(f"{path} has an invalid ar member name") from error
         if raw_name.startswith(("/", "#1/")):
             raise ScriptError(f"{path} uses an unsupported extended ar filename")
         name = raw_name.removesuffix("/")
