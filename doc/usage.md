@@ -543,7 +543,7 @@ launches.
 | `--scratch PATH` | required for `run` and `provision` | Attach a preformatted ext4 scratch image as the writable overlay. |
 | `--state-dir PATH` | required for managed operations | Select persistent sandbox state. One-shot `run` rejects this option. |
 | `--entrypoint PATH` | `/bin/sh` | Select an absolute workload entrypoint without whitespace. |
-| `--arg VALUE` | none | Append one whitespace-free entrypoint argument. Repeat to pass multiple arguments. |
+| `--arg VALUE` | none | Append an entrypoint argument. Repeat to pass multiple arguments. Arguments for `run` and `provision` must be nonempty and whitespace-free; managed `exec` arguments may contain whitespace. |
 | `--hostname NAME` | `nvx-sandbox` | Set the workload UTS hostname. |
 | `--workload-user UID:GID` | `65534:65534` | Select the fixed non-root workload identity for `run` or `provision`. |
 | `--memory-max BYTES` | none | Set the workload cgroup memory limit. |
