@@ -423,10 +423,7 @@ fn array<const N: usize>(bytes: &[u8]) -> [u8; N] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
+    use crate::id::hex;
 
     /// A workload that runs `argv` without a timeout in `/` with the default environment.
     fn program<'a>(argv: &[&str]) -> Workload<'a> {
