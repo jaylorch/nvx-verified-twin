@@ -2361,6 +2361,17 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("**fail** | rustc is required", text)
         self.assertIn("Generation: `emeraldrapids`", text)
 
+        arguments.summary = self.root
+        with (
+            patch.dict(doctor.CHECKS, {"H2": passing("H2"), "H5": passing("H5")}),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                doctor.ScriptError, "failed to write doctor summary"
+            ),
+        ):
+            doctor.run(arguments)
+        arguments.summary = summary
+
         # Unreadable values that break a computation, such as a zero rate,
         # fail only their own check, and the later checks still run.
         def arithmetic(context: doctor.DoctorContext) -> doctor.CheckResult:

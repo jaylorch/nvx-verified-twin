@@ -1093,8 +1093,13 @@ def run(args: argparse.Namespace) -> int:
         flush=True,
     )
     if args.summary is not None:
-        with args.summary.open("a", encoding="utf-8") as summary:
-            summary.write(summary_markdown(args.backend, results, context.facts))
+        try:
+            with args.summary.open("a", encoding="utf-8") as summary:
+                summary.write(summary_markdown(args.backend, results, context.facts))
+        except OSError as error:
+            raise ScriptError(
+                f"failed to write doctor summary: {args.summary}"
+            ) from error
     return 1 if failed else 0
 
 
