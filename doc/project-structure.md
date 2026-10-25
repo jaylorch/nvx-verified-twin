@@ -61,7 +61,8 @@ nvx/
 |   |-- distribution.md          Packaging and source delivery
 |   |-- project-structure.md     This guide
 |   |-- run.md                   Guest launch and host mapping
-|   `-- setup.md                 Initialization and development prerequisites
+|   |-- setup.md                 Initialization and development prerequisites
+|   `-- usage.md                 Complete command-line reference
 |-- kernel/                      Linux configuration and NVX patch set
 |   |-- patches/                 Ordered patches applied to Linux
 |   |-- COPYING-LINUX            Linux copyright and license notice
