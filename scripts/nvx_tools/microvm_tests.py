@@ -1798,7 +1798,7 @@ def run_directional_network_policy(
 def _bind_consecutive_ports(
     socket_type: socket.SocketKind, count: int
 ) -> list[socket.socket]:
-    for base in range(20000, 60000 - count):
+    for base in range(20000, 60001 - count):
         endpoints: list[socket.socket] = []
         try:
             for offset in range(count):

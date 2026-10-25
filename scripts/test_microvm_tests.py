@@ -3355,6 +3355,30 @@ class MicrovmTests(unittest.TestCase):
         for endpoint in endpoints:
             endpoint.close.assert_called_once_with()
 
+    def test_consecutive_port_reservation_tries_the_last_valid_window(self):
+        attempted_ports: list[int] = []
+
+        class Endpoint:
+            def __init__(self, _family: int, _socket_type: socket.SocketKind) -> None:
+                pass
+
+            def bind(self, address: tuple[str, int]) -> None:
+                attempted_ports.append(address[1])
+                if address[1] < 59995:
+                    raise OSError("port unavailable")
+
+            def close(self) -> None:
+                pass
+
+            def listen(self, _backlog: int) -> None:
+                pass
+
+        with patch.object(microvm_tests.socket, "socket", side_effect=Endpoint):
+            reserved = microvm_tests._bind_consecutive_ports(socket.SOCK_STREAM, 5)
+
+        self.assertEqual(len(reserved), 5)
+        self.assertEqual(attempted_ports[-5:], [59995, 59996, 59997, 59998, 59999])
+
     def test_bounded_egress_acceptance_policy_lowers_ranges_and_exclusions(self):
         policy = microvm_tests._bounded_egress_policy(
             "192.0.2.1",
