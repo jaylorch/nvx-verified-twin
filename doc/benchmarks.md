@@ -86,7 +86,8 @@ python scripts\nvx.py benchmark --suite performance --backend whp --platform win
 ```
 
 Run the canonical device operation-rate suite with its default five warmups, 30 retained attempts
-per device, ten-second operation windows, and 512 MiB backing objects:
+per device, ten-second operation windows, and 512 MiB backing objects. The
+`--device-io-size-mib` backing-object size cannot be less than 64 MiB:
 
 ```console
 # Linux/KVM; use --backend mshv and the matching platform on Linux/MSHV.
