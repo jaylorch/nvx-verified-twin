@@ -259,6 +259,8 @@ class ControlSession:
     ) -> ControlSession:
         if len(capability) != 32 or capability == bytes(32):
             raise ValueError("control capability must be 32 nonzero bytes")
+        if not 0 < timeout < float("inf"):
+            raise ValueError("control session timeout must be positive and finite")
         stream = (
             _NamedPipeStream.connect(endpoint, timeout)
             if os.name == "nt"

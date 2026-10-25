@@ -7,6 +7,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from nvx_tools import control_session  # noqa: E402
@@ -67,6 +68,20 @@ def _write_app(
 
 
 class ControlSessionTests(unittest.TestCase):
+    def test_connect_rejects_invalid_timeout_before_opening_endpoint(self):
+        for timeout in (0.0, -1.0, float("nan"), float("inf")):
+            with (
+                self.subTest(timeout=timeout),
+                patch.object(control_session._SocketStream, "connect") as connect,
+                self.assertRaisesRegex(ValueError, "positive and finite"),
+            ):
+                control_session.ControlSession.connect(
+                    Path("unused"),
+                    bytes.fromhex("11" * 32),
+                    timeout,
+                )
+            connect.assert_not_called()
+
     def test_exec_streams_output_and_returns_bounded_status(self):
         client, server = socket.socketpair()
         instance = bytes.fromhex("11" * 16)
