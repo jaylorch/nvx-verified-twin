@@ -14005,6 +14005,21 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(io.call_count, 4)
         self.assertEqual(roundtrip.call_count, 4)
 
+    def test_device_io_resume_rejects_incomplete_success_record(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "device-io.log"
+            output.write_text(
+                benchmark.DEVICE_IO_RESULT_PREFIX
+                + '{"device":"virtio-blk","attempt_index":0,"warmup":false,'
+                '"status":"success"}\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "invalid resumable device I/O record"
+            ):
+                benchmark._device_io_completed_attempts(output)
+
     def test_device_io_retains_failure_and_resumes_completed_attempts(self):
         args = argparse.Namespace(
             processors=1,

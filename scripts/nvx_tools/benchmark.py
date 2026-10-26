@@ -3342,13 +3342,33 @@ def _device_io_completed_attempts(path: Path | None) -> set[tuple[str, int]]:
         record = cast(dict[str, object], decoded)
         device_value = record.get("device")
         attempt_index = record.get("attempt_index")
+        status = record.get("status")
+        common_fields = {
+            "schema_version",
+            "attempt_index",
+            "sample_index",
+            "warmup",
+            "device",
+            "status",
+            "results",
+        }
+        expected_fields = (
+            common_fields | {"wall_ms", "peak_rss_bytes"}
+            if status == "success"
+            else common_fields | {"error"}
+        )
         if (
             not isinstance(device_value, str)
             or device_value not in DEVICE_IO_OPERATIONS
             or (isinstance(attempt_index, bool) or not isinstance(attempt_index, int))
+            or record.get("schema_version") != 1
+            or not isinstance(record.get("warmup"), bool)
+            or status not in ("success", "failure")
+            or not isinstance(record.get("results"), list)
+            or set(record) != expected_fields
         ):
             raise ValueError(
-                f"invalid resumable device I/O identity at {path}:{line_number}"
+                f"invalid resumable device I/O record at {path}:{line_number}"
             )
         device = device_value
         identity = (device, attempt_index)
