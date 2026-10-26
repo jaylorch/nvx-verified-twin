@@ -17,8 +17,8 @@ initramfs through the documented environment overrides. Run the unit and
 documentation tests with `scripts/nvx.py test-openvmm-unit`, and use
 `scripts/nvx.py test-openvmm --backend BACKEND` for the VMM tests.
 
-NVX owns behavior that depends on its patched Linux kernel, Alpine userspace,
-guest helpers, SMP behavior, or virtio devices. Add those scenarios to
-`scripts/nvx_tools/microvm_tests.py` and run them with
+NVX owns behavior that depends on its patched Linux kernel, Alpine, Ubuntu, or
+Azure Linux userspace, guest helpers, SMP behavior, or virtio devices. Add those
+scenarios to `scripts/nvx_tools/microvm_tests.py` and run them with
 `scripts/nvx.py test-microvm --backend BACKEND`. Keep guest workloads in
 `scripts/nvx_tools/microvm_test_scripts` and retain complete failure logs.
