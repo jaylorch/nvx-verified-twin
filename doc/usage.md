@@ -44,7 +44,7 @@ python3 scripts/nvx.py performance gate --help
 | `run` | Run an OpenVMM microVM. |
 | `sandbox` | Run or manage workloads over EROFS layers and private ext4 scratch. |
 | `benchmark` | Run the OpenVMM-native benchmark coordinator. |
-| `performance` | Collect, gate, and persist CI performance results. |
+| `performance` | Validate and collect benchmark results, gate regressions, and persist CI performance history. |
 | `collect-sources` | Materialize verified Linux, Alpine, and Ubuntu release sources. |
 | `collect-alpine-sources` | Collect exact Alpine recipes and upstream sources. |
 | `collect-ubuntu-sources` | Collect exact Ubuntu source packages. |
