@@ -943,6 +943,28 @@ class CliTests(unittest.TestCase):
             with self.assertRaisesRegex(common.ScriptError, "systemd images"):
                 nvx.command_sandbox(args)
 
+    def test_sandbox_reports_non_utf8_distro_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layer = root / "distro.erofs"
+            scratch = root / "scratch.ext4"
+            layer.write_bytes(b"distro")
+            scratch.write_bytes(b"scratch")
+            layer.with_name(f"{layer.name}.manifest.json").write_bytes(b"\xff")
+            args = nvx.parse_args(
+                [
+                    "sandbox",
+                    "--layer",
+                    f"distro,{layer},11111111-1111-1111-1111-111111111111",
+                    "--scratch",
+                    str(scratch),
+                ]
+            )
+            with self.assertRaisesRegex(
+                common.ScriptError, "invalid sandbox distro manifest"
+            ):
+                nvx.command_sandbox(args)
+
     def test_sandbox_command_parses_typed_launch_contract(self):
         args = nvx.parse_args(
             [

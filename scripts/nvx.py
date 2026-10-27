@@ -169,7 +169,7 @@ def _validate_sandbox_systemd_policy(launch: SandboxLaunch) -> None:
         return
     try:
         document: object = json.loads(manifest.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as error:
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as error:
         raise ScriptError(f"invalid sandbox distro manifest: {error}") from error
     if not isinstance(document, dict):
         raise ScriptError("invalid sandbox distro manifest: expected a JSON object")
