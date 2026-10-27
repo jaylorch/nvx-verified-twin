@@ -6299,6 +6299,10 @@ class BuildTests(unittest.TestCase):
             second_digest = ubuntu.rootfs_sha256(second)
             self.assertEqual(first_digest, second_digest)
             self.assertEqual(
+                list(ubuntu.rootfs_inventory(first)),
+                ["etc", "etc/os-release"],
+            )
+            self.assertEqual(
                 ubuntu.erofs_uuid(first_digest),
                 ubuntu.erofs_uuid(second_digest),
             )

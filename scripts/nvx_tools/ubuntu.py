@@ -845,13 +845,16 @@ def apply_metadata_policy(root: Path) -> None:
             )
 
 
-def rootfs_sha256(root: Path) -> str:
-    digest = hashlib.sha256()
+def _rootfs_entries(root: Path) -> Iterable[tuple[Path, str, os.stat_result]]:
     for path in sorted(
         root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
     ):
-        relative = path.relative_to(root).as_posix()
-        metadata = path.lstat()
+        yield path, path.relative_to(root).as_posix(), path.lstat()
+
+
+def rootfs_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path, relative, metadata in _rootfs_entries(root):
         mode = stat.S_IMODE(metadata.st_mode)
         if path.is_symlink():
             kind = "symlink"
@@ -874,11 +877,7 @@ def rootfs_sha256(root: Path) -> str:
 
 def rootfs_inventory(root: Path) -> dict[str, dict[str, object]]:
     inventory: dict[str, dict[str, object]] = {}
-    for path in sorted(
-        root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
-    ):
-        relative = path.relative_to(root).as_posix()
-        metadata = path.lstat()
+    for path, relative, metadata in _rootfs_entries(root):
         record: dict[str, object] = {
             "mode": stat.S_IMODE(metadata.st_mode),
             "uid": metadata.st_uid,
