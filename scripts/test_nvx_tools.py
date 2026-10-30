@@ -10976,6 +10976,24 @@ class SandboxTests(unittest.TestCase):
                     sandbox_lifecycle.ManagedExecResult(0, "exit", b"", b""),
                 )
 
+    def test_managed_exec_reports_capability_read_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            _write_managed_runtime(state, 123, None)
+            with (
+                patch.object(sandbox_lifecycle, "_process_running", return_value=True),
+                patch.object(Path, "read_bytes", side_effect=PermissionError("denied")),
+                self.assertRaisesRegex(
+                    common.ScriptError, "failed to read sandbox control capability"
+                ),
+            ):
+                sandbox_lifecycle.exec_workload(
+                    state,
+                    ("true",),
+                    timeout_ms=1000,
+                    response_timeout=1,
+                )
+
     def test_managed_stop_cleans_runtime_state_if_report_is_invalid(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)

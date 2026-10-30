@@ -425,9 +425,15 @@ def _load_running(state_dir: Path) -> tuple[dict[str, Any], bytes]:
         raise ScriptError(
             "sandbox runtime state is stale because the OpenVMM process is not running"
         )
-    capability = require_file(
+    capability_path = require_file(
         state_dir / CAPABILITY_NAME, "sandbox control capability"
-    ).read_bytes()
+    )
+    try:
+        capability = capability_path.read_bytes()
+    except OSError as error:
+        raise ScriptError(
+            f"failed to read sandbox control capability: {capability_path}"
+        ) from error
     if len(capability) != 32 or capability == bytes(32):
         raise ScriptError("sandbox control capability is invalid")
     return runtime, capability
