@@ -35,20 +35,22 @@ pub const fn microvm_processor_count_supported(processor_count: u32) -> bool {
 pub const MICROVM_BASE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc0 reboot=t panic=-1";
 /// Command line when the microVM virtio console is present.
 pub const MICROVM_CONSOLE_COMMAND_LINE: &str = "earlycon=xe9 console=hvc1 reboot=t panic=-1";
-/// Maximum microVM command-line size, including its trailing NUL.
-pub const MICROVM_COMMAND_LINE_MAX_SIZE: usize = 64 * 1024;
+/// Maximum size of the effective microVM kernel command line, including its
+/// terminating NUL: the x86 guest kernel's `COMMAND_LINE_SIZE`.
+///
+/// The guest kernel silently truncates a longer command line, which would lose
+/// the profile's own tokens first, because the profile appends them last.
+pub const MICROVM_COMMAND_LINE_MAX_SIZE: usize = 2048;
 /// Fixed distro virtio-blk MMIO base.
 pub const MICROVM_VIRTIO_BLK_MMIO_BASE: u64 = 0xd000_3000;
 /// Reserved microVM virtio-net MMIO base.
 pub const MICROVM_VIRTIO_NET_MMIO_BASE: u64 = 0xd000_0000;
-/// Reserved MMIO base of the first microVM virtio-fs slot.
+/// Reserved MMIO base of the microVM virtio-fs slot.
 pub const MICROVM_VIRTIO_FS_MMIO_BASE: u64 = 0xd000_1000;
 /// Reserved microVM virtio-console MMIO base.
 pub const MICROVM_VIRTIO_CONSOLE_MMIO_BASE: u64 = 0xd000_2000;
 /// Fixed microVM control virtio-console MMIO base.
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE: u64 = 0xd000_7000;
-/// Fixed MMIO base of the second microVM virtio-fs slot.
-pub const MICROVM_VIRTIO_FS1_MMIO_BASE: u64 = 0xd000_8000;
 /// Fixed microVM virtio transport window length.
 pub const MICROVM_VIRTIO_MMIO_LEN: u64 = 0x1000;
 /// Fixed distro virtio-blk interrupt.
@@ -65,13 +67,8 @@ pub const MICROVM_VIRTIO_SCRATCH_BLK_IRQ: u32 = 11;
 pub const MICROVM_VIRTIO_CONSOLE_IRQ: u32 = 7;
 /// Fixed microVM control virtio-console interrupt.
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ: u32 = 3;
-/// Fixed interrupt of the first microVM virtio-fs slot.
+/// Fixed interrupt of the microVM virtio-fs slot.
 pub const MICROVM_VIRTIO_FS_IRQ: u32 = 6;
-/// Fixed interrupt of the second microVM virtio-fs slot.
-///
-/// The MP table routes only ISA interrupts, and no other device of any
-/// backend uses IRQ 13.
-pub const MICROVM_VIRTIO_FS1_IRQ: u32 = 13;
 /// Fixed microVM virtio-net interrupt on KVM.
 pub const MICROVM_VIRTIO_NET_KVM_IRQ: u32 = 10;
 /// Fixed microVM virtio-net interrupt on WHP.
@@ -87,8 +84,16 @@ pub const MICROVM_CONSOLE_RECONNECT_TIMEOUT_MS: u64 = 5_000;
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_ID: &str = "virtio-control-console";
 /// Host-owned kernel command-line token identifying the control tty.
 pub const MICROVM_CONTROL_TTY_COMMAND_LINE: &str = "nvx_control_tty=hvc2";
+/// Host-owned kernel command-line token asking the guest to announce its TCP
+/// and UDP listeners for private-network ingress; see
+/// [`net_backend_resources::ingress`].
+pub const MICROVM_INGRESS_COMMAND_LINE_TOKEN: &str = "virtnet_ingress=allow";
+/// Host-owned kernel command-line token asking the guest to announce its TCP
+/// and UDP listeners for host-loopback ingress alone, which publishes them on
+/// host loopback; see [`net_backend_resources::ingress`].
+pub const MICROVM_HOST_LOOPBACK_INGRESS_COMMAND_LINE_TOKEN: &str = "virtnet_ingress=host-loopback";
 /// MicroVM virtio MMIO reservations in stable device order.
-pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 9] = [
+pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 8] = [
     MICROVM_VIRTIO_NET_MMIO_BASE,
     MICROVM_VIRTIO_FS_MMIO_BASE,
     MICROVM_VIRTIO_CONSOLE_MMIO_BASE,
@@ -97,10 +102,9 @@ pub const MICROVM_VIRTIO_MMIO_BASES: [u64; 9] = [
     0xd000_5000,
     0xd000_6000,
     MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE,
-    MICROVM_VIRTIO_FS1_MMIO_BASE,
 ];
 
-/// A fixed microVM virtio-fs slot.
+/// The fixed microVM virtio-fs slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MicrovmFilesystemSlot {
     /// Stable identity of the slot's device and host attachment.
@@ -123,23 +127,15 @@ impl MicrovmFilesystemSlot {
     }
 }
 
-/// The fixed microVM virtio-fs slots. Filesystems occupy them in attachment
-/// order. A cold boot always exposes the first slot, dormant when nothing is
-/// attached to it; a later slot exists only with a filesystem attached.
-pub const MICROVM_FILESYSTEM_SLOTS: [MicrovmFilesystemSlot; 2] = [
-    MicrovmFilesystemSlot {
-        stable_id: "fs:microvm0",
-        tag: "microvm",
-        mmio_base: MICROVM_VIRTIO_FS_MMIO_BASE,
-        irq: MICROVM_VIRTIO_FS_IRQ,
-    },
-    MicrovmFilesystemSlot {
-        stable_id: "fs:microvm1",
-        tag: "microvm1",
-        mmio_base: MICROVM_VIRTIO_FS1_MMIO_BASE,
-        irq: MICROVM_VIRTIO_FS1_IRQ,
-    },
-];
+/// The fixed microVM virtio-fs slots: the microVM has one. A cold boot always
+/// exposes it, dormant when no filesystem is attached. Several host
+/// directories share it as the children of one aggregate filesystem.
+pub const MICROVM_FILESYSTEM_SLOTS: [MicrovmFilesystemSlot; 1] = [MicrovmFilesystemSlot {
+    stable_id: "fs:microvm0",
+    tag: "microvm",
+    mmio_base: MICROVM_VIRTIO_FS_MMIO_BASE,
+    irq: MICROVM_VIRTIO_FS_IRQ,
+}];
 /// Fixed sandbox virtio-blk MMIO slots in layer order.
 pub const MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES: [u64; 4] = [
     MICROVM_VIRTIO_BLK_MMIO_BASE,
@@ -153,7 +149,7 @@ pub const MICROVM_SHARED_STATUS_PAGE_GPA: u64 = 0x3_0000;
 pub const MICROVM_SHARED_STATUS_PAGE_SIZE: u64 = 0x1000;
 /// Shared-status offset for virtio-net.
 pub const MICROVM_VIRTIO_NET_STATUS_OFFSET: u64 = 0x00;
-/// Shared-status offset for the first virtio-fs slot.
+/// Shared-status offset for virtio-fs.
 pub const MICROVM_VIRTIO_FS_STATUS_OFFSET: u64 = 0x04;
 /// Shared-status offset for virtio-console.
 pub const MICROVM_VIRTIO_CONSOLE_STATUS_OFFSET: u64 = 0x08;
@@ -167,8 +163,6 @@ pub const MICROVM_VIRTIO_CUSTOM_BLK_STATUS_OFFSET: u64 = 0x14;
 pub const MICROVM_VIRTIO_SCRATCH_BLK_STATUS_OFFSET: u64 = 0x18;
 /// Shared-status offset for the dedicated control virtio-console.
 pub const MICROVM_VIRTIO_CONTROL_CONSOLE_STATUS_OFFSET: u64 = 0x1c;
-/// Shared-status offset for the second virtio-fs slot.
-pub const MICROVM_VIRTIO_FS1_STATUS_OFFSET: u64 = 0x20;
 
 /// Returns the shared interrupt-status word for a fixed virtio-mmio slot.
 pub const fn microvm_virtio_status_gpa(mmio_base: u64) -> Option<u64> {
@@ -181,7 +175,6 @@ pub const fn microvm_virtio_status_gpa(mmio_base: u64) -> Option<u64> {
         0xd000_5000 => MICROVM_VIRTIO_CUSTOM_BLK_STATUS_OFFSET,
         0xd000_6000 => MICROVM_VIRTIO_SCRATCH_BLK_STATUS_OFFSET,
         MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE => MICROVM_VIRTIO_CONTROL_CONSOLE_STATUS_OFFSET,
-        MICROVM_VIRTIO_FS1_MMIO_BASE => MICROVM_VIRTIO_FS1_STATUS_OFFSET,
         _ => return None,
     };
     Some(MICROVM_SHARED_STATUS_PAGE_GPA + offset)
@@ -279,6 +272,30 @@ pub struct MicrovmSandboxBlockConfig {
     pub read_only: bool,
 }
 
+/// The peers to which a microVM publishes the listeners that its guest
+/// announces, which selects the host-owned token that asks the guest to
+/// announce them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrovmIngress {
+    /// Clients on the host's private networks and, with host-loopback access,
+    /// the host itself; see [`MICROVM_INGRESS_COMMAND_LINE_TOKEN`].
+    PrivateNetworks,
+    /// The host alone, on host loopback; see
+    /// [`MICROVM_HOST_LOOPBACK_INGRESS_COMMAND_LINE_TOKEN`].
+    HostLoopback,
+}
+
+impl MicrovmIngress {
+    /// Returns the host-owned token that asks the guest to announce its
+    /// listeners for this ingress.
+    pub const fn command_line_token(self) -> &'static str {
+        match self {
+            Self::PrivateNetworks => MICROVM_INGRESS_COMMAND_LINE_TOKEN,
+            Self::HostLoopback => MICROVM_HOST_LOOPBACK_INGRESS_COMMAND_LINE_TOKEN,
+        }
+    }
+}
+
 /// Static guest-visible network identity for the microVM NIC.
 #[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
 pub struct MicrovmNetworkConfig {
@@ -289,6 +306,49 @@ pub struct MicrovmNetworkConfig {
     pub derived_gateway_ipv4: std::net::Ipv4Addr,
     pub guest_mac: MacAddress,
     pub gateway_mac: MacAddress,
+    /// IPv6 identity of the dual-stack NIC, derived from the IPv4 identity.
+    /// A snapshot whose network predates IPv6 restores without one.
+    pub ipv6: Option<MicrovmIpv6Config>,
+}
+
+/// Unique local prefix that embeds a microVM's IPv4 identity in its IPv6
+/// identity: the IPv4 address forms the last 32 bits of the IPv6 address.
+pub const MICROVM_IPV6_PREFIX: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0);
+
+/// Length of [`MICROVM_IPV6_PREFIX`].
+pub const MICROVM_IPV6_PREFIX_LENGTH: u8 = 96;
+
+/// IPv6 identity of a dual-stack microVM NIC.
+///
+/// The guest and gateway addresses embed their IPv4 addresses in
+/// [`MICROVM_IPV6_PREFIX`], and the subnet is the IPv4 subnet in the same
+/// prefix, so `10.0.0.2/24` with gateway `10.0.0.1` becomes `fd00::a00:2/120`
+/// with gateway `fd00::a00:1`.
+#[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MicrovmIpv6Config {
+    pub guest_ipv6: std::net::Ipv6Addr,
+    pub prefix_length: u8,
+    pub derived_gateway_ipv6: std::net::Ipv6Addr,
+}
+
+impl MicrovmIpv6Config {
+    fn embedding(
+        guest_ipv4: std::net::Ipv4Addr,
+        prefix_length: u8,
+        gateway_ipv4: std::net::Ipv4Addr,
+    ) -> Self {
+        let embed = |address: std::net::Ipv4Addr| {
+            std::net::Ipv6Addr::from(
+                u128::from(MICROVM_IPV6_PREFIX) | u128::from(address.to_bits()),
+            )
+        };
+        Self {
+            guest_ipv6: embed(guest_ipv4),
+            prefix_length: MICROVM_IPV6_PREFIX_LENGTH + prefix_length,
+            derived_gateway_ipv6: embed(gateway_ipv4),
+        }
+    }
 }
 
 /// Required host-network implementation contract for a microVM NIC.
@@ -361,6 +421,11 @@ impl MicrovmFilesystemOwner {
 }
 
 /// Guest-visible configuration for the microVM virtio-fs device.
+///
+/// The filesystem is either a single host directory, with its own access
+/// policy, or an aggregate whose synthetic, read-only root lists one named
+/// directory or file per child, each with its own access mode. An aggregate
+/// has no policy paths of its own, and it is read-write when any child is.
 #[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
 pub struct MicrovmFilesystemConfig {
     /// Absolute guest path at which the initramfs mounts the filesystem.
@@ -369,8 +434,312 @@ pub struct MicrovmFilesystemConfig {
     pub access: MicrovmFilesystemAccess,
     /// Canonical host-relative paths hidden by the virtio-fs server.
     pub denied_paths: Vec<String>,
-    /// Snapshot-authoritative host identity of guest operations.
+    /// Canonical host-relative paths inside denied paths that the virtio-fs
+    /// server exposes again.
+    pub allowed_paths: Vec<String>,
+    /// Canonical host-relative paths that are the only parts of a read-write
+    /// filesystem that the guest can modify; none makes all of it writable.
+    pub writable_paths: Vec<String>,
+    /// Snapshot-authoritative host identity of guest operations, which
+    /// applies to every child of an aggregate.
     pub owner: MicrovmFilesystemOwner,
+    /// The children of an aggregate, in order; empty for a single directory.
+    pub children: Vec<MicrovmFilesystemChildConfig>,
+}
+
+/// The largest number of children of a microVM aggregate filesystem.
+pub const MICROVM_FILESYSTEM_MAX_CHILDREN: usize = 256;
+/// The longest name of a child of a microVM aggregate filesystem, in bytes.
+pub const MICROVM_FILESYSTEM_MAX_CHILD_NAME: usize = 64;
+/// The largest combined size of the policy paths of every child of a microVM
+/// aggregate filesystem, in bytes, which bounds its snapshot contract.
+pub const MICROVM_FILESYSTEM_MAX_AGGREGATE_POLICY_BYTES: usize = 128 * 1024;
+
+/// What a child of a microVM aggregate filesystem exposes.
+#[derive(MeshPayload, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrovmFilesystemChildKind {
+    /// A host directory, which the child's directory lists.
+    Directory,
+    /// A regular host file, which is the child itself. Nothing else in the
+    /// file's host directory is exposed.
+    File,
+}
+
+impl MicrovmFilesystemChildKind {
+    /// Returns the spelling of this kind in messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::File => "file",
+        }
+    }
+}
+
+/// Guest-visible configuration of one host directory or regular file that a
+/// microVM aggregate filesystem exposes as a named child of its synthetic
+/// root.
+#[derive(MeshPayload, Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmFilesystemChildConfig {
+    /// Name of the child under the aggregate's root.
+    pub name: String,
+    /// Snapshot-authoritative kind of the child.
+    pub kind: MicrovmFilesystemChildKind,
+    /// Snapshot-authoritative access policy of the child.
+    pub access: MicrovmFilesystemAccess,
+    /// Canonical child-relative paths hidden by the virtio-fs server.
+    pub denied_paths: Vec<String>,
+    /// Canonical child-relative paths inside denied paths that the virtio-fs
+    /// server exposes again.
+    pub allowed_paths: Vec<String>,
+    /// Canonical child-relative paths that are the only parts of a read-write
+    /// child that the guest can modify; none makes all of it writable.
+    pub writable_paths: Vec<String>,
+}
+
+impl MicrovmFilesystemChildConfig {
+    /// Validates and constructs a child named `name`, which must be 1 to
+    /// [`MICROVM_FILESYSTEM_MAX_CHILD_NAME`] ASCII letters, digits, `.`, `_`,
+    /// or `-`, other than `.` and `..`.
+    pub fn new(
+        name: String,
+        access: MicrovmFilesystemAccess,
+    ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
+        if name.is_empty()
+            || name.len() > MICROVM_FILESYSTEM_MAX_CHILD_NAME
+            || matches!(name.as_str(), "." | "..")
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(InvalidMicrovmFilesystemConfig::InvalidChildName(name));
+        }
+        Ok(Self {
+            name,
+            kind: MicrovmFilesystemChildKind::Directory,
+            access,
+            denied_paths: Vec::new(),
+            allowed_paths: Vec::new(),
+            writable_paths: Vec::new(),
+        })
+    }
+
+    /// Validates and constructs a child named `name`, like [`Self::new`],
+    /// that exposes a regular host file rather than a directory. Its access
+    /// mode applies to the file, which has no policy paths.
+    pub fn new_file(
+        name: String,
+        access: MicrovmFilesystemAccess,
+    ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
+        Ok(Self {
+            kind: MicrovmFilesystemChildKind::File,
+            ..Self::new(name, access)?
+        })
+    }
+
+    /// Returns whether the child exposes a regular host file.
+    pub fn is_file(&self) -> bool {
+        matches!(self.kind, MicrovmFilesystemChildKind::File)
+    }
+
+    /// Adds the complete access policy of the child, with the rules of
+    /// [`MicrovmFilesystemConfig::with_access_policy`]. A child that exposes
+    /// a file has none.
+    pub fn with_access_policy(
+        mut self,
+        denied_paths: Vec<String>,
+        allowed_paths: Vec<String>,
+        writable_paths: Vec<String>,
+    ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
+        if self.is_file()
+            && !(denied_paths.is_empty() && allowed_paths.is_empty() && writable_paths.is_empty())
+        {
+            return Err(InvalidMicrovmFilesystemConfig::FileChildPolicyPaths(
+                self.name,
+            ));
+        }
+        validate_microvm_filesystem_access_policy(
+            self.access,
+            &denied_paths,
+            &allowed_paths,
+            &writable_paths,
+        )?;
+        self.denied_paths = denied_paths;
+        self.allowed_paths = allowed_paths;
+        self.writable_paths = writable_paths;
+        Ok(self)
+    }
+}
+
+/// A kind of path in the access policy of a microVM filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrovmFilesystemPathKind {
+    /// A path hidden from the guest.
+    Denied,
+    /// A path inside a denied path that the guest can reach again.
+    Allowed,
+    /// One of the only paths that the guest can modify.
+    Writable,
+}
+
+impl std::fmt::Display for MicrovmFilesystemPathKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Denied => "denied",
+            Self::Allowed => "allowed",
+            Self::Writable => "writable",
+        })
+    }
+}
+
+/// Returns whether the canonical relative path `inner` equals or is inside the
+/// canonical relative path `outer`. The empty path is the root, which contains
+/// every path.
+fn policy_path_contains(outer: &str, inner: &str) -> bool {
+    outer.is_empty()
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+}
+
+/// Returns whether the nearest denied or allowed path that contains `path` is
+/// a denied path (`Some(true)`), an allowed path (`Some(false)`), or neither.
+/// `path` itself counts only when `inclusive`.
+fn nearest_policy_rule(
+    path: &str,
+    denied: &[String],
+    allowed: &[String],
+    inclusive: bool,
+) -> Option<bool> {
+    denied
+        .iter()
+        .map(|rule| (rule, true))
+        .chain(allowed.iter().map(|rule| (rule, false)))
+        .filter(|(rule, _)| (inclusive || *rule != path) && policy_path_contains(rule, path))
+        .max_by_key(|(rule, _)| rule.len())
+        .map(|(_, denied)| denied)
+}
+
+/// Validates one list of canonical, host-relative policy paths in lexical
+/// order, without regard to the filesystem's other policy paths. A denied path
+/// may be empty, which names the root.
+pub fn validate_microvm_filesystem_policy_paths(
+    kind: MicrovmFilesystemPathKind,
+    paths: &[String],
+) -> Result<(), InvalidMicrovmFilesystemConfig> {
+    if paths.len() > 128 {
+        return Err(InvalidMicrovmFilesystemConfig::TooManyPolicyPaths(kind));
+    }
+    let total_bytes = paths
+        .iter()
+        .try_fold(0usize, |total, path| total.checked_add(path.len()))
+        .ok_or(InvalidMicrovmFilesystemConfig::PolicyPathsTooLarge(kind))?;
+    if total_bytes > 16 * 1024 {
+        return Err(InvalidMicrovmFilesystemConfig::PolicyPathsTooLarge(kind));
+    }
+    for path in paths {
+        if path.is_empty() && kind == MicrovmFilesystemPathKind::Denied {
+            continue;
+        }
+        // A name may contain spaces, but not begin or end with one.
+        if path.is_empty()
+            || path.len() > 4096
+            || path.starts_with('/')
+            || path.ends_with('/')
+            || path.chars().any(|character| {
+                (character.is_whitespace() && character != ' ')
+                    || matches!(character, '\0' | '\\' | ':')
+            })
+            || path.split('/').any(|component| {
+                component.is_empty()
+                    || matches!(component, "." | "..")
+                    || component.starts_with(' ')
+                    || component.ends_with(' ')
+            })
+        {
+            return Err(InvalidMicrovmFilesystemConfig::InvalidPolicyPath(
+                kind,
+                path.clone(),
+            ));
+        }
+    }
+    if paths.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(InvalidMicrovmFilesystemConfig::NonCanonicalPolicyPaths(
+            kind,
+        ));
+    }
+    Ok(())
+}
+
+/// Validates the complete access policy of a filesystem or aggregate child
+/// with access mode `access`; see
+/// [`MicrovmFilesystemConfig::with_access_policy`].
+fn validate_microvm_filesystem_access_policy(
+    access: MicrovmFilesystemAccess,
+    denied_paths: &[String],
+    allowed_paths: &[String],
+    writable_paths: &[String],
+) -> Result<(), InvalidMicrovmFilesystemConfig> {
+    validate_microvm_filesystem_policy_paths(MicrovmFilesystemPathKind::Denied, denied_paths)?;
+    validate_microvm_filesystem_policy_paths(MicrovmFilesystemPathKind::Allowed, allowed_paths)?;
+    validate_microvm_filesystem_policy_paths(MicrovmFilesystemPathKind::Writable, writable_paths)?;
+    if denied_paths.iter().any(String::is_empty) && allowed_paths.is_empty() {
+        return Err(InvalidMicrovmFilesystemConfig::HiddenRootWithoutAllowedPaths);
+    }
+    for path in denied_paths {
+        if nearest_policy_rule(path, denied_paths, allowed_paths, false) == Some(true) {
+            return Err(InvalidMicrovmFilesystemConfig::OverlappingDeniedPaths);
+        }
+    }
+    for path in allowed_paths {
+        if denied_paths.contains(path)
+            || nearest_policy_rule(path, denied_paths, allowed_paths, false) != Some(true)
+        {
+            return Err(InvalidMicrovmFilesystemConfig::MisplacedAllowedPath(
+                path.clone(),
+            ));
+        }
+    }
+    if access.is_read_only() && !writable_paths.is_empty() {
+        return Err(InvalidMicrovmFilesystemConfig::ReadOnlyWritablePaths);
+    }
+    for (index, path) in writable_paths.iter().enumerate() {
+        if writable_paths
+            .iter()
+            .enumerate()
+            .any(|(other_index, other)| other_index != index && policy_path_contains(other, path))
+        {
+            return Err(InvalidMicrovmFilesystemConfig::OverlappingWritablePaths);
+        }
+        if nearest_policy_rule(path, denied_paths, allowed_paths, true) == Some(true) {
+            return Err(InvalidMicrovmFilesystemConfig::HiddenWritablePath(
+                path.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a canonical absolute guest mount target.
+fn validate_microvm_guest_mount_target(
+    guest_mount_target: &str,
+) -> Result<(), InvalidMicrovmFilesystemConfig> {
+    if guest_mount_target.is_empty()
+        || !guest_mount_target.starts_with('/')
+        || guest_mount_target == "/"
+        || guest_mount_target.len() > 4096
+        || guest_mount_target
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '\0' | '\\' | '='))
+        || guest_mount_target
+            .split('/')
+            .skip(1)
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(InvalidMicrovmFilesystemConfig::InvalidGuestTarget(
+            guest_mount_target.to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl MicrovmFilesystemConfig {
@@ -379,28 +748,67 @@ impl MicrovmFilesystemConfig {
         guest_mount_target: String,
         access: MicrovmFilesystemAccess,
     ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
-        if guest_mount_target.is_empty()
-            || !guest_mount_target.starts_with('/')
-            || guest_mount_target == "/"
-            || guest_mount_target.len() > 4096
-            || guest_mount_target.chars().any(|character| {
-                character.is_whitespace() || matches!(character, '\0' | '\\' | '=')
-            })
-            || guest_mount_target
-                .split('/')
-                .skip(1)
-                .any(|component| component.is_empty() || matches!(component, "." | ".."))
-        {
-            return Err(InvalidMicrovmFilesystemConfig::InvalidGuestTarget(
-                guest_mount_target,
-            ));
-        }
+        validate_microvm_guest_mount_target(&guest_mount_target)?;
         Ok(Self {
             guest_mount_target,
             access,
             denied_paths: Vec::new(),
+            allowed_paths: Vec::new(),
+            writable_paths: Vec::new(),
             owner: MicrovmFilesystemOwner::Vmm,
+            children: Vec::new(),
         })
+    }
+
+    /// Validates and constructs an aggregate filesystem with `children`, in
+    /// the order in which the guest lists them. Their names must be unique,
+    /// and their policy paths must not exceed
+    /// [`MICROVM_FILESYSTEM_MAX_AGGREGATE_POLICY_BYTES`] in total.
+    pub fn new_aggregate(
+        guest_mount_target: String,
+        children: Vec<MicrovmFilesystemChildConfig>,
+    ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
+        validate_microvm_guest_mount_target(&guest_mount_target)?;
+        if children.is_empty() || children.len() > MICROVM_FILESYSTEM_MAX_CHILDREN {
+            return Err(InvalidMicrovmFilesystemConfig::InvalidChildCount);
+        }
+        let mut policy_bytes = 0usize;
+        for (index, child) in children.iter().enumerate() {
+            if children[..index]
+                .iter()
+                .any(|other| other.name == child.name)
+            {
+                return Err(InvalidMicrovmFilesystemConfig::DuplicateChildName(
+                    child.name.clone(),
+                ));
+            }
+            policy_bytes = child
+                .denied_paths
+                .iter()
+                .chain(&child.allowed_paths)
+                .chain(&child.writable_paths)
+                .try_fold(policy_bytes, |total, path| total.checked_add(path.len()))
+                .filter(|total| *total <= MICROVM_FILESYSTEM_MAX_AGGREGATE_POLICY_BYTES)
+                .ok_or(InvalidMicrovmFilesystemConfig::AggregatePolicyPathsTooLarge)?;
+        }
+        Ok(Self {
+            guest_mount_target,
+            access: if children.iter().all(|child| child.access.is_read_only()) {
+                MicrovmFilesystemAccess::ReadOnly
+            } else {
+                MicrovmFilesystemAccess::ReadWrite
+            },
+            denied_paths: Vec::new(),
+            allowed_paths: Vec::new(),
+            writable_paths: Vec::new(),
+            owner: MicrovmFilesystemOwner::Vmm,
+            children,
+        })
+    }
+
+    /// Returns whether the filesystem is an aggregate.
+    pub fn is_aggregate(&self) -> bool {
+        !self.children.is_empty()
     }
 
     /// Selects the host identity that performs the guest's operations.
@@ -411,96 +819,71 @@ impl MicrovmFilesystemConfig {
 
     /// Adds a canonical, non-overlapping denied-path policy.
     pub fn with_denied_paths(
-        mut self,
+        self,
         denied_paths: Vec<String>,
     ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
-        if denied_paths.len() > 128 {
-            return Err(InvalidMicrovmFilesystemConfig::TooManyDeniedPaths);
+        self.with_access_policy(denied_paths, Vec::new(), Vec::new())
+    }
+
+    /// Adds the complete access policy of the filesystem, as canonical
+    /// host-relative paths in lexical order.
+    ///
+    /// Denied paths hide subtrees, and allowed paths expose subtrees of denied
+    /// paths again. The nearest denied or allowed path that contains a denied
+    /// path must be an allowed path, if any, and the nearest one that contains
+    /// an allowed path must be a denied path. Writable paths, when present, are
+    /// the only parts of a read-write filesystem that the guest can modify; they
+    /// must not overlap or be inside a denied path that no allowed path exposes.
+    /// An aggregate's policy belongs to its children, so it has none.
+    pub fn with_access_policy(
+        mut self,
+        denied_paths: Vec<String>,
+        allowed_paths: Vec<String>,
+        writable_paths: Vec<String>,
+    ) -> Result<Self, InvalidMicrovmFilesystemConfig> {
+        if self.is_aggregate()
+            && !(denied_paths.is_empty() && allowed_paths.is_empty() && writable_paths.is_empty())
+        {
+            return Err(InvalidMicrovmFilesystemConfig::AggregatePolicyPaths);
         }
-        let total_bytes = denied_paths
-            .iter()
-            .try_fold(0usize, |total, path| total.checked_add(path.len()))
-            .ok_or(InvalidMicrovmFilesystemConfig::DeniedPathsTooLarge)?;
-        if total_bytes > 16 * 1024 {
-            return Err(InvalidMicrovmFilesystemConfig::DeniedPathsTooLarge);
-        }
-        for path in &denied_paths {
-            if path.is_empty()
-                || path.len() > 4096
-                || path.starts_with('/')
-                || path.ends_with('/')
-                || path.chars().any(|character| {
-                    character.is_whitespace() || matches!(character, '\0' | '\\' | ':')
-                })
-                || path
-                    .split('/')
-                    .any(|component| component.is_empty() || matches!(component, "." | ".."))
-            {
-                return Err(InvalidMicrovmFilesystemConfig::InvalidDeniedPath(
-                    path.clone(),
-                ));
-            }
-        }
-        let mut canonical = denied_paths.clone();
-        canonical.sort_unstable();
-        if canonical != denied_paths {
-            return Err(InvalidMicrovmFilesystemConfig::NonCanonicalDeniedPaths);
-        }
-        for pair in denied_paths.windows(2) {
-            if pair[1]
-                .strip_prefix(&pair[0])
-                .is_some_and(|suffix| suffix.starts_with('/'))
-            {
-                return Err(InvalidMicrovmFilesystemConfig::OverlappingDeniedPaths);
-            }
-        }
+        validate_microvm_filesystem_access_policy(
+            self.access,
+            &denied_paths,
+            &allowed_paths,
+            &writable_paths,
+        )?;
         self.denied_paths = denied_paths;
+        self.allowed_paths = allowed_paths;
+        self.writable_paths = writable_paths;
         Ok(self)
     }
 
     /// Returns the pinned guest bootstrap command-line tokens of this
-    /// filesystem when it is attached to `slot`.
+    /// filesystem when it is attached to `slot`. An aggregate adds
+    /// `virtfs_aggregate=1`, so the guest can tell its root, which lists the
+    /// children, from a single shared directory.
     pub fn command_line_fragment(&self, slot: &MicrovmFilesystemSlot) -> String {
         format!(
-            "virtfs_dir={} virtfs_tag={} virtfs_mode={}",
+            "virtfs_dir={} virtfs_tag={} virtfs_mode={}{}",
             self.guest_mount_target,
             slot.tag,
-            self.access.as_str()
+            self.access.as_str(),
+            if self.is_aggregate() {
+                " virtfs_aggregate=1"
+            } else {
+                ""
+            }
         )
     }
 }
 
-/// Returns whether one guest mount target equals or contains the other.
-fn microvm_guest_targets_overlap(left: &str, right: &str) -> bool {
-    let contains = |outer: &str, inner: &str| {
-        inner
-            .strip_prefix(outer)
-            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-    };
-    contains(left, right) || contains(right, left)
-}
-
-/// Validates the filesystems attached to the fixed microVM virtio-fs slots,
-/// in slot order: there are no more than the slots, and no guest mount target
-/// equals or contains another, so no mount hides or shadows another.
+/// Validates the filesystems attached to the microVM virtio-fs slot: at most
+/// one, since several host directories share the slot as an aggregate.
 pub fn validate_microvm_filesystems(
     filesystems: &[MicrovmFilesystemConfig],
 ) -> Result<(), InvalidMicrovmFilesystemConfig> {
     if filesystems.len() > MICROVM_FILESYSTEM_SLOTS.len() {
         return Err(InvalidMicrovmFilesystemConfig::TooManyFilesystems);
-    }
-    for (index, filesystem) in filesystems.iter().enumerate() {
-        for other in &filesystems[..index] {
-            if microvm_guest_targets_overlap(
-                &other.guest_mount_target,
-                &filesystem.guest_mount_target,
-            ) {
-                return Err(InvalidMicrovmFilesystemConfig::OverlappingGuestTargets(
-                    other.guest_mount_target.clone(),
-                    filesystem.guest_mount_target.clone(),
-                ));
-            }
-        }
     }
     Ok(())
 }
@@ -513,29 +896,74 @@ pub enum InvalidMicrovmFilesystemConfig {
         "invalid guest mount target '{0}': expected an absolute non-root Linux path without empty, dot, parent, whitespace, backslash, or '=' components"
     )]
     InvalidGuestTarget(String),
-    /// A denied path was not a canonical relative path.
+    /// A policy path was not a canonical relative path.
     #[error(
-        "invalid denied path '{0}': expected a relative path without empty, dot, parent, whitespace, backslash, or ':' components"
+        "invalid {0} path '{1}': expected a relative path without empty, dot, or parent components, backslashes, colons, or whitespace other than spaces inside names"
     )]
-    InvalidDeniedPath(String),
-    /// The denied-path list exceeded its count bound.
-    #[error("microVM filesystem permits at most 128 denied paths")]
-    TooManyDeniedPaths,
-    /// The denied-path list exceeded its aggregate byte bound.
-    #[error("microVM filesystem denied paths exceed the 16-KiB aggregate limit")]
-    DeniedPathsTooLarge,
-    /// The denied-path list did not preserve canonical lexical order.
-    #[error("microVM filesystem denied paths are not in canonical order")]
-    NonCanonicalDeniedPaths,
-    /// One denied path contained another denied path.
-    #[error("microVM filesystem denied paths overlap")]
+    InvalidPolicyPath(MicrovmFilesystemPathKind, String),
+    /// A policy-path list exceeded its count bound.
+    #[error("microVM filesystem permits at most 128 {0} paths")]
+    TooManyPolicyPaths(MicrovmFilesystemPathKind),
+    /// A policy-path list exceeded its aggregate byte bound.
+    #[error("microVM filesystem {0} paths exceed the 16-KiB aggregate limit")]
+    PolicyPathsTooLarge(MicrovmFilesystemPathKind),
+    /// A policy-path list was not unique and in canonical lexical order.
+    #[error("microVM filesystem {0} paths are not in canonical order")]
+    NonCanonicalPolicyPaths(MicrovmFilesystemPathKind),
+    /// A denied path was inside another denied path, with no allowed path
+    /// between them.
+    #[error("microVM filesystem denied paths overlap without an allowed path between them")]
     OverlappingDeniedPaths,
-    /// More filesystems were attached than the microVM has virtio-fs slots.
-    #[error("microVM permits at most {} filesystems", MICROVM_FILESYSTEM_SLOTS.len())]
+    /// An allowed path was not inside a denied path, or was inside another
+    /// allowed path with no denied path between them.
+    #[error(
+        "microVM filesystem allowed path '{0}' must be inside a denied path, with no other allowed path between them"
+    )]
+    MisplacedAllowedPath(String),
+    /// A read-only filesystem had writable paths.
+    #[error("a read-only microVM filesystem cannot have writable paths")]
+    ReadOnlyWritablePaths,
+    /// One writable path contained another.
+    #[error("microVM filesystem writable paths overlap")]
+    OverlappingWritablePaths,
+    /// A writable path was inside a denied path that no allowed path exposes.
+    #[error("microVM filesystem writable path '{0}' is hidden by a denied path")]
+    HiddenWritablePath(String),
+    /// The root was a denied path, but no allowed path exposes part of it.
+    #[error("a microVM filesystem can hide its root only to expose allowed paths inside it")]
+    HiddenRootWithoutAllowedPaths,
+    /// More than one filesystem was attached to the microVM's virtio-fs slot.
+    #[error(
+        "microVM permits one filesystem; attach several host directories as the children of an aggregate"
+    )]
     TooManyFilesystems,
-    /// One guest mount target equals or contains another.
-    #[error("microVM filesystem guest mount targets '{0}' and '{1}' overlap")]
-    OverlappingGuestTargets(String, String),
+    /// An aggregate child's name was not a valid child name.
+    #[error(
+        "invalid microVM aggregate child name '{0}': expected 1 to {MICROVM_FILESYSTEM_MAX_CHILD_NAME} ASCII letters, digits, '.', '_', or '-', other than '.' and '..'"
+    )]
+    InvalidChildName(String),
+    /// Two aggregate children had the same name.
+    #[error("microVM aggregate child name '{0}' is not unique")]
+    DuplicateChildName(String),
+    /// An aggregate had no children or too many.
+    #[error(
+        "microVM aggregate filesystem requires 1 to {MICROVM_FILESYSTEM_MAX_CHILDREN} children"
+    )]
+    InvalidChildCount,
+    /// The policy paths of an aggregate's children exceeded their combined
+    /// byte bound.
+    #[error(
+        "microVM aggregate policy paths exceed the {MICROVM_FILESYSTEM_MAX_AGGREGATE_POLICY_BYTES}-byte aggregate limit"
+    )]
+    AggregatePolicyPathsTooLarge,
+    /// An aggregate had policy paths of its own.
+    #[error("a microVM aggregate filesystem has no policy paths of its own; its children do")]
+    AggregatePolicyPaths,
+    /// An aggregate child that exposes a file had policy paths.
+    #[error(
+        "microVM aggregate child '{0}' exposes a regular file, which takes no denied, allowed, or writable paths; its access mode applies to the whole file"
+    )]
+    FileChildPolicyPaths(String),
 }
 
 impl MicrovmNetworkConfig {
@@ -544,24 +972,87 @@ impl MicrovmNetworkConfig {
         std::net::Ipv4Addr::from(u32::MAX << (32 - self.prefix_length))
     }
 
-    /// Returns the pinned NVX guest-bootstrap command-line tokens.
-    pub fn command_line_fragment(&self) -> String {
-        self.command_line_fragment_with_dns(false)
+    /// Returns whether `address` is one of this identity's gateway addresses.
+    pub fn is_gateway(&self, address: std::net::IpAddr) -> bool {
+        match address {
+            std::net::IpAddr::V4(address) => address == self.derived_gateway_ipv4,
+            std::net::IpAddr::V6(address) => self
+                .ipv6
+                .is_some_and(|ipv6| address == ipv6.derived_gateway_ipv6),
+        }
     }
 
-    /// Returns the pinned bootstrap tokens, optionally including gateway DNS.
-    pub fn command_line_fragment_with_dns(&self, gateway_dns: bool) -> String {
-        let dns = if gateway_dns {
-            format!(" virtnet_dns={}", self.derived_gateway_ipv4)
-        } else {
-            String::new()
-        };
+    /// Returns this identity without its IPv6 identity, as a snapshot whose
+    /// network predates IPv6 records it.
+    pub fn without_ipv6(mut self) -> Self {
+        self.ipv6 = None;
+        self
+    }
+
+    /// Binds `mode` to this identity: the IPv4 identity and, on a dual-stack
+    /// NIC, the IPv6 identity.
+    pub fn bind_egress_policy(
+        &self,
+        mode: net_backend_resources::egress::EgressPolicyMode,
+    ) -> Result<
+        net_backend_resources::egress::EgressPolicy,
+        net_backend_resources::egress::InvalidEgressPolicy,
+    > {
+        let policy = net_backend_resources::egress::EgressPolicy::bind(
+            self.guest_ipv4,
+            self.prefix_length,
+            self.guest_mac,
+            self.derived_gateway_ipv4,
+            mode,
+        )?;
+        match self.ipv6 {
+            Some(ipv6) => policy.with_ipv6(
+                ipv6.guest_ipv6,
+                ipv6.prefix_length,
+                ipv6.derived_gateway_ipv6,
+            ),
+            None => Ok(policy),
+        }
+    }
+
+    /// Returns the pinned NVX guest-bootstrap command-line tokens.
+    pub fn command_line_fragment(&self) -> String {
+        self.command_line_fragment_with_dns(None)
+    }
+
+    /// Returns the pinned bootstrap tokens, naming `gateway_dns`, one of this
+    /// identity's gateway addresses, as the guest's DNS server.
+    pub fn command_line_fragment_with_dns(&self, gateway_dns: Option<std::net::IpAddr>) -> String {
+        self.command_line_fragment_with(gateway_dns, None)
+    }
+
+    /// Returns the pinned bootstrap tokens, naming `gateway_dns`, one of this
+    /// identity's gateway addresses, as the guest's DNS server and, with
+    /// `ingress`, asking the guest to announce its listeners with
+    /// [`MicrovmIngress::command_line_token`].
+    pub fn command_line_fragment_with(
+        &self,
+        gateway_dns: Option<std::net::IpAddr>,
+        ingress: Option<MicrovmIngress>,
+    ) -> String {
+        let dns = gateway_dns.map_or_else(String::new, |server| format!(" virtnet_dns={server}"));
+        let ipv6 = self.ipv6.map_or_else(String::new, |ipv6| {
+            format!(
+                " virtnet_ip6={}/{} virtnet_gw6={}",
+                ipv6.guest_ipv6, ipv6.prefix_length, ipv6.derived_gateway_ipv6
+            )
+        });
+        let ingress = ingress.map_or_else(String::new, |ingress| {
+            format!(" {}", ingress.command_line_token())
+        });
         format!(
-            "virtnet_ip={} virtnet_mask={} virtnet_gw={}{}",
+            "virtnet_ip={} virtnet_mask={} virtnet_gw={}{}{}{}",
             self.guest_ipv4,
             self.netmask(),
             self.derived_gateway_ipv4,
             dns,
+            ipv6,
+            ingress,
         )
     }
 
@@ -631,6 +1122,11 @@ impl std::str::FromStr for MicrovmNetworkConfig {
             derived_gateway_ipv4,
             guest_mac: Self::derive_mac(guest_ipv4),
             gateway_mac: Self::derive_mac(derived_gateway_ipv4),
+            ipv6: Some(MicrovmIpv6Config::embedding(
+                guest_ipv4,
+                prefix_length,
+                derived_gateway_ipv4,
+            )),
         })
     }
 }
@@ -684,7 +1180,25 @@ fn validate_microvm_virtio_reservations() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_microvm_sandbox_blocks(blocks: &[MicrovmSandboxBlockConfig]) -> anyhow::Result<()> {
+/// Returns whether the guest explicitly requests a RAM-backed overlay upper.
+/// The opt-in permits a read-only distro block without a writable scratch block.
+pub fn ramfs_overlay_requested(cmdline: &str) -> anyhow::Result<bool> {
+    // A bare key has no value, so it fails like any value other than ramfs.
+    let mut values = cmdline.split_ascii_whitespace().filter_map(|token| {
+        let (name, value) = token.split_once('=').unwrap_or((token, ""));
+        (name == "nvx_overlay_upper").then_some(value)
+    });
+    match (values.next(), values.next()) {
+        (None, None) => Ok(false),
+        (Some("ramfs"), None) => Ok(true),
+        _ => anyhow::bail!("microVM nvx_overlay_upper must appear once and equal ramfs"),
+    }
+}
+
+fn validate_microvm_sandbox_blocks(
+    blocks: &[MicrovmSandboxBlockConfig],
+    ramfs_overlay: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         blocks.len() <= MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES.len(),
         "microVM permits at most three read-only layers and one writable scratch device"
@@ -707,7 +1221,14 @@ fn validate_microvm_sandbox_blocks(blocks: &[MicrovmSandboxBlockConfig]) -> anyh
             );
         }
     }
-    if !blocks.is_empty() {
+    if ramfs_overlay {
+        anyhow::ensure!(
+            blocks.len() == 1
+                && blocks[0].role == MicrovmSandboxBlockRole::Distro
+                && blocks[0].read_only,
+            "microVM RAM-backed overlay requires exactly one read-only distro block"
+        );
+    } else if !blocks.is_empty() {
         anyhow::ensure!(
             blocks
                 .last()
@@ -718,8 +1239,8 @@ fn validate_microvm_sandbox_blocks(blocks: &[MicrovmSandboxBlockConfig]) -> anyh
     Ok(())
 }
 
-/// Returns the number of virtio-fs slots present when the first slot is
-/// reserved as `first_slot` and `attached` filesystems occupy the slots.
+/// Returns the number of virtio-fs slots present when the slot is reserved as
+/// `first_slot` and `attached` filesystems occupy it.
 pub fn microvm_filesystem_slot_count(first_slot: bool, attached: usize) -> anyhow::Result<usize> {
     anyhow::ensure!(
         attached == 0 || first_slot,
@@ -734,19 +1255,25 @@ pub fn microvm_filesystem_slot_count(first_slot: bool, attached: usize) -> anyho
 
 /// Appends sandbox virtio devices in fixed-address order.
 ///
-/// `filesystem_slot` reserves the first virtio-fs slot, and `filesystems`
-/// occupy the virtio-fs slots in order. A virtio-fs slot after the first is
-/// discovered only with a filesystem attached.
+/// `filesystem_slot` reserves the virtio-fs slot, and `filesystems`, at most
+/// one, occupies it. `network` carries the NIC's identity, its interrupt, the
+/// gateway address, if any, that the guest names as its DNS server, and the
+/// ingress, if any, for which the guest announces its listeners.
 pub fn append_microvm_virtio_discovery(
     cmdline: &mut String,
-    network: Option<(&MicrovmNetworkConfig, u32, bool)>,
+    network: Option<(
+        &MicrovmNetworkConfig,
+        u32,
+        Option<std::net::IpAddr>,
+        Option<MicrovmIngress>,
+    )>,
     filesystem_slot: bool,
     filesystems: &[MicrovmFilesystemConfig],
     has_console: bool,
     has_control_console: bool,
     blocks: &[MicrovmSandboxBlockConfig],
 ) -> anyhow::Result<()> {
-    validate_microvm_sandbox_blocks(blocks)?;
+    validate_microvm_sandbox_blocks(blocks, ramfs_overlay_requested(cmdline)?)?;
     anyhow::ensure!(
         !cmdline.split_ascii_whitespace().any(|token| {
             if has_control_console {
@@ -761,7 +1288,7 @@ pub fn append_microvm_virtio_discovery(
     validate_microvm_filesystems(filesystems)?;
 
     use std::fmt::Write as _;
-    if let Some((_, irq, _)) = network {
+    if let Some((_, irq, _, _)) = network {
         anyhow::ensure!(
             matches!(irq, MICROVM_VIRTIO_NET_KVM_IRQ | MICROVM_VIRTIO_NET_WHP_IRQ),
             "microVM virtio-net IRQ {irq} is not part of the fixed machine contract"
@@ -802,33 +1329,22 @@ pub fn append_microvm_virtio_discovery(
             " virtio_mmio.device={MICROVM_VIRTIO_MMIO_LEN:#x}@{MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE:#x}:{MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ} {MICROVM_CONTROL_TTY_COMMAND_LINE}"
         )?;
     }
-    for slot in MICROVM_FILESYSTEM_SLOTS
-        .iter()
-        .take(filesystem_slots)
-        .skip(1)
-    {
-        write!(cmdline, " {}", slot.discovery_token())?;
-    }
-    if let Some((network, _, gateway_dns)) = network {
+    if let Some((network, _, gateway_dns, ingress)) = network {
         write!(
             cmdline,
             " {}",
-            network.command_line_fragment_with_dns(gateway_dns)
+            network.command_line_fragment_with(gateway_dns, ingress)
         )?;
     }
     for (filesystem, slot) in filesystems.iter().zip(&MICROVM_FILESYSTEM_SLOTS) {
         write!(cmdline, " {}", filesystem.command_line_fragment(slot))?;
     }
-    anyhow::ensure!(
-        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
-        "microVM kernel command line exceeds the 64-KiB ABI limit after device discovery"
-    );
-    Ok(())
+    check_microvm_command_line(cmdline)
 }
 
-/// Validates the virtio-fs device inventory against the attached filesystems,
-/// which occupy the first slots, and returns the number of virtio-fs devices.
-/// Only the first slot may be present without a filesystem.
+/// Validates the virtio-fs device inventory against the attached filesystem
+/// and returns the number of virtio-fs devices: the slot may be present
+/// without a filesystem.
 fn validate_microvm_filesystem_devices(config: &Config) -> anyhow::Result<usize> {
     let filesystem_count = config
         .virtio_devices
@@ -838,16 +1354,11 @@ fn validate_microvm_filesystem_devices(config: &Config) -> anyhow::Result<usize>
     let filesystems = &config.microvm.filesystems;
     anyhow::ensure!(
         filesystem_count <= MICROVM_FILESYSTEM_SLOTS.len(),
-        "microVM permits at most {} virtio-fs devices",
-        MICROVM_FILESYSTEM_SLOTS.len()
+        "microVM permits one virtio-fs device"
     );
     anyhow::ensure!(
         filesystems.len() <= filesystem_count,
         "microVM filesystem policy requires a virtio-fs device"
-    );
-    anyhow::ensure!(
-        filesystem_count <= filesystems.len().max(1),
-        "microVM exposes a virtio-fs slot after the first only with a filesystem attached"
     );
     validate_microvm_filesystems(filesystems)?;
     anyhow::ensure!(
@@ -855,6 +1366,69 @@ fn validate_microvm_filesystem_devices(config: &Config) -> anyhow::Result<usize>
         "microVM filesystem bootstrap requires an active filesystem policy"
     );
     Ok(filesystem_count)
+}
+
+/// Returns the DNS server that the command line's `virtnet_dns=` token names,
+/// which must be one of `network`'s gateway addresses, spelled canonically.
+fn microvm_command_line_dns_server(
+    network: Option<&MicrovmNetworkConfig>,
+    tokens: &[&str],
+) -> anyhow::Result<Option<std::net::IpAddr>> {
+    let dns_tokens = tokens
+        .iter()
+        .filter_map(|token| token.strip_prefix("virtnet_dns="))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        dns_tokens.len() <= 1,
+        "microVM command line has an invalid number of virtnet_dns= tokens"
+    );
+    let Some(dns) = dns_tokens.first() else {
+        return Ok(None);
+    };
+    let network =
+        network.ok_or_else(|| anyhow::anyhow!("microVM DNS bootstrap requires virtio-net"))?;
+    let server = dns
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .filter(|server| network.is_gateway(*server) && server.to_string() == *dns);
+    anyhow::ensure!(
+        server.is_some(),
+        "microVM DNS bootstrap does not match the portable gateway"
+    );
+    Ok(server)
+}
+
+/// Returns the ingress for which the command line asks the guest to announce
+/// its listeners with [`MicrovmIngress::command_line_token`], which needs
+/// `network`.
+fn microvm_command_line_ingress(
+    network: Option<&MicrovmNetworkConfig>,
+    tokens: &[&str],
+) -> anyhow::Result<Option<MicrovmIngress>> {
+    let ingress_tokens = tokens
+        .iter()
+        .copied()
+        .filter(|token| token.starts_with("virtnet_ingress="))
+        .collect::<Vec<_>>();
+    match ingress_tokens.as_slice() {
+        [] => Ok(None),
+        [token] => {
+            let Some(ingress) = [
+                MicrovmIngress::PrivateNetworks,
+                MicrovmIngress::HostLoopback,
+            ]
+            .into_iter()
+            .find(|ingress| ingress.command_line_token() == *token) else {
+                anyhow::bail!("microVM command line has an invalid virtnet_ingress= token");
+            };
+            anyhow::ensure!(
+                network.is_some(),
+                "microVM ingress bootstrap requires virtio-net"
+            );
+            Ok(Some(ingress))
+        }
+        _ => anyhow::bail!("microVM command line has an invalid number of virtnet_ingress= tokens"),
+    }
 }
 
 fn validate_microvm_command_line(
@@ -872,14 +1446,7 @@ fn validate_microvm_command_line(
         } => cmdline,
         _ => anyhow::bail!("microVM requires Linux MP-table load mode"),
     };
-    anyhow::ensure!(
-        !cmdline.contains('\0'),
-        "microVM command line contains an embedded NUL"
-    );
-    anyhow::ensure!(
-        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
-        "microVM command line exceeds the 64-KiB ABI limit"
-    );
+    check_microvm_command_line(cmdline)?;
 
     let tokens = cmdline.split_ascii_whitespace().collect::<Vec<_>>();
     let has_console = config
@@ -905,7 +1472,10 @@ fn validate_microvm_command_line(
         has_network == config.microvm.network.is_some(),
         "microVM virtio-net device and static network identity must be configured together"
     );
-    validate_microvm_sandbox_blocks(&config.microvm.sandbox_blocks)?;
+    validate_microvm_sandbox_blocks(
+        &config.microvm.sandbox_blocks,
+        ramfs_overlay_requested(cmdline)?,
+    )?;
     anyhow::ensure!(
         block_count == config.microvm.sandbox_blocks.len(),
         "microVM sandbox block roles do not match the virtio-blk device inventory"
@@ -932,9 +1502,12 @@ fn validate_microvm_command_line(
         "virtnet_ip=",
         "virtnet_mask=",
         "virtnet_gw=",
+        "virtnet_ip6=",
+        "virtnet_gw6=",
         "virtfs_dir=",
         "virtfs_tag=",
         "virtfs_mode=",
+        "virtfs_aggregate=",
     ] {
         let count = if prefix == "virtio_mmio.device=" && has_control_console {
             tokens
@@ -947,16 +1520,26 @@ fn validate_microvm_command_line(
                 .filter(|token| token.starts_with(prefix))
                 .count()
         };
+        let bootstrapped = if config.microvm.filesystem_bootstrap {
+            config.microvm.filesystems.as_slice()
+        } else {
+            &[]
+        };
         let expected = match prefix {
             "virtio_mmio.device=" => config.virtio_devices.len(),
             "virtnet_ip=" | "virtnet_mask=" | "virtnet_gw=" => usize::from(has_network),
-            "virtfs_dir=" | "virtfs_tag=" | "virtfs_mode=" => {
-                if config.microvm.filesystem_bootstrap {
-                    config.microvm.filesystems.len()
-                } else {
-                    0
-                }
-            }
+            "virtnet_ip6=" | "virtnet_gw6=" => usize::from(
+                config
+                    .microvm
+                    .network
+                    .as_ref()
+                    .is_some_and(|network| network.ipv6.is_some()),
+            ),
+            "virtfs_dir=" | "virtfs_tag=" | "virtfs_mode=" => bootstrapped.len(),
+            "virtfs_aggregate=" => bootstrapped
+                .iter()
+                .filter(|filesystem| filesystem.is_aggregate())
+                .count(),
             _ => 1,
         };
         anyhow::ensure!(
@@ -964,26 +1547,8 @@ fn validate_microvm_command_line(
             "microVM command line has an invalid number of {prefix} tokens"
         );
     }
-    let dns_tokens = tokens
-        .iter()
-        .filter(|token| token.starts_with("virtnet_dns="))
-        .copied()
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        dns_tokens.len() <= 1,
-        "microVM command line has an invalid number of virtnet_dns= tokens"
-    );
-    if let Some(dns) = dns_tokens.first() {
-        let network = config
-            .microvm
-            .network
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("microVM DNS bootstrap requires virtio-net"))?;
-        anyhow::ensure!(
-            **dns == format!("virtnet_dns={}", network.derived_gateway_ipv4),
-            "microVM DNS bootstrap does not match the portable gateway"
-        );
-    }
+    let dns_server = microvm_command_line_dns_server(config.microvm.network.as_ref(), &tokens)?;
+    let ingress = microvm_command_line_ingress(config.microvm.network.as_ref(), &tokens)?;
     let mut expected_discovery = Vec::new();
     if has_network {
         let irq = microvm_virtio_net_irq(hypervisor_id)?;
@@ -1012,17 +1577,10 @@ fn validate_microvm_command_line(
         ));
         expected_discovery.push(MICROVM_CONTROL_TTY_COMMAND_LINE.to_owned());
     }
-    expected_discovery.extend(
-        MICROVM_FILESYSTEM_SLOTS
-            .iter()
-            .take(filesystem_count)
-            .skip(1)
-            .map(MicrovmFilesystemSlot::discovery_token),
-    );
     if let Some(network) = &config.microvm.network {
         expected_discovery.extend(
             network
-                .command_line_fragment_with_dns(!dns_tokens.is_empty())
+                .command_line_fragment_with(dns_server, ingress)
                 .split_ascii_whitespace()
                 .map(str::to_owned),
         );
@@ -1056,6 +1614,26 @@ fn validate_microvm_command_line(
     Ok(())
 }
 
+/// Checks that the guest kernel can receive `cmdline` whole: it contains no
+/// NUL, and with its terminating NUL it fits in
+/// [`MICROVM_COMMAND_LINE_MAX_SIZE`] bytes.
+///
+/// The profile applies this check after appending each of its tokens, and to
+/// the effective command line of every cold boot and restore.
+pub fn check_microvm_command_line(cmdline: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cmdline.contains('\0'),
+        "microVM kernel command line contains an embedded NUL"
+    );
+    anyhow::ensure!(
+        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
+        "microVM kernel command line is {} bytes; the limit is {} bytes plus the terminating NUL",
+        cmdline.len(),
+        MICROVM_COMMAND_LINE_MAX_SIZE - 1
+    );
+    Ok(())
+}
+
 /// Builds the microVM command line and rejects profile-owned user tokens.
 pub fn build_microvm_command_line(
     user_args: &[String],
@@ -1082,11 +1660,7 @@ pub fn append_microvm_processor_limit(
         "microVM does not support {processor_count} vCPUs"
     );
     write!(cmdline, " nr_cpus={processor_count}")?;
-    anyhow::ensure!(
-        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
-        "microVM kernel command line exceeds the 64-KiB ABI limit"
-    );
-    Ok(())
+    check_microvm_command_line(cmdline)
 }
 
 /// Appends the host-owned fixed workload identity to a microVM command line.
@@ -1098,22 +1672,14 @@ pub fn append_microvm_workload_identity(
     anyhow::ensure!(uid != 0, "microVM workload UID must be nonzero");
     anyhow::ensure!(gid != 0, "microVM workload GID must be nonzero");
     write!(cmdline, " nvx_workload_uid={uid} nvx_workload_gid={gid}")?;
-    anyhow::ensure!(
-        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
-        "microVM kernel command line exceeds the 64-KiB ABI limit"
-    );
-    Ok(())
+    check_microvm_command_line(cmdline)
 }
 
 /// Appends the host-owned workload lifecycle to a microVM command line.
 pub fn append_microvm_lifecycle(cmdline: &mut String, managed: bool) -> anyhow::Result<()> {
     let lifecycle = if managed { "managed" } else { "one-shot" };
     write!(cmdline, " nvx_lifecycle={lifecycle}")?;
-    anyhow::ensure!(
-        cmdline.len() < MICROVM_COMMAND_LINE_MAX_SIZE,
-        "microVM kernel command line exceeds the 64-KiB ABI limit"
-    );
-    Ok(())
+    check_microvm_command_line(cmdline)
 }
 
 fn kernel_parameter_name_matches(token: &str, expected: &str) -> bool {
@@ -1180,9 +1746,13 @@ fn build_microvm_command_line_inner(
                 "virtnet_mask=",
                 "virtnet_gw=",
                 "virtnet_dns=",
+                "virtnet_ip6=",
+                "virtnet_gw6=",
+                "virtnet_ingress=",
                 "virtfs_dir=",
                 "virtfs_tag=",
                 "virtfs_mode=",
+                "virtfs_aggregate=",
                 "nvx_snapshot_tier=",
                 "nr_cpus=",
                 "nvx_workload_uid=",
@@ -1212,9 +1782,7 @@ fn build_microvm_command_line_inner(
         cmdline.push(' ');
         cmdline.push_str(arg);
     }
-    if cmdline.len() >= MICROVM_COMMAND_LINE_MAX_SIZE {
-        anyhow::bail!("microVM kernel command line exceeds the 64-KiB ABI limit");
-    }
+    check_microvm_command_line(&cmdline)?;
     Ok(cmdline)
 }
 
@@ -1531,7 +2099,6 @@ pub fn validate_machine_config(config: &Config, hypervisor_id: Option<&str>) -> 
         !has_control_console || has_console,
         "microVM control console requires the boot console"
     );
-    validate_microvm_sandbox_blocks(&config.microvm.sandbox_blocks)?;
     anyhow::ensure!(
         block_count == config.microvm.sandbox_blocks.len(),
         "microVM sandbox block roles do not match the virtio-blk device inventory"
@@ -1719,11 +2286,314 @@ mod tests {
         assert!(build_microvm_command_line(&["nr_cpus=1".to_owned()], false).is_err());
     }
 
+    // The exact text of the limit error for a command line one byte over the
+    // limit, which callers may match. The other crates' tests take it from
+    // check_microvm_command_line.
+    fn limit_error() -> String {
+        format!(
+            "microVM kernel command line is {} bytes; the limit is {} bytes plus the terminating NUL",
+            MICROVM_COMMAND_LINE_MAX_SIZE,
+            MICROVM_COMMAND_LINE_MAX_SIZE - 1
+        )
+    }
+
+    #[test]
+    fn microvm_command_line_fits_the_guest_kernel_limit() {
+        // The limit is the x86 guest kernel's COMMAND_LINE_SIZE: 2,047 bytes
+        // of text and the terminating NUL fill its 2,048-byte buffer.
+        assert_eq!(MICROVM_COMMAND_LINE_MAX_SIZE, 2048);
+        let max_text = MICROVM_COMMAND_LINE_MAX_SIZE - 1;
+        check_microvm_command_line(&"x".repeat(max_text)).unwrap();
+        assert_eq!(
+            check_microvm_command_line(&"x".repeat(max_text + 1))
+                .unwrap_err()
+                .to_string(),
+            limit_error()
+        );
+        assert_eq!(
+            check_microvm_command_line("console=hvc0 \0")
+                .unwrap_err()
+                .to_string(),
+            "microVM kernel command line contains an embedded NUL"
+        );
+
+        let fill = max_text
+            .checked_sub(MICROVM_CONSOLE_COMMAND_LINE.len() + 1)
+            .expect("the console command line leaves room for the caller's argument");
+        let longest = build_microvm_command_line(&["x".repeat(fill)], true).unwrap();
+        assert_eq!(longest.len(), max_text);
+        assert_eq!(
+            build_microvm_control_command_line(&["x".repeat(fill + 1)], true)
+                .unwrap_err()
+                .to_string(),
+            limit_error()
+        );
+    }
+
+    #[test]
+    fn microvm_command_line_limit_includes_the_profile_tokens() {
+        // Every token that the profile appends is checked with the line that
+        // precedes it.
+        type Append = fn(&mut String) -> anyhow::Result<()>;
+        let appends: [(Append, &str); 3] = [
+            (
+                |cmdline| append_microvm_processor_limit(cmdline, 8),
+                " nr_cpus=8",
+            ),
+            (
+                |cmdline| append_microvm_workload_identity(cmdline, u32::MAX, u32::MAX),
+                " nvx_workload_uid=4294967295 nvx_workload_gid=4294967295",
+            ),
+            (
+                |cmdline| append_microvm_lifecycle(cmdline, false),
+                " nvx_lifecycle=one-shot",
+            ),
+        ];
+        let max_text = MICROVM_COMMAND_LINE_MAX_SIZE - 1;
+        for (append, token) in appends {
+            let fill = max_text
+                .checked_sub(token.len())
+                .expect("the token fits within the limit");
+            let mut longest = "x".repeat(fill);
+            append(&mut longest).unwrap();
+            assert_eq!(longest.len(), max_text);
+            assert!(longest.ends_with(token));
+            let mut over = "x".repeat(fill + 1);
+            assert_eq!(append(&mut over).unwrap_err().to_string(), limit_error());
+        }
+
+        // Device discovery and the network bootstrap come last, so the line
+        // that they complete is the effective one. Padded to the limit, it
+        // must join the base command line, the caller's argument, and the
+        // tokens that discovery writes after an empty line, whose formats
+        // microvm_discovery_bootstraps_one_filesystem pins, so that no token
+        // is lost, and still end with the network bootstrap.
+        let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let discover = |cmdline: &mut String| {
+            append_microvm_virtio_discovery(
+                cmdline,
+                Some((&network, MICROVM_VIRTIO_NET_KVM_IRQ, None, None)),
+                false,
+                &[],
+                false,
+                false,
+                &[],
+            )
+        };
+        let mut discovery = String::new();
+        discover(&mut discovery).unwrap();
+        let fill = max_text
+            .checked_sub(MICROVM_BASE_COMMAND_LINE.len() + 1 + discovery.len())
+            .expect("the profile's tokens leave room for the caller's argument");
+        let mut longest = build_microvm_command_line(&["x".repeat(fill)], false).unwrap();
+        discover(&mut longest).unwrap();
+        assert_eq!(
+            longest,
+            format!(
+                "{MICROVM_BASE_COMMAND_LINE} {}{discovery}",
+                "x".repeat(fill)
+            )
+        );
+        assert_eq!(longest.len(), max_text);
+        assert!(longest.ends_with(" virtnet_gw6=fd00::a00:1"));
+        let mut over = build_microvm_command_line(&["x".repeat(fill + 1)], false).unwrap();
+        assert_eq!(discover(&mut over).unwrap_err().to_string(), limit_error());
+    }
+
     #[test]
     fn microvm_network_identity_has_portable_profile() {
         let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
         assert_eq!(network.profile, MicrovmNetworkProfile::Portable);
         assert_eq!(network.profile.as_str(), "portable");
+    }
+
+    #[test]
+    fn microvm_network_identity_embeds_ipv4_in_its_ipv6_identity() {
+        for (spec, guest, prefix_length, gateway) in [
+            ("10.0.0.2/24", "fd00::a00:2", 120, "fd00::a00:1"),
+            ("192.168.5.37/28", "fd00::c0a8:525", 124, "fd00::c0a8:521"),
+            ("172.16.0.9/12", "fd00::ac10:9", 108, "fd00::ac10:1"),
+        ] {
+            let network: MicrovmNetworkConfig = spec.parse().unwrap();
+            assert_eq!(
+                network.ipv6,
+                Some(MicrovmIpv6Config {
+                    guest_ipv6: guest.parse().unwrap(),
+                    prefix_length,
+                    derived_gateway_ipv6: gateway.parse().unwrap(),
+                }),
+                "{spec}"
+            );
+            assert!(
+                network.command_line_fragment().ends_with(&format!(
+                    " virtnet_ip6={guest}/{prefix_length} virtnet_gw6={gateway}"
+                )),
+                "{spec}"
+            );
+            let policy = network
+                .bind_egress_policy(net_backend_resources::egress::EgressPolicyMode::AllowAll)
+                .unwrap();
+            let link = policy.ipv6_link().unwrap();
+            assert_eq!(
+                (link.guest(), link.prefix_length(), link.gateway()),
+                (
+                    guest.parse().unwrap(),
+                    prefix_length,
+                    gateway.parse().unwrap()
+                )
+            );
+
+            let ipv4_only = network.without_ipv6();
+            assert_eq!(ipv4_only.ipv6, None);
+            assert!(!ipv4_only.command_line_fragment().contains("virtnet_ip6="));
+            assert!(
+                ipv4_only
+                    .bind_egress_policy(net_backend_resources::egress::EgressPolicyMode::AllowAll)
+                    .unwrap()
+                    .ipv6_link()
+                    .is_none()
+            );
+        }
+        for reserved in ["virtnet_ip6=fd00::2/120", "virtnet_gw6=fd00::1"] {
+            assert!(build_microvm_command_line(&[reserved.to_owned()], false).is_err());
+        }
+    }
+
+    #[test]
+    fn microvm_dns_bootstrap_names_either_gateway_canonically() {
+        use net_backend_resources::egress::EgressAction;
+        use net_backend_resources::egress::EgressPolicyMode;
+
+        let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let ipv4: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let ipv6: std::net::IpAddr = "fd00::a00:1".parse().unwrap();
+        assert!(network.is_gateway(ipv4) && network.is_gateway(ipv6));
+        assert!(!network.is_gateway("10.0.0.2".parse().unwrap()));
+        assert!(!network.is_gateway("fd00::a00:2".parse().unwrap()));
+
+        // A policy that permits DNS over IPv6 alone names the IPv6 gateway.
+        let policy = |allow: &str| {
+            network
+                .bind_egress_policy(EgressPolicyMode::Rules {
+                    default_action: EgressAction::Deny,
+                    allow: vec![allow.parse().unwrap()],
+                    deny: Vec::new(),
+                })
+                .unwrap()
+                .gateway_dns_server()
+        };
+        assert_eq!(policy("10.0.0.1:udp:53"), Some(ipv4));
+        assert_eq!(policy("fd00::a00:1:udp:53"), Some(ipv6));
+        assert_eq!(policy("fd00::a00:1:tcp:443"), None);
+
+        for (server, dns) in [
+            (ipv4, "virtnet_dns=10.0.0.1"),
+            (ipv6, "virtnet_dns=fd00::a00:1"),
+        ] {
+            let fragment = network.command_line_fragment_with_dns(Some(server));
+            let tokens = fragment.split_ascii_whitespace().collect::<Vec<_>>();
+            assert!(tokens.contains(&dns), "{fragment}");
+            assert_eq!(
+                microvm_command_line_dns_server(Some(&network), &tokens).unwrap(),
+                Some(server)
+            );
+        }
+        assert_eq!(
+            microvm_command_line_dns_server(Some(&network), &[]).unwrap(),
+            None
+        );
+
+        let ipv4_only = network.clone().without_ipv6();
+        for (network, tokens) in [
+            (Some(&network), &["virtnet_dns=fd00::a00:2"][..]),
+            (Some(&network), &["virtnet_dns=fd00:0::a00:1"]),
+            (Some(&network), &["virtnet_dns=010.0.0.1"]),
+            (Some(&network), &["virtnet_dns=10.0.0.1,fd00::a00:1"]),
+            (Some(&ipv4_only), &["virtnet_dns=fd00::a00:1"]),
+            (
+                Some(&network),
+                &["virtnet_dns=10.0.0.1", "virtnet_dns=fd00::a00:1"],
+            ),
+            (None, &["virtnet_dns=10.0.0.1"]),
+        ] {
+            assert!(
+                microvm_command_line_dns_server(network, tokens).is_err(),
+                "{tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn microvm_ingress_bootstrap_is_host_owned() {
+        let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let dns = Some("10.0.0.1".parse().unwrap());
+        for (ingress, token) in [
+            (
+                MicrovmIngress::PrivateNetworks,
+                MICROVM_INGRESS_COMMAND_LINE_TOKEN,
+            ),
+            (
+                MicrovmIngress::HostLoopback,
+                MICROVM_HOST_LOOPBACK_INGRESS_COMMAND_LINE_TOKEN,
+            ),
+        ] {
+            let fragment = network.command_line_fragment_with(dns, Some(ingress));
+            assert_eq!(
+                fragment,
+                format!("{} {token}", network.command_line_fragment_with_dns(dns))
+            );
+            let tokens = fragment.split_ascii_whitespace().collect::<Vec<_>>();
+            assert_eq!(
+                microvm_command_line_ingress(Some(&network), &tokens).unwrap(),
+                Some(ingress)
+            );
+
+            let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
+            append_microvm_virtio_discovery(
+                &mut cmdline,
+                Some((&network, MICROVM_VIRTIO_NET_KVM_IRQ, dns, Some(ingress))),
+                false,
+                &[],
+                false,
+                false,
+                &[],
+            )
+            .unwrap();
+            assert!(cmdline.ends_with(&format!(
+                "virtnet_dns=10.0.0.1 virtnet_ip6=fd00::a00:2/120 virtnet_gw6=fd00::a00:1 \
+                 {token}"
+            )));
+            assert!(build_microvm_command_line(&[token.to_owned()], false).is_err());
+        }
+        assert_eq!(
+            microvm_command_line_ingress(Some(&network), &[]).unwrap(),
+            None
+        );
+
+        for (network, tokens) in [
+            (Some(&network), &["virtnet_ingress=deny"][..]),
+            (
+                Some(&network),
+                &[
+                    MICROVM_INGRESS_COMMAND_LINE_TOKEN,
+                    MICROVM_INGRESS_COMMAND_LINE_TOKEN,
+                ],
+            ),
+            (
+                Some(&network),
+                &[
+                    MICROVM_INGRESS_COMMAND_LINE_TOKEN,
+                    MICROVM_HOST_LOOPBACK_INGRESS_COMMAND_LINE_TOKEN,
+                ],
+            ),
+            (None, &[MICROVM_INGRESS_COMMAND_LINE_TOKEN]),
+            (None, &[MICROVM_HOST_LOOPBACK_INGRESS_COMMAND_LINE_TOKEN]),
+        ] {
+            assert!(
+                microvm_command_line_ingress(network, tokens).is_err(),
+                "{tokens:?}"
+            );
+        }
     }
 
     #[test]
@@ -1746,7 +2616,7 @@ mod tests {
                 read_only: false,
             },
         ];
-        validate_microvm_sandbox_blocks(&blocks).unwrap();
+        validate_microvm_sandbox_blocks(&blocks, false).unwrap();
 
         let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
         append_microvm_virtio_discovery(&mut cmdline, None, false, &[], false, false, &blocks)
@@ -1796,7 +2666,6 @@ mod tests {
             (MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[2], 0x3_0014),
             (MICROVM_VIRTIO_SANDBOX_BLOCK_MMIO_BASES[3], 0x3_0018),
             (MICROVM_VIRTIO_CONTROL_CONSOLE_MMIO_BASE, 0x3_001c),
-            (MICROVM_VIRTIO_FS1_MMIO_BASE, 0x3_0020),
         ];
         for (mmio_base, expected_gpa) in slots {
             assert_eq!(microvm_virtio_status_gpa(mmio_base), Some(expected_gpa));
@@ -1805,11 +2674,13 @@ mod tests {
                 expected_gpa < MICROVM_SHARED_STATUS_PAGE_GPA + MICROVM_SHARED_STATUS_PAGE_SIZE
             );
         }
+        // The window of the retired second virtio-fs slot is free.
+        assert_eq!(microvm_virtio_status_gpa(0xd000_8000), None);
         assert_eq!(microvm_virtio_status_gpa(0xd000_9000), None);
     }
 
     #[test]
-    fn microvm_filesystem_slots_are_stable() {
+    fn microvm_filesystem_slot_is_stable() {
         assert_eq!(
             MICROVM_FILESYSTEM_SLOTS.map(|slot| (
                 slot.stable_id,
@@ -1817,44 +2688,22 @@ mod tests {
                 slot.mmio_base,
                 slot.irq
             )),
-            [
-                ("fs:microvm0", "microvm", 0xd000_1000, 6),
-                ("fs:microvm1", "microvm1", 0xd000_8000, 13),
-            ]
+            [("fs:microvm0", "microvm", 0xd000_1000, 6)]
         );
         assert_eq!(
-            MICROVM_FILESYSTEM_SLOTS[1].discovery_token(),
-            "virtio_mmio.device=0x1000@0xd0008000:13"
+            MICROVM_FILESYSTEM_SLOTS[0].discovery_token(),
+            "virtio_mmio.device=0x1000@0xd0001000:6"
         );
         validate_microvm_virtio_reservations().unwrap();
-        // Every slot has its own reserved window and an ISA interrupt that no
-        // other fixed device of any backend uses.
-        let other_irqs = [
-            0,
-            8,
-            MICROVM_VIRTIO_CONTROL_CONSOLE_IRQ,
-            MICROVM_VIRTIO_BLK_IRQ,
-            MICROVM_VIRTIO_NET_WHP_IRQ,
-            MICROVM_VIRTIO_CONSOLE_IRQ,
-            MICROVM_VIRTIO_CUSTOM_BLK_IRQ,
-            MICROVM_VIRTIO_NET_KVM_IRQ,
-            MICROVM_VIRTIO_SCRATCH_BLK_IRQ,
-            MICROVM_VIRTIO_RUNTIME_BLK_IRQ,
-        ];
-        for (index, slot) in MICROVM_FILESYSTEM_SLOTS.iter().enumerate() {
-            assert!(MICROVM_VIRTIO_MMIO_BASES.contains(&slot.mmio_base));
-            assert!(microvm_virtio_status_gpa(slot.mmio_base).is_some());
-            assert!(slot.irq < 16 && !other_irqs.contains(&slot.irq));
-            for other in &MICROVM_FILESYSTEM_SLOTS[..index] {
-                assert_ne!(other.stable_id, slot.stable_id);
-                assert_ne!(other.tag, slot.tag);
-                assert_ne!(other.irq, slot.irq);
-            }
-        }
+        assert!(!MICROVM_VIRTIO_MMIO_BASES.contains(&0xd000_8000));
     }
 
     fn filesystem(target: &str, access: MicrovmFilesystemAccess) -> MicrovmFilesystemConfig {
         MicrovmFilesystemConfig::new(target.to_owned(), access).unwrap()
+    }
+
+    fn child(name: &str, access: MicrovmFilesystemAccess) -> MicrovmFilesystemChildConfig {
+        MicrovmFilesystemChildConfig::new(name.to_owned(), access).unwrap()
     }
 
     #[test]
@@ -1862,67 +2711,439 @@ mod tests {
         assert_eq!(microvm_filesystem_slot_count(false, 0).unwrap(), 0);
         assert_eq!(microvm_filesystem_slot_count(true, 0).unwrap(), 1);
         assert_eq!(microvm_filesystem_slot_count(true, 1).unwrap(), 1);
-        assert_eq!(microvm_filesystem_slot_count(true, 2).unwrap(), 2);
         assert!(microvm_filesystem_slot_count(false, 1).is_err());
-        assert!(microvm_filesystem_slot_count(true, 3).is_err());
+        assert!(microvm_filesystem_slot_count(true, 2).is_err());
     }
 
     #[test]
-    fn microvm_filesystems_reject_overlapping_guest_targets() {
+    fn microvm_filesystems_occupy_one_slot() {
         use MicrovmFilesystemAccess::ReadOnly;
         use MicrovmFilesystemAccess::ReadWrite;
 
         validate_microvm_filesystems(&[]).unwrap();
-        validate_microvm_filesystems(&[
-            filesystem("/workspace", ReadWrite),
-            filesystem("/opt/hostedtoolcache", ReadOnly),
-        ])
-        .unwrap();
-        // A shared prefix that is not a path component does not overlap.
-        validate_microvm_filesystems(&[
-            filesystem("/work", ReadWrite),
-            filesystem("/workspace", ReadOnly),
-        ])
-        .unwrap();
-        for (first, second) in [
-            ("/workspace", "/workspace"),
-            ("/workspace", "/workspace/cache"),
-            ("/opt/hostedtoolcache/node", "/opt"),
-        ] {
-            assert_eq!(
-                validate_microvm_filesystems(&[
-                    filesystem(first, ReadWrite),
-                    filesystem(second, ReadOnly),
-                ]),
-                Err(InvalidMicrovmFilesystemConfig::OverlappingGuestTargets(
-                    first.to_owned(),
-                    second.to_owned()
-                ))
-            );
-        }
+        validate_microvm_filesystems(&[filesystem("/workspace", ReadWrite)]).unwrap();
         assert_eq!(
             validate_microvm_filesystems(&[
-                filesystem("/a", ReadOnly),
-                filesystem("/b", ReadOnly),
-                filesystem("/c", ReadOnly),
+                filesystem("/workspace", ReadWrite),
+                filesystem("/opt/hostedtoolcache", ReadOnly),
             ]),
             Err(InvalidMicrovmFilesystemConfig::TooManyFilesystems)
         );
     }
 
     #[test]
-    fn microvm_discovery_places_later_filesystem_slots_after_the_control_console() {
+    fn microvm_aggregate_filesystem_is_canonical_and_consistent() {
+        use MicrovmFilesystemAccess::ReadOnly;
+        use MicrovmFilesystemAccess::ReadWrite;
+
+        let aggregate = MicrovmFilesystemConfig::new_aggregate(
+            "/run/nvx/shares".to_owned(),
+            vec![
+                child("0", ReadOnly)
+                    .with_access_policy(vec!["secret".to_owned()], Vec::new(), Vec::new())
+                    .unwrap(),
+                child("work-tree_1.x", ReadOnly),
+            ],
+        )
+        .unwrap();
+        assert!(aggregate.is_aggregate());
+        assert_eq!(aggregate.access, ReadOnly);
+        assert!(aggregate.denied_paths.is_empty());
+        assert_eq!(aggregate.children[0].denied_paths, ["secret"]);
+        assert!(!filesystem("/workspace", ReadOnly).is_aggregate());
+        // The aggregate is read-write when any child is.
+        assert_eq!(
+            MicrovmFilesystemConfig::new_aggregate(
+                "/run/nvx/shares".to_owned(),
+                vec![child("0", ReadOnly), child("1", ReadWrite)],
+            )
+            .unwrap()
+            .access,
+            ReadWrite
+        );
+        // The policy belongs to the children.
+        assert_eq!(
+            aggregate
+                .clone()
+                .with_access_policy(vec!["x".to_owned()], Vec::new(), Vec::new()),
+            Err(InvalidMicrovmFilesystemConfig::AggregatePolicyPaths)
+        );
+        assert_eq!(
+            aggregate
+                .with_access_policy(Vec::new(), Vec::new(), Vec::new())
+                .unwrap()
+                .children
+                .len(),
+            2
+        );
+
+        for name in ["", ".", "..", "a/b", "a b", "a,b", "a:b", &"x".repeat(65)] {
+            assert_eq!(
+                MicrovmFilesystemChildConfig::new(name.to_owned(), ReadOnly),
+                Err(InvalidMicrovmFilesystemConfig::InvalidChildName(
+                    name.to_owned()
+                ))
+            );
+        }
+        assert_eq!(
+            child("0", ReadOnly).with_access_policy(Vec::new(), Vec::new(), vec!["out".to_owned()]),
+            Err(InvalidMicrovmFilesystemConfig::ReadOnlyWritablePaths)
+        );
+        for (children, expected) in [
+            (
+                Vec::new(),
+                InvalidMicrovmFilesystemConfig::InvalidChildCount,
+            ),
+            (
+                (0..=MICROVM_FILESYSTEM_MAX_CHILDREN)
+                    .map(|index| child(&index.to_string(), ReadOnly))
+                    .collect(),
+                InvalidMicrovmFilesystemConfig::InvalidChildCount,
+            ),
+            (
+                vec![child("0", ReadOnly), child("0", ReadWrite)],
+                InvalidMicrovmFilesystemConfig::DuplicateChildName("0".to_owned()),
+            ),
+            (
+                (0..9)
+                    .map(|index| {
+                        child(&index.to_string(), ReadOnly)
+                            .with_access_policy(
+                                (0..4)
+                                    .map(|path| format!("{path}{}", "x".repeat(4000)))
+                                    .collect(),
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                            .unwrap()
+                    })
+                    .collect(),
+                InvalidMicrovmFilesystemConfig::AggregatePolicyPathsTooLarge,
+            ),
+        ] {
+            assert_eq!(
+                MicrovmFilesystemConfig::new_aggregate("/shares".to_owned(), children),
+                Err(expected)
+            );
+        }
+        assert!(
+            MicrovmFilesystemConfig::new_aggregate(
+                "relative".to_owned(),
+                vec![child("0", ReadOnly)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn microvm_aggregate_file_children_have_no_policy_paths() {
+        use MicrovmFilesystemAccess::ReadOnly;
+        use MicrovmFilesystemAccess::ReadWrite;
+
+        let file = MicrovmFilesystemChildConfig::new_file("1".to_owned(), ReadWrite).unwrap();
+        assert!(file.is_file());
+        assert_eq!(file.kind, MicrovmFilesystemChildKind::File);
+        assert!(!child("0", ReadOnly).is_file());
+        // The mode applies to the whole file, which no policy path can narrow.
+        for (denied, allowed, writable) in [
+            (vec!["x".to_owned()], Vec::new(), Vec::new()),
+            (Vec::new(), vec!["x".to_owned()], Vec::new()),
+            (Vec::new(), Vec::new(), vec!["x".to_owned()]),
+        ] {
+            assert_eq!(
+                file.clone().with_access_policy(denied, allowed, writable),
+                Err(InvalidMicrovmFilesystemConfig::FileChildPolicyPaths(
+                    "1".to_owned()
+                ))
+            );
+        }
+        let file = file
+            .with_access_policy(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            MicrovmFilesystemChildConfig::new_file("a/b".to_owned(), ReadOnly),
+            Err(InvalidMicrovmFilesystemConfig::InvalidChildName(
+                "a/b".to_owned()
+            ))
+        );
+        // Files and directories share an aggregate.
+        let aggregate = MicrovmFilesystemConfig::new_aggregate(
+            "/run/nvx/shares".to_owned(),
+            vec![child("0", ReadOnly), file],
+        )
+        .unwrap();
+        assert_eq!(aggregate.access, ReadWrite);
+        assert_eq!(
+            aggregate
+                .children
+                .iter()
+                .map(|child| child.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["directory", "file"]
+        );
+    }
+
+    #[test]
+    fn microvm_filesystem_access_policy_is_canonical_and_consistent() {
+        use MicrovmFilesystemAccess::ReadOnly;
+        use MicrovmFilesystemAccess::ReadWrite;
+        use MicrovmFilesystemPathKind::Allowed;
+        use MicrovmFilesystemPathKind::Denied;
+        use MicrovmFilesystemPathKind::Writable;
+
+        fn owned(paths: &[&str]) -> Vec<String> {
+            paths.iter().map(|path| (*path).to_owned()).collect()
+        }
+        let policy = |access, denied: &[&str], allowed: &[&str], writable: &[&str]| {
+            filesystem("/workspace", access).with_access_policy(
+                owned(denied),
+                owned(allowed),
+                owned(writable),
+            )
+        };
+
+        // A denied path may nest inside an allowed path, and lexical order
+        // puts `logs-old` before `logs/...`.
+        let config = policy(
+            ReadWrite,
+            &["logs", "logs-old", "logs/payloads/private"],
+            &["logs/payloads"],
+            &["logs/payloads/out", "out"],
+        )
+        .unwrap();
+        assert_eq!(config.allowed_paths, ["logs/payloads"]);
+        assert_eq!(config.writable_paths, ["logs/payloads/out", "out"]);
+        assert_eq!(
+            config
+                .clone()
+                .with_owner(MicrovmFilesystemOwner::Caller)
+                .owner,
+            MicrovmFilesystemOwner::Caller
+        );
+        assert_eq!(
+            filesystem("/workspace", ReadOnly)
+                .with_denied_paths(owned(&["secrets"]))
+                .unwrap()
+                .denied_paths,
+            ["secrets"]
+        );
+
+        for (access, denied, allowed, writable, expected) in [
+            (
+                ReadWrite,
+                vec!["a", "a/b"],
+                vec![],
+                vec![],
+                InvalidMicrovmFilesystemConfig::OverlappingDeniedPaths,
+            ),
+            (
+                ReadWrite,
+                vec!["b", "a"],
+                vec![],
+                vec![],
+                InvalidMicrovmFilesystemConfig::NonCanonicalPolicyPaths(Denied),
+            ),
+            (
+                ReadWrite,
+                vec!["a"],
+                vec!["a/c", "a/b"],
+                vec![],
+                InvalidMicrovmFilesystemConfig::NonCanonicalPolicyPaths(Allowed),
+            ),
+            (
+                ReadWrite,
+                vec![],
+                vec![],
+                vec!["out", "out"],
+                InvalidMicrovmFilesystemConfig::NonCanonicalPolicyPaths(Writable),
+            ),
+            (
+                ReadWrite,
+                vec!["a"],
+                vec!["a/../b"],
+                vec![],
+                InvalidMicrovmFilesystemConfig::InvalidPolicyPath(Allowed, "a/../b".to_owned()),
+            ),
+            (
+                ReadWrite,
+                vec![],
+                vec![],
+                vec!["/out"],
+                InvalidMicrovmFilesystemConfig::InvalidPolicyPath(Writable, "/out".to_owned()),
+            ),
+            (
+                ReadWrite,
+                vec!["a"],
+                vec!["b"],
+                vec![],
+                InvalidMicrovmFilesystemConfig::MisplacedAllowedPath("b".to_owned()),
+            ),
+            (
+                ReadWrite,
+                vec!["a"],
+                vec!["a"],
+                vec![],
+                InvalidMicrovmFilesystemConfig::MisplacedAllowedPath("a".to_owned()),
+            ),
+            (
+                ReadWrite,
+                vec!["a"],
+                vec!["a/b", "a/b/c"],
+                vec![],
+                InvalidMicrovmFilesystemConfig::MisplacedAllowedPath("a/b/c".to_owned()),
+            ),
+            (
+                ReadOnly,
+                vec![],
+                vec![],
+                vec!["out"],
+                InvalidMicrovmFilesystemConfig::ReadOnlyWritablePaths,
+            ),
+            (
+                ReadWrite,
+                vec![],
+                vec![],
+                vec!["out", "out/cache"],
+                InvalidMicrovmFilesystemConfig::OverlappingWritablePaths,
+            ),
+            (
+                ReadWrite,
+                vec!["a"],
+                vec!["a/b/c"],
+                vec!["a/b"],
+                InvalidMicrovmFilesystemConfig::HiddenWritablePath("a/b".to_owned()),
+            ),
+        ] {
+            assert_eq!(policy(access, &denied, &allowed, &writable), Err(expected));
+        }
+        assert_eq!(
+            policy(ReadWrite, &[], &[], &vec!["out"; 129]),
+            Err(InvalidMicrovmFilesystemConfig::TooManyPolicyPaths(Writable))
+        );
+    }
+
+    #[test]
+    fn microvm_filesystem_root_is_denied_only_with_allowed_paths() {
+        use MicrovmFilesystemAccess::ReadWrite;
+
+        fn owned(paths: &[&str]) -> Vec<String> {
+            paths.iter().map(|path| (*path).to_owned()).collect()
+        }
+        let config = filesystem("/workspace", ReadWrite)
+            .with_access_policy(
+                owned(&["", "tools/bin/secret"]),
+                owned(&["config.json", "tools/bin"]),
+                owned(&["config.json"]),
+            )
+            .unwrap();
+        assert_eq!(config.denied_paths, ["", "tools/bin/secret"]);
+        let child = child("0", ReadWrite)
+            .with_access_policy(owned(&[""]), owned(&["file"]), Vec::new())
+            .unwrap();
+        assert_eq!(child.denied_paths, [""]);
+
+        for (denied, allowed, writable, expected) in [
+            (
+                vec![""],
+                vec![],
+                vec![],
+                InvalidMicrovmFilesystemConfig::HiddenRootWithoutAllowedPaths,
+            ),
+            (
+                vec!["", "secret"],
+                vec!["file"],
+                vec![],
+                InvalidMicrovmFilesystemConfig::OverlappingDeniedPaths,
+            ),
+            (
+                vec![""],
+                vec!["file"],
+                vec!["other"],
+                InvalidMicrovmFilesystemConfig::HiddenWritablePath("other".to_owned()),
+            ),
+            (
+                vec![],
+                vec![""],
+                vec![],
+                InvalidMicrovmFilesystemConfig::InvalidPolicyPath(
+                    MicrovmFilesystemPathKind::Allowed,
+                    String::new(),
+                ),
+            ),
+            (
+                vec![],
+                vec![],
+                vec![""],
+                InvalidMicrovmFilesystemConfig::InvalidPolicyPath(
+                    MicrovmFilesystemPathKind::Writable,
+                    String::new(),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                filesystem("/workspace", ReadWrite).with_access_policy(
+                    owned(&denied),
+                    owned(&allowed),
+                    owned(&writable),
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn microvm_filesystem_policy_names_may_contain_spaces() {
+        use MicrovmFilesystemAccess::ReadWrite;
+        use MicrovmFilesystemPathKind::Denied;
+
+        fn owned(paths: &[&str]) -> Vec<String> {
+            paths.iter().map(|path| (*path).to_owned()).collect()
+        }
+        let config = filesystem("/workspace", ReadWrite)
+            .with_access_policy(
+                owned(&["Program Files"]),
+                owned(&["Program Files/My Tool"]),
+                owned(&["Program Files/My Tool/out dir"]),
+            )
+            .unwrap();
+        assert_eq!(config.allowed_paths, ["Program Files/My Tool"]);
+        for path in [
+            " leading",
+            "trailing ",
+            "name/ leading",
+            "name /x",
+            "tab\tname",
+            "line\nbreak",
+            "no\u{a0}break",
+        ] {
+            assert_eq!(
+                validate_microvm_filesystem_policy_paths(Denied, &[path.to_owned()]),
+                Err(InvalidMicrovmFilesystemConfig::InvalidPolicyPath(
+                    Denied,
+                    path.to_owned()
+                )),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn microvm_discovery_bootstraps_one_filesystem() {
         let network: MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
-        let filesystems = [
-            filesystem("/workspace", MicrovmFilesystemAccess::ReadWrite),
-            filesystem("/opt/hostedtoolcache", MicrovmFilesystemAccess::ReadOnly),
-        ];
+        let aggregate = MicrovmFilesystemConfig::new_aggregate(
+            "/run/nvx/shares".to_owned(),
+            vec![
+                child("0", MicrovmFilesystemAccess::ReadWrite),
+                child("1", MicrovmFilesystemAccess::ReadOnly),
+            ],
+        )
+        .unwrap();
         let mut cmdline = MICROVM_CONSOLE_COMMAND_LINE.to_owned();
         append_microvm_virtio_discovery(
             &mut cmdline,
-            Some((&network, MICROVM_VIRTIO_NET_KVM_IRQ, false)),
+            Some((&network, MICROVM_VIRTIO_NET_KVM_IRQ, None, None)),
             true,
-            &filesystems,
+            std::slice::from_ref(&aggregate),
             true,
             true,
             &[],
@@ -1937,14 +3158,17 @@ mod tests {
                  virtio_mmio.device=0x1000@0xd0002000:7 \
                  virtio_mmio.device=0x1000@0xd0007000:3 \
                  {MICROVM_CONTROL_TTY_COMMAND_LINE} \
-                 virtio_mmio.device=0x1000@0xd0008000:13 \
                  virtnet_ip=10.0.0.2 virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1 \
-                 virtfs_dir=/workspace virtfs_tag=microvm virtfs_mode=rw \
-                 virtfs_dir=/opt/hostedtoolcache virtfs_tag=microvm1 virtfs_mode=ro"
+                 virtnet_ip6=fd00::a00:2/120 virtnet_gw6=fd00::a00:1 \
+                 virtfs_dir=/run/nvx/shares virtfs_tag=microvm virtfs_mode=rw virtfs_aggregate=1"
             )
         );
 
-        // One filesystem keeps the single-slot command line.
+        // A single directory has no aggregate marker.
+        let filesystems = [
+            filesystem("/workspace", MicrovmFilesystemAccess::ReadWrite),
+            filesystem("/opt/hostedtoolcache", MicrovmFilesystemAccess::ReadOnly),
+        ];
         let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
         append_microvm_virtio_discovery(
             &mut cmdline,
@@ -1964,104 +3188,149 @@ mod tests {
             )
         );
 
-        let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
+        for filesystem_slot in [false, true] {
+            let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
+            assert!(
+                append_microvm_virtio_discovery(
+                    &mut cmdline,
+                    None,
+                    filesystem_slot,
+                    &filesystems,
+                    false,
+                    false,
+                    &[]
+                )
+                .is_err()
+            );
+        }
+        assert!(build_microvm_command_line(&["virtfs_aggregate=1".to_owned()], false).is_err());
+    }
+
+    #[test]
+    fn microvm_sandbox_block_validation_rejects_invalid_layouts() {
         assert!(
-            append_microvm_virtio_discovery(
-                &mut cmdline,
-                None,
-                false,
-                &filesystems,
-                false,
-                false,
-                &[]
+            validate_microvm_sandbox_blocks(
+                &[MicrovmSandboxBlockConfig {
+                    role: MicrovmSandboxBlockRole::Scratch,
+                    read_only: true,
+                }],
+                false
             )
             .is_err()
         );
-        let overlapping = [
-            filesystem("/workspace", MicrovmFilesystemAccess::ReadWrite),
-            filesystem("/workspace/cache", MicrovmFilesystemAccess::ReadOnly),
-        ];
-        let mut cmdline = MICROVM_BASE_COMMAND_LINE.to_owned();
         assert!(
-            append_microvm_virtio_discovery(
-                &mut cmdline,
-                None,
-                true,
-                &overlapping,
-                false,
-                false,
-                &[]
+            validate_microvm_sandbox_blocks(
+                &[
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Runtime,
+                        read_only: true,
+                    },
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Distro,
+                        read_only: true,
+                    },
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Scratch,
+                        read_only: false,
+                    },
+                ],
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_microvm_sandbox_blocks(
+                &[
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Distro,
+                        read_only: true,
+                    },
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Distro,
+                        read_only: true,
+                    },
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Scratch,
+                        read_only: false,
+                    },
+                ],
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_microvm_sandbox_blocks(
+                &[
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Distro,
+                        read_only: true,
+                    },
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Runtime,
+                        read_only: true,
+                    },
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Custom,
+                        read_only: true,
+                    },
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Scratch,
+                        read_only: false,
+                    },
+                    MicrovmSandboxBlockConfig {
+                        role: MicrovmSandboxBlockRole::Scratch,
+                        read_only: false,
+                    },
+                ],
+                false
             )
             .is_err()
         );
     }
 
     #[test]
-    fn microvm_sandbox_block_validation_rejects_invalid_layouts() {
+    fn ramfs_overlay_allows_only_a_read_only_distro_without_scratch() {
+        let distro = MicrovmSandboxBlockConfig {
+            role: MicrovmSandboxBlockRole::Distro,
+            read_only: true,
+        };
+        let scratch = MicrovmSandboxBlockConfig {
+            role: MicrovmSandboxBlockRole::Scratch,
+            read_only: false,
+        };
+        assert!(!ramfs_overlay_requested("quiet").unwrap());
+        assert!(ramfs_overlay_requested("quiet nvx_overlay_upper=ramfs").unwrap());
+        assert!(ramfs_overlay_requested("nvx_overlay_upper=disk").is_err());
+        assert!(ramfs_overlay_requested("nvx_overlay_upper=").is_err());
+        assert!(ramfs_overlay_requested("quiet nvx_overlay_upper").is_err());
         assert!(
-            validate_microvm_sandbox_blocks(&[MicrovmSandboxBlockConfig {
-                role: MicrovmSandboxBlockRole::Scratch,
-                read_only: true,
-            }])
-            .is_err()
+            ramfs_overlay_requested("nvx_overlay_upper=ramfs nvx_overlay_upper=ramfs").is_err()
         );
+        assert!(ramfs_overlay_requested("nvx_overlay_upper=ramfs nvx_overlay_upper").is_err());
+        assert!(ramfs_overlay_requested("nvx_overlay_upper nvx_overlay_upper=ramfs").is_err());
+        assert!(validate_microvm_sandbox_blocks(&[distro], false).is_err());
+        validate_microvm_sandbox_blocks(&[distro], true).unwrap();
+        assert!(validate_microvm_sandbox_blocks(&[], true).is_err());
+        assert!(validate_microvm_sandbox_blocks(&[scratch], true).is_err());
+        assert!(validate_microvm_sandbox_blocks(&[distro, scratch], true).is_err());
+
+        let mut cmdline = format!("{MICROVM_BASE_COMMAND_LINE} nvx_overlay_upper=ramfs");
+        append_microvm_virtio_discovery(&mut cmdline, None, false, &[], false, false, &[distro])
+            .unwrap();
+        assert!(cmdline.contains("virtio_mmio.device=0x1000@0xd0003000:4"));
+        assert!(!cmdline.contains("virtio_mmio.device=0x1000@0xd0006000:11"));
+
+        let mut cmdline = format!("{MICROVM_BASE_COMMAND_LINE} nvx_overlay_upper");
         assert!(
-            validate_microvm_sandbox_blocks(&[
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Runtime,
-                    read_only: true,
-                },
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Distro,
-                    read_only: true,
-                },
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Scratch,
-                    read_only: false,
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            validate_microvm_sandbox_blocks(&[
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Distro,
-                    read_only: true,
-                },
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Distro,
-                    read_only: true,
-                },
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Scratch,
-                    read_only: false,
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            validate_microvm_sandbox_blocks(&[
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Distro,
-                    read_only: true,
-                },
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Runtime,
-                    read_only: true,
-                },
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Custom,
-                    read_only: true,
-                },
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Scratch,
-                    read_only: false,
-                },
-                MicrovmSandboxBlockConfig {
-                    role: MicrovmSandboxBlockRole::Scratch,
-                    read_only: false,
-                },
-            ])
+            append_microvm_virtio_discovery(
+                &mut cmdline,
+                None,
+                false,
+                &[],
+                false,
+                false,
+                &[distro, scratch]
+            )
             .is_err()
         );
     }

@@ -17,6 +17,7 @@ chipset_resources.workspace = true
 chipset_device_worker_defs.workspace = true
 cpu_profile.workspace = true
 crypto.workspace = true
+cxl.workspace = true
 cxl_spec.workspace = true
 debug_worker_defs.workspace = true
 vmotherboard.workspace = true
@@ -104,8 +105,10 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 unicycle.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 net_tap.workspace = true
 
 [target.'cfg(windows)'.dependencies]

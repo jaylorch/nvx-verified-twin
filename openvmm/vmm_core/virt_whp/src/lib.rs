@@ -19,6 +19,8 @@ mod fingerprint;
 mod hypercalls;
 mod memory;
 #[cfg(guest_arch = "x86_64")]
+mod native_cpuid;
+#[cfg(guest_arch = "x86_64")]
 mod profile_features;
 mod regs;
 mod synic;
@@ -157,6 +159,7 @@ struct WhpPartitionInner {
 struct VtlPartition {
     #[inspect(skip)]
     whp: whp::Partition,
+    time_frozen: Mutex<bool>,
     #[inspect(skip)]
     vplcs: Vec<Vplc>,
     #[inspect(with = "|x| inspect::adhoc(|req| inspect::iter_by_index(&*x.read()).inspect(req))")]
@@ -174,6 +177,11 @@ struct VtlPartition {
     lapic: LocalApicKind,
 
     hypervisor_enlightened: bool,
+
+    /// Set when WHP answers CPUID leaves 0 and 1 without exits.
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(with = "Option::is_some")]
+    native_cpuid_leaves: Option<native_cpuid::NativeCpuidLeaves>,
 
     /// The NVX time ABI state this partition was configured with, until the
     /// partition build moves it to [`WhpPartitionInner`].
@@ -581,6 +589,20 @@ impl virt::ResetPartition for WhpPartition {
     }
 }
 
+impl virt::PartitionTimeControl for WhpPartition {
+    fn freeze_time(&self) {
+        for (_, vtlp) in self.inner.vtlps() {
+            vtlp.set_time_frozen(true);
+        }
+    }
+
+    fn thaw_time(&self) {
+        for (_, vtlp) in self.inner.vtlps() {
+            vtlp.set_time_frozen(false);
+        }
+    }
+}
+
 impl virt::ScrubVtl for WhpPartition {
     type Error = Error;
 
@@ -591,6 +613,7 @@ impl virt::ScrubVtl for WhpPartition {
         tracing::info!(?vtl, "scrubbing partition");
 
         let vtl2 = self.inner.vtl2.as_ref().ok_or(Error::NoVtl2)?;
+        vtl2.set_time_frozen(true);
 
         // Preserve VTL2 reference time across the scrub to match hypervisor
         // behavior and so that the guest can determine how much time was lost.
@@ -601,7 +624,7 @@ impl virt::ScrubVtl for WhpPartition {
 
         // NOTE: Mapping state (and therefore VTL protections) is _not_ reset
         // across scrub. Thus only reset WHP state, but not VtlPartition state.
-        vtl2.whp.reset().for_op("reset partition")?;
+        vtl2.reset_whp()?;
         self.inner.vtl2_emulation.as_ref().unwrap().reset(false);
         self.validate_is_reset(Vtl::Vtl2);
 
@@ -651,6 +674,10 @@ impl virt::Partition for WhpPartition {
         } else {
             None
         }
+    }
+
+    fn supports_time_control(&self) -> Option<&dyn virt::PartitionTimeControl> {
+        Some(self)
     }
 
     fn supports_vtl_scrub(
@@ -788,6 +815,17 @@ impl virt::BindProcessor for WhpProcessorBinder {
                 }
             }
 
+            // WHP answers CPUID leaf 1, with this VP's initial APIC ID, without
+            // an exit.
+            #[cfg(guest_arch = "x86_64")]
+            if let Some(native_cpuid_leaves) = &vtlp.native_cpuid_leaves {
+                native_cpuid_leaves.verify_apic_id(
+                    vp.vp.whp(vtl),
+                    vp_info.base.vp_index.index(),
+                    vp_info.apic_id,
+                )?;
+            }
+
             #[cfg(guest_arch = "aarch64")]
             {
                 let _ = vtlp;
@@ -881,6 +919,27 @@ pub enum Error {
     #[cfg(guest_arch = "x86_64")]
     #[error(transparent)]
     TimeAbi(#[from] virt::time_abi::TimeAbiError),
+    #[cfg(guest_arch = "x86_64")]
+    #[error("CPUID leaf {0:#x} has a programmed result but does not exit")]
+    NativeCpuidUnrouted(u32),
+    #[cfg(guest_arch = "x86_64")]
+    #[error(
+        "WHP answers CPUID leaf {function:#x} with {native:08x?} without an exit, but the partition's result is {expected:08x?}"
+    )]
+    NativeCpuidMismatch {
+        function: u32,
+        native: [u32; 4],
+        expected: [u32; 4],
+    },
+    #[cfg(guest_arch = "x86_64")]
+    #[error(
+        "WHP reports initial APIC ID {native:#x} in CPUID leaf 1 of VP {vp_index}, but its APIC ID is {apic_id:#x}"
+    )]
+    NativeCpuidApicId {
+        vp_index: u32,
+        native: u32,
+        apic_id: u32,
+    },
 }
 
 trait WhpResultExt<T> {
@@ -1174,7 +1233,7 @@ impl WhpPartitionInner {
         // FUTURE: register cpuid results with the hypervisor, and register
         // appropriate per-VP results where necessary (or tell the hypervisor
         // the AMD topology information so that it can provide per-VP results
-        // accurately).
+        // accurately). `native_cpuid` does so for leaves 0 and 1.
         #[cfg(guest_arch = "x86_64")]
         let cpuid = {
             use vm_topology::processor::x86::ApicMode;
@@ -1183,15 +1242,9 @@ impl WhpPartitionInner {
             // Report x2apic support. When the APIC is in the hypervisor, the
             // hypervisor will do this automatically, but it doesn't hurt to do this
             // again.
-            let mask = [0, 0, 1 << 21, 0];
-            let (value, use_apic_msrs) = match proto_config.processor_topology.apic_mode() {
-                ApicMode::XApic => ([0; 4], true),
-                ApicMode::X2ApicSupported | ApicMode::X2ApicEnabled => (mask, false),
-            };
-            cpuid.push(
-                virt::CpuidLeaf::new(x86defs::cpuid::CpuidFunction::VersionAndFeatures.0, value)
-                    .masked(mask),
-            );
+            let apic_mode = proto_config.processor_topology.apic_mode();
+            let use_apic_msrs = matches!(apic_mode, ApicMode::XApic);
+            cpuid.push(native_cpuid::x2apic_leaf(apic_mode));
 
             // Add in the synthetic hv leaves if necessary.
             if proto_config.hv_config.is_some() {
@@ -1261,6 +1314,11 @@ impl WhpPartitionInner {
                 }
             }
         };
+
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(native_cpuid_leaves) = &vtl0.native_cpuid_leaves {
+            native_cpuid_leaves.verify(&cpuid, |eax, ecx| vtl0.cpuid(eax, ecx))?;
+        }
 
         let mut vtl0_alias_map_offset = None;
         let vtl2_emulation = if let Some(vtl2_config) = proto_config
@@ -1340,6 +1398,7 @@ impl WhpPartitionInner {
             };
             let mut caps = caps.map_err(Error::Capabilities)?;
             caps.can_freeze_time = true;
+            caps.tsc_deadline &= matches!(vtl0.lapic, LocalApicKind::Offloaded);
             caps.xsaves_state_bv_broken = true;
             caps.dr6_tsx_broken = true;
             caps.nested_virt = nested_virt;
@@ -1381,6 +1440,10 @@ impl WhpPartitionInner {
             if vtl0.hypervisor_enlightened {
                 Hv1State::Offloaded
             } else {
+                // x86_64 already queried the TSC frequency for its CPUID
+                // leaves.
+                #[cfg(guest_arch = "aarch64")]
+                let tsc_frequency = vtl0.whp.tsc_frequency().for_op("get tsc frequency")?;
                 let ref_time = ReferenceTimeSource::new(VmTimeReferenceTimeSource::new(
                     proto_config.vmtime.clone(),
                 ));
@@ -1536,6 +1599,8 @@ impl VtlPartition {
         }
 
         let mut hypervisor_enlightened = false;
+        #[cfg(guest_arch = "x86_64")]
+        let mut native_cpuid_leaves = None;
 
         let mut extended_exits = whp::abi::WHV_EXTENDED_VM_EXITS(0);
 
@@ -1789,6 +1854,23 @@ impl VtlPartition {
                         synth_features,
                     ))
                     .for_op("set synthetic processor features")?;
+
+                // Keep CPUID leaves 0 and 1, which guest interrupt handlers
+                // can run, in the hypervisor (see `native_cpuid`). Other VTL
+                // and isolation configurations route more leaves through the
+                // exit handler.
+                #[cfg(guest_arch = "x86_64")]
+                if vtl == Vtl::Vtl0
+                    && hv_config.vtl2.is_none()
+                    && !nested_virt
+                    && !config.isolation.is_isolated()
+                    && time_abi.is_none()
+                {
+                    native_cpuid_leaves = native_cpuid::NativeCpuidLeaves::configure(
+                        config.processor_topology,
+                        &mut whp_config,
+                    );
+                }
             } else {
                 with_overlays = hv_config.vtl2.is_none();
             }
@@ -1805,6 +1887,7 @@ impl VtlPartition {
             .for_op("set extended vm exits")?;
 
         let whp = whp_config.create().for_op("set up partition")?;
+        whp.suspend_time().for_op("suspend partition time")?;
 
         for vp in config.processor_topology.vps() {
             let index = vp.vp_index.index();
@@ -1872,6 +1955,7 @@ impl VtlPartition {
 
         Ok(Self {
             whp,
+            time_frozen: Mutex::new(true),
             vplcs,
             #[cfg(guest_arch = "x86_64")]
             software_devices: virt::x86::apic_software_device::ApicSoftwareDevices::new(
@@ -1882,15 +1966,43 @@ impl VtlPartition {
             lapic,
             hypervisor_enlightened,
             #[cfg(guest_arch = "x86_64")]
+            native_cpuid_leaves,
+            #[cfg(guest_arch = "x86_64")]
             time_abi,
         })
     }
 
     /// Reset this partition back into the state before starting VPs.
     fn reset(&self) -> Result<(), Error> {
-        self.whp.reset().for_op("reset partition")?;
+        self.reset_whp()?;
         self.reset_mappings().map_err(Error::ResetMemoryMapping)?;
         Ok(())
+    }
+
+    fn reset_whp(&self) -> Result<(), Error> {
+        let mut time_frozen = self.time_frozen.lock();
+        self.whp.reset().for_op("reset partition")?;
+        // WHP reset freezes time until an explicit resume or the first VP run.
+        *time_frozen = true;
+        Ok(())
+    }
+
+    fn set_time_frozen(&self, frozen: bool) {
+        let mut time_frozen = self.time_frozen.lock();
+        if *time_frozen != frozen {
+            if frozen {
+                self.whp
+                    .suspend_time()
+                    .for_op("suspend partition time")
+                    .expect("failed to freeze WHP partition time");
+            } else {
+                self.whp
+                    .resume_time()
+                    .for_op("resume partition time")
+                    .expect("failed to thaw WHP partition time");
+            }
+            *time_frozen = frozen;
+        }
     }
 }
 

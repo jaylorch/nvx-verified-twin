@@ -203,7 +203,7 @@ mod x86 {
         }
 
         fn set_tsc_deadline(&mut self, value: &vp::TscDeadline) -> Result<(), Self::Error> {
-            self.run.vp.set_register_state(self.vtl, value)
+            self.write_tsc_deadline(value)
         }
 
         fn cet(&mut self) -> Result<vp::Cet, Self::Error> {

@@ -42,6 +42,47 @@ before their implementation is connected end to end.
 * RemoveVpciDevice
 * Quit
 
+## Virtio-console file output
+
+`VmService` can write a virtio-console stream directly to a host file. Set the
+console's `SerialBackend` to `SerialFile`:
+
+```text
+pcie {
+  root_complexes {
+    name: "rc0"
+    root_ports {
+      name: "console"
+      attached { device { virtio { console {
+        backend { file {
+          path: "path/to/console.log"
+          append: false
+        } }
+      } } } }
+    }
+  }
+}
+```
+
+The file is opened while `CreateVM` processes the device configuration, so an
+invalid path or permission failure causes `CreateVM` to fail. With `append`
+unset or `false`, OpenVMM creates or truncates the file. With `append: true`,
+OpenVMM preserves existing contents and appends new guest output.
+
+The backend remains open for the console lifetime. OpenVMM does not rotate or
+limit the file, so the management client owns retention. `SerialRelay` remains
+available when the client needs an interactive or externally managed stream.
+The backend writes synchronously to the file, without an intermediate socket,
+named pipe, or background copy task. Successful writes complete before returning
+to the serial device, so there is no background output to drain during teardown.
+A slow or stalled file write can block the calling device thread. After
+`TeardownVM` or `Quit` completes, the management client can read the completed
+output. Writes do not force a disk synchronization and do not guarantee that the
+output survives a host crash or power failure.
+If a write fails, OpenVMM logs the error and disconnects the file backend.
+Further console output is discarded; the backend does not automatically retry
+or reopen the file.
+
 `AddVpciDevice` dynamically exposes a PCI device to VTL0 over Hyper-V VPCI.
 The VM must have Hyper-V enlightenments and VMBus enabled, and the host
 hypervisor backend must support virtual devices. The caller supplies the
@@ -133,7 +174,8 @@ restore flow over both transports:
   `memory.bin` payload and initial Linux direct e820 map.
 * `restore_path` selects manifest-authoritative restore. `config` may be
   absent, or may contain only the matching microVM profile, an optional exact
-  processor-count assertion, serial port 0 host
+  processor-count assertion, a `cpu_profile` that the restore accepts (see
+  below), serial port 0 host
   attachment, matching `DevicesConfig.virtio_console` and
   `DevicesConfig.virtiofs_config` attachments, and guest power actions.
   Guest-visible boot, memory, processor topology, other device, NUMA, and PCIe
@@ -177,14 +219,18 @@ before vCPUs start. The device uses MMIO `0xd0002000`, IRQ 7, and selects
 `DevicesConfig.virtiofs_config` may bind one HostFs attachment to the fixed
 microVM slot. Set `tag` to `microvm`, supply `root_path`, and set
 `guest_mount_target` to an absolute Linux path. `read_write=false` selects the
-default read-only policy. Restoring an active attachment requires the exact
-same canonical root path, tag, guest target, and access mode, and the live root
-must retain its saved identity. A snapshot captured with the slot dormant may
+default read-only policy. The management API cannot set an access policy, so a
+cold-booted attachment has no denied, allowed, or writable paths. Restoring an
+active attachment requires the exact same canonical root path, tag, guest
+target, and access mode, and the live root must retain its saved identity;
+the snapshot's denied, allowed, and writable paths apply again. A snapshot
+captured with the slot dormant may
 omit the attachment or supply a new one; after `ResumeVM`, the guest explicitly
 mounts tag `microvm`. The fixed device uses MMIO `0xd0001000`, IRQ 6, one
-request queue, and no DAX window. The management API binds only the first
-microVM virtio-fs slot: the command line's second `--mount` slot is not
-exposed, and restoring a snapshot that captured two shares fails.
+request queue, and no DAX window. The management API binds only a single
+directory: it cannot attach an aggregate of several host directories, as the
+command line's `--mount-aggregate` does, and it cannot restore a snapshot of
+one.
 
 The fork retains `VirtioFs.guest_mount_target` at protobuf field 3 and
 `read_write` at field 4 for existing microVM clients. Standard-machine
@@ -212,11 +258,24 @@ currently blockless; role-bearing sandbox blocks remain CLI-only. Snapshot ABI
 and boot layout remain value 2, which identifies the Linux-direct MP-table
 layout. Value 1 snapshots are unsupported.
 
+`VMConfig.cpu_profile` selects the microVM's CPU profile as
+[`--cpu-profile`](cli.md) does, with the same values and checks: `auto`, the
+default, which an empty value also selects, for the built-in profile of the
+host CPU's generation; `host` for a development profile derived from this
+host; or a built-in profile ID. A cold boot fails as the command line's does
+for a profile that the host cannot boot, such as with
+`E_PROFILE_UNSUPPORTED` where the backend cannot present the profile that
+`auto` selected. A restore uses the snapshot's profile and accepts only
+`auto`, the snapshot's profile ID, or, for a snapshot of a host profile,
+`host`; any other value fails with `E_PROFILE_UNKNOWN`. A standard VM rejects
+a nonempty `cpu_profile`.
+
 `VMConfig.pvh_boot` and protobuf field 14 are reserved, upstream `iommufds`
 retains field 15, `crash_dump_path` uses field 16, and `machine_profile` uses
 field 17. Upstream's `disable_vmbus` and `disable_hv` use fields 20 and 21
 instead of upstream's fields 16 and 17, while the `igvm` boot configuration and
-`isolation_config` keep upstream's fields 18 and 19. Generate bindings from this
+`isolation_config` keep upstream's fields 18 and 19. The fork's `cpu_profile`
+uses field 22. Generate bindings from this
 fork for the combined schema.
 
 The API has the same KVM/MSHV/WHP backend, no-block device, artifact integrity,

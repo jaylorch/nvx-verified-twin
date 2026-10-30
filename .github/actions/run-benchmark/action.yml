@@ -37,6 +37,24 @@ inputs:
 runs:
   using: composite
   steps:
+    # The series' history comes from one host, data/<platform>-host.json.
+    # Refuse to measure it on another; the diagnostics artifact keeps this
+    # runner's host file for accepting it (doc/benchmarks.md).
+    - name: Check Linux benchmark host
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/nvx.py performance check-host \
+          --platform "${{ inputs.platform }}" \
+          --history-dir data \
+          --output "data/runs/${{ inputs.platform }}/${{ inputs.platform }}-host.json" \
+          --summary "${GITHUB_STEP_SUMMARY}"
+
+    # The runner signals only a step's shell when the job is cancelled, so the
+    # Linux steps run the test harness with run_harness, which passes SIGINT
+    # and SIGTERM on to it as SIGTERM, or exec it, so that it can stop OpenVMM
+    # and remove its scratch directories (doc/ci.md#cancellation).
     - name: Run Linux acceptance test
       if: runner.os != 'Windows'
       shell: bash
@@ -46,16 +64,19 @@ runs:
         NVX_BENCHMARK_MARKER_TIMEOUT: ${{ inputs.marker-timeout }}
       run: |
         set -euo pipefail
+        source "${GITHUB_ACTION_PATH}/forward-signals.sh"
         cpu_args=(--host-cpu-reserve "${NVX_BENCHMARK_HOST_CPU_RESERVE}")
         if [[ -n "${NVX_BENCHMARK_CPUS}" ]]; then
           cpu_args+=(--cpus "${NVX_BENCHMARK_CPUS}")
         fi
         run_dir="data/runs/${{ inputs.platform }}/microvm-v2/1vcpu"
         acceptance_output="${run_dir}/acceptance.json"
-        rm -f "${acceptance_output}"
+        attempt_log="${run_dir}/acceptance-attempts.json"
+        rm -f "${acceptance_output}" "${attempt_log}" \
+          "${run_dir}"/acceptance-attempt-*.json
         for attempt in 1 2; do
           attempt_output="${run_dir}/acceptance-attempt-${attempt}.json"
-          python3 scripts/nvx.py benchmark \
+          run_harness python3 scripts/nvx.py benchmark \
             --suite e2e \
             --backend "${{ inputs.backend }}" \
             --platform "${{ inputs.platform }}" \
@@ -71,7 +92,8 @@ runs:
           validation_status=0
           python3 scripts/nvx.py performance validate-openvmm \
             --platform "${{ inputs.platform }}" \
-            --input "${attempt_output}" || validation_status=$?
+            --input "${attempt_output}" \
+            --attempt-log "${attempt_log}" || validation_status=$?
           if [[ "${validation_status}" -eq 0 ]]; then
             cp "${attempt_output}" "${acceptance_output}"
             break
@@ -91,24 +113,43 @@ runs:
         NVX_BENCHMARK_MARKER_TIMEOUT: ${{ inputs.marker-timeout }}
       run: |
         set -euo pipefail
+        source "${GITHUB_ACTION_PATH}/forward-signals.sh"
         cpu_args=(--host-cpu-reserve "${NVX_BENCHMARK_HOST_CPU_RESERVE}")
         if [[ -n "${NVX_BENCHMARK_CPUS}" ]]; then
           cpu_args+=(--cpus "${NVX_BENCHMARK_CPUS}")
         fi
         run_dir="data/runs/${{ inputs.platform }}/microvm-v2/1vcpu"
-        python3 scripts/nvx.py benchmark \
-          --suite performance \
-          --backend "${{ inputs.backend }}" \
-          --platform "${{ inputs.platform }}" \
-          --processors 1 \
-          "${cpu_args[@]}" \
-          --warmups "${{ inputs.warmups }}" \
-          --runs "${{ inputs.runs }}" \
-          --virtfs-runs "${{ inputs.runs }}" \
-          --timeout "${NVX_BENCHMARK_MARKER_TIMEOUT}" \
-          --skip-build \
-          --teardown-mode "${{ inputs.teardown-mode }}" \
-          --output-dir "${run_dir}"
+        # Each attempt keeps its logs in its own directory; only a validated
+        # attempt is copied to run_dir for collection.
+        rm -rf "${run_dir}"/performance-attempt-*
+        for attempt in 1 2; do
+          attempt_dir="${run_dir}/performance-attempt-${attempt}"
+          run_harness python3 scripts/nvx.py benchmark \
+            --suite performance \
+            --backend "${{ inputs.backend }}" \
+            --platform "${{ inputs.platform }}" \
+            --processors 1 \
+            "${cpu_args[@]}" \
+            --warmups "${{ inputs.warmups }}" \
+            --runs "${{ inputs.runs }}" \
+            --virtfs-runs "${{ inputs.runs }}" \
+            --timeout "${NVX_BENCHMARK_MARKER_TIMEOUT}" \
+            --skip-build \
+            --teardown-mode "${{ inputs.teardown-mode }}" \
+            --output-dir "${attempt_dir}"
+          validation_status=0
+          python3 scripts/nvx.py performance validate-workload \
+            --platform "${{ inputs.platform }}" \
+            --input-dir "${attempt_dir}" || validation_status=$?
+          if [[ "${validation_status}" -eq 0 ]]; then
+            cp -p "${attempt_dir}"/* "${run_dir}/"
+            break
+          fi
+          if [[ "${validation_status}" -ne 75 || "${attempt}" -eq 2 ]]; then
+            exit "${validation_status}"
+          fi
+          echo "::warning::Shell-snapshot restore was unstable on attempt ${attempt}; remeasuring once"
+        done
 
     - name: Run Linux multi-vCPU shell restore
       if: runner.os != 'Windows'
@@ -119,25 +160,44 @@ runs:
         NVX_BENCHMARK_MARKER_TIMEOUT: ${{ inputs.marker-timeout }}
       run: |
         set -euo pipefail
+        source "${GITHUB_ACTION_PATH}/forward-signals.sh"
         cpu_args=(--host-cpu-reserve "${NVX_BENCHMARK_HOST_CPU_RESERVE}")
         if [[ -n "${NVX_BENCHMARK_CPUS}" ]]; then
           cpu_args+=(--cpus "${NVX_BENCHMARK_CPUS}")
         fi
         for processors in 2 4 8; do
           run_dir="data/runs/${{ inputs.platform }}/microvm-v2/${processors}vcpu"
-          python3 scripts/nvx.py benchmark \
-            --suite shell-snapshot-restore \
-            --backend "${{ inputs.backend }}" \
-            --platform "${{ inputs.platform }}" \
-            --processors "${processors}" \
-            "${cpu_args[@]}" \
-            --warmups "${{ inputs.warmups }}" \
-            --runs "${{ inputs.runs }}" \
-            --shell-memories 512 \
-            --timeout "${NVX_BENCHMARK_MARKER_TIMEOUT}" \
-            --skip-build \
-            --teardown-mode "${{ inputs.teardown-mode }}" \
-            --output-dir "${run_dir}"
+          # Each attempt keeps its logs in its own directory; only a validated
+          # attempt is copied to run_dir for collection.
+          rm -rf "${run_dir}"/shell-snapshot-restore-attempt-*
+          for attempt in 1 2; do
+            attempt_dir="${run_dir}/shell-snapshot-restore-attempt-${attempt}"
+            run_harness python3 scripts/nvx.py benchmark \
+              --suite shell-snapshot-restore \
+              --backend "${{ inputs.backend }}" \
+              --platform "${{ inputs.platform }}" \
+              --processors "${processors}" \
+              "${cpu_args[@]}" \
+              --warmups "${{ inputs.warmups }}" \
+              --runs "${{ inputs.runs }}" \
+              --shell-memories 512 \
+              --timeout "${NVX_BENCHMARK_MARKER_TIMEOUT}" \
+              --skip-build \
+              --teardown-mode "${{ inputs.teardown-mode }}" \
+              --output-dir "${attempt_dir}"
+            validation_status=0
+            python3 scripts/nvx.py performance validate-workload \
+              --platform "${{ inputs.platform }}" \
+              --input-dir "${attempt_dir}" || validation_status=$?
+            if [[ "${validation_status}" -eq 0 ]]; then
+              cp -p "${attempt_dir}"/* "${run_dir}/"
+              break
+            fi
+            if [[ "${validation_status}" -ne 75 || "${attempt}" -eq 2 ]]; then
+              exit "${validation_status}"
+            fi
+            echo "::warning::Shell-snapshot restore with ${processors} vCPUs was unstable on attempt ${attempt}; remeasuring once"
+          done
         done
 
     - name: Run Linux device operation rates
@@ -154,7 +214,7 @@ runs:
           cpu_args+=(--cpus "${NVX_BENCHMARK_CPUS}")
         fi
         run_dir="data/runs/${{ inputs.platform }}/microvm-v2/1vcpu/device-io"
-        python3 scripts/nvx.py benchmark \
+        exec python3 scripts/nvx.py benchmark \
           --suite device-io \
           --backend "${{ inputs.backend }}" \
           --platform "${{ inputs.platform }}" \
@@ -201,6 +261,25 @@ runs:
           Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         Write-Output "Benchmark scratch: $Scratch"
 
+    # The scratch volume is part of the host, so the check follows its
+    # preparation.
+    - name: Check Windows benchmark host
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+        $ScratchArgs = @()
+        if ($env:NVX_BENCHMARK_SCRATCH_DIR) {
+          $ScratchArgs = @("--scratch-dir", $env:NVX_BENCHMARK_SCRATCH_DIR)
+        }
+        python scripts\nvx.py performance check-host `
+          --platform "${{ inputs.platform }}" `
+          --history-dir data `
+          --output "data/runs/${{ inputs.platform }}/${{ inputs.platform }}-host.json" `
+          --summary $env:GITHUB_STEP_SUMMARY `
+          @ScratchArgs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     - name: Run Windows acceptance test
       if: runner.os == 'Windows'
       shell: powershell
@@ -220,8 +299,15 @@ runs:
         }
         $RunDir = "data/runs/${{ inputs.platform }}/microvm-v2/1vcpu"
         $AcceptanceOutput = "$RunDir/acceptance.json"
-        if (Test-Path -LiteralPath $AcceptanceOutput) {
-          Remove-Item -LiteralPath $AcceptanceOutput
+        $AttemptLog = "$RunDir/acceptance-attempts.json"
+        foreach ($Stale in $AcceptanceOutput, $AttemptLog) {
+          if (Test-Path -LiteralPath $Stale) {
+            Remove-Item -LiteralPath $Stale
+          }
+        }
+        if (Test-Path -LiteralPath $RunDir) {
+          Get-ChildItem -LiteralPath $RunDir -Filter "acceptance-attempt-*.json" |
+            Remove-Item
         }
         foreach ($Attempt in 1, 2) {
           $AttemptOutput = "$RunDir/acceptance-attempt-$Attempt.json"
@@ -242,7 +328,8 @@ runs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts\nvx.py performance validate-openvmm `
             --platform "${{ inputs.platform }}" `
-            --input $AttemptOutput
+            --input $AttemptOutput `
+            --attempt-log $AttemptLog
           $ValidationStatus = $LASTEXITCODE
           if ($ValidationStatus -eq 0) {
             Copy-Item -LiteralPath $AttemptOutput -Destination $AcceptanceOutput
@@ -272,21 +359,43 @@ runs:
           $ScratchArgs = @("--scratch-dir", $env:NVX_BENCHMARK_SCRATCH_DIR)
         }
         $RunDir = "data/runs/${{ inputs.platform }}/microvm-v2/1vcpu"
-        python scripts\nvx.py benchmark `
-          --suite performance `
-          --backend "${{ inputs.backend }}" `
-          --platform "${{ inputs.platform }}" `
-          --processors 1 `
-          --warmups "${{ inputs.warmups }}" `
-          --runs "${{ inputs.runs }}" `
-          --virtfs-runs "${{ inputs.runs }}" `
-          --timeout $env:NVX_BENCHMARK_MARKER_TIMEOUT `
-          --skip-build `
-          --teardown-mode "${{ inputs.teardown-mode }}" `
-          --output-dir "$RunDir" `
-          @CpuArgs `
-          @ScratchArgs
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # Each attempt keeps its logs in its own directory; only a validated
+        # attempt is copied to $RunDir for collection.
+        if (Test-Path -LiteralPath $RunDir) {
+          Get-ChildItem -LiteralPath $RunDir -Directory -Filter "performance-attempt-*" |
+            Remove-Item -Recurse -Force
+        }
+        foreach ($Attempt in 1, 2) {
+          $AttemptDir = "$RunDir/performance-attempt-$Attempt"
+          python scripts\nvx.py benchmark `
+            --suite performance `
+            --backend "${{ inputs.backend }}" `
+            --platform "${{ inputs.platform }}" `
+            --processors 1 `
+            --warmups "${{ inputs.warmups }}" `
+            --runs "${{ inputs.runs }}" `
+            --virtfs-runs "${{ inputs.runs }}" `
+            --timeout $env:NVX_BENCHMARK_MARKER_TIMEOUT `
+            --skip-build `
+            --teardown-mode "${{ inputs.teardown-mode }}" `
+            --output-dir "$AttemptDir" `
+            @CpuArgs `
+            @ScratchArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts\nvx.py performance validate-workload `
+            --platform "${{ inputs.platform }}" `
+            --input-dir "$AttemptDir"
+          $ValidationStatus = $LASTEXITCODE
+          if ($ValidationStatus -eq 0) {
+            Get-ChildItem -LiteralPath $AttemptDir -File |
+              Copy-Item -Destination $RunDir
+            break
+          }
+          if ($ValidationStatus -ne 75 -or $Attempt -eq 2) {
+            exit $ValidationStatus
+          }
+          Write-Output "::warning::Shell-snapshot restore was unstable on attempt $Attempt; remeasuring once"
+        }
 
     - name: Run Windows multi-vCPU shell restore
       if: runner.os == 'Windows'
@@ -307,21 +416,43 @@ runs:
         }
         foreach ($Processors in 2, 4, 8) {
           $RunDir = "data/runs/${{ inputs.platform }}/microvm-v2/${Processors}vcpu"
-          python scripts\nvx.py benchmark `
-            --suite shell-snapshot-restore `
-            --backend "${{ inputs.backend }}" `
-            --platform "${{ inputs.platform }}" `
-            --processors $Processors `
-            --warmups "${{ inputs.warmups }}" `
-            --runs "${{ inputs.runs }}" `
-            --shell-memories 512 `
-            --timeout $env:NVX_BENCHMARK_MARKER_TIMEOUT `
-            --skip-build `
-            --teardown-mode "${{ inputs.teardown-mode }}" `
-            --output-dir "$RunDir" `
-            @CpuArgs `
-            @ScratchArgs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Each attempt keeps its logs in its own directory; only a validated
+          # attempt is copied to $RunDir for collection.
+          if (Test-Path -LiteralPath $RunDir) {
+            Get-ChildItem -LiteralPath $RunDir -Directory -Filter "shell-snapshot-restore-attempt-*" |
+              Remove-Item -Recurse -Force
+          }
+          foreach ($Attempt in 1, 2) {
+            $AttemptDir = "$RunDir/shell-snapshot-restore-attempt-$Attempt"
+            python scripts\nvx.py benchmark `
+              --suite shell-snapshot-restore `
+              --backend "${{ inputs.backend }}" `
+              --platform "${{ inputs.platform }}" `
+              --processors $Processors `
+              --warmups "${{ inputs.warmups }}" `
+              --runs "${{ inputs.runs }}" `
+              --shell-memories 512 `
+              --timeout $env:NVX_BENCHMARK_MARKER_TIMEOUT `
+              --skip-build `
+              --teardown-mode "${{ inputs.teardown-mode }}" `
+              --output-dir "$AttemptDir" `
+              @CpuArgs `
+              @ScratchArgs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            python scripts\nvx.py performance validate-workload `
+              --platform "${{ inputs.platform }}" `
+              --input-dir "$AttemptDir"
+            $ValidationStatus = $LASTEXITCODE
+            if ($ValidationStatus -eq 0) {
+              Get-ChildItem -LiteralPath $AttemptDir -File |
+                Copy-Item -Destination $RunDir
+              break
+            }
+            if ($ValidationStatus -ne 75 -or $Attempt -eq 2) {
+              exit $ValidationStatus
+            }
+            Write-Output "::warning::Shell-snapshot restore with $Processors vCPUs was unstable on attempt $Attempt; remeasuring once"
+          }
         }
 
     - name: Run Windows device operation rates
@@ -373,6 +504,7 @@ runs:
           --require-shell-snapshot \
           --require-shared-suite \
           --lifecycle-input "${run_dir}/acceptance.json" \
+          --lifecycle-attempt-log "${run_dir}/acceptance-attempts.json" \
           --summary "${GITHUB_STEP_SUMMARY}"
         device_run_dir="${run_dir}/device-io"
         device_results_dir="${device_run_dir}/results"
@@ -411,6 +543,7 @@ runs:
           --require-shell-snapshot `
           --require-shared-suite `
           --lifecycle-input "$RunDir/acceptance.json" `
+          --lifecycle-attempt-log "$RunDir/acceptance-attempts.json" `
           --summary $env:GITHUB_STEP_SUMMARY
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         $DeviceRunDir = "$RunDir/device-io"
@@ -482,21 +615,26 @@ runs:
           }
         }
 
-    - name: Remove Windows benchmark scratch
-      if: always() && runner.os == 'Windows'
+    # A storage stall leaves events that a reimage of the runner erases, so a
+    # failed benchmark keeps those of the job's window, which its platform job
+    # records the start of, and warns of slow I/O (doc/benchmarks.md).
+    - name: Save Windows storage events
+      if: failure() && runner.os == 'Windows'
       shell: powershell
       run: |
         $ErrorActionPreference = "Stop"
-        if ($env:NVX_BENCHMARK_SCRATCH_DIR -and
-            (Test-Path -LiteralPath $env:NVX_BENCHMARK_SCRATCH_DIR)) {
-          try {
-            Remove-Item -LiteralPath $env:NVX_BENCHMARK_SCRATCH_DIR -Recurse -Force
-          }
-          catch {
-            Write-Output "::warning::Could not remove benchmark scratch: $($_.Exception.Message)"
-          }
+        $ScratchArgs = @()
+        if ($env:NVX_BENCHMARK_SCRATCH_DIR) {
+          $ScratchArgs = @("--scratch-dir", $env:NVX_BENCHMARK_SCRATCH_DIR)
         }
+        python scripts\nvx.py performance storage-events `
+          --since $env:NVX_JOB_STARTED_AT `
+          --output-dir "data/runs/${{ inputs.platform }}/storage-events" `
+          @ScratchArgs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    # The uploads precede the scratch removal, which a stalled volume can hold
+    # up past the job's timeout, when no later step runs.
     - name: Upload benchmark diagnostics
       if: always()
       uses: actions/upload-artifact@v7
@@ -516,3 +654,18 @@ runs:
         if-no-files-found: error
         overwrite: true
         retention-days: 1
+
+    - name: Remove Windows benchmark scratch
+      if: always() && runner.os == 'Windows'
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+        if ($env:NVX_BENCHMARK_SCRATCH_DIR -and
+            (Test-Path -LiteralPath $env:NVX_BENCHMARK_SCRATCH_DIR)) {
+          try {
+            Remove-Item -LiteralPath $env:NVX_BENCHMARK_SCRATCH_DIR -Recurse -Force
+          }
+          catch {
+            Write-Output "::warning::Could not remove benchmark scratch: $($_.Exception.Message)"
+          }
+        }

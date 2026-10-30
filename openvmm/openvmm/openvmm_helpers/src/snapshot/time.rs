@@ -34,7 +34,7 @@ fn identity(bytes: &[u8], description: &str) -> Result<[u8; 16], TimeAbiError> {
         .map_err(|_| manifest_error(format!("{description} is {} bytes, not 16", bytes.len())))
 }
 
-/// Validates a time contract (restore step 2 of the specification).
+/// Validates a snapshot's time contract before a restore relies on it.
 pub fn validate_time_contract(contract: &SnapshotTimeContract) -> Result<(), TimeAbiError> {
     let SnapshotTimeContract {
         time_abi_version,
@@ -48,6 +48,7 @@ pub fn validate_time_contract(contract: &SnapshotTimeContract) -> Result<(), Tim
         host_id,
         host_boot_id,
         capture_generation,
+        vm_time_cut_to_anchor_ns: _,
     } = contract;
     if *time_abi_version != TIME_ABI_VERSION {
         return Err(manifest_error(format!(
@@ -74,6 +75,7 @@ pub fn validate_time_contract(contract: &SnapshotTimeContract) -> Result<(), Tim
     }
     identity(host_id, "host identity")?;
     identity(host_boot_id, "host boot identity")?;
+    contract.vm_time_downtime_ns(0)?;
     if *capture_generation == u32::MAX {
         return Err(TimeAbiError::new(
             TimeAbiCode::GenerationExhausted,
@@ -155,8 +157,8 @@ pub fn required_machine_contract(
         manifest_error("the microVM snapshot has no machine contract, so no time ABI records")
     })
 }
-/// The controller's view of a time ABI restore after restore steps 2 to 5 of
-/// the specification.
+/// The controller's view of a time ABI restore after its preflight,
+/// [`preflight_time_abi_restore`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeAbiRestorePreflight {
     /// The capture record.
@@ -170,10 +172,10 @@ pub struct TimeAbiRestorePreflight {
     pub cpu_profile: String,
 }
 
-/// Runs restore steps 2 to 5 of the specification on a version 6 machine
-/// contract: the time ABI records, the backend, the CPU profile and host CPU
-/// generation, and the downtime preflight against the destination host's
-/// identity and clocks.
+/// Runs the time ABI's restore preflight on a version 6 machine contract: it
+/// checks the time ABI records, the backend, the CPU profile and host CPU
+/// generation, and the downtime against the destination host's identity and
+/// clocks.
 ///
 /// The snapshot's profile must be pinned in this OpenVMM with the same
 /// digest, and the embedded document must be the pinned profile's canonical
@@ -249,6 +251,7 @@ pub fn preflight_time_abi_restore(
     }
     let capture = capture_record(time)?;
     let downtime = select_downtime(&capture, destination, now, hooks)?;
+    time.vm_time_downtime_ns(downtime.nanos)?;
     Ok(TimeAbiRestorePreflight {
         capture,
         downtime,
@@ -290,6 +293,7 @@ pub(super) mod tests {
             host_id: vec![1; 16],
             host_boot_id: vec![2; 16],
             capture_generation: 3,
+            vm_time_cut_to_anchor_ns: Some(200),
         }
     }
 
@@ -412,6 +416,23 @@ pub(super) mod tests {
                 "{contract:?}"
             );
         }
+    }
+
+    #[test]
+    fn vm_time_downtime_starts_at_the_saved_cut() {
+        let contract = test_time_contract();
+        assert_eq!(contract.vm_time_downtime_ns(1_000).unwrap(), 1_200);
+
+        let mut legacy = contract.clone();
+        legacy.vm_time_cut_to_anchor_ns = None;
+        assert_eq!(legacy.vm_time_downtime_ns(1_000).unwrap(), 1_000);
+
+        let mut excessive = contract;
+        excessive.vm_time_cut_to_anchor_ns = Some(virt::time_abi::downtime::MAX_DOWNTIME_NS);
+        assert_eq!(
+            excessive.vm_time_downtime_ns(1).unwrap_err().code,
+            TimeAbiCode::DowntimeExcessive
+        );
     }
 
     #[test]

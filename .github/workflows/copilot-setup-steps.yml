@@ -16,16 +16,17 @@ on:
     paths:
       - .github/workflows/copilot-setup-steps.yml
       - .github/actions/build-guest-artifacts/action.yml
-      - .github/actions/check-aci-edge-sandboxes/action.yml
+      - .github/actions/check-nvx-rs/action.yml
       - .github/actions/check-quality/action.yml
       - .gitmodules
       - SOURCE-MANIFEST.json
-      - aci_edge_sandboxes/Cargo.toml
+      - nvx-rs/**
       - openvmm
       - requirements-dev.txt
+      - rust-toolchain.toml
       - scripts/nvx.py
       - scripts/nvx_tools/**
-      - scripts/setup/setup-linux-runner.sh
+      - scripts/setup/tool-versions.conf
 
 permissions:
   contents: read
@@ -76,13 +77,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install gh-aw extension
-        id: gh-aw
-        continue-on-error: true
-        uses: github/gh-aw-actions/setup-cli@5e508589e03a7757a7e05b26e834292f5445bfb6 # v0.88.7
-        with:
-          version: v0.88.7
-
       # The OpenVMM submodule is public, so it needs no deploy key here.
       - name: Initialize the OpenVMM submodule
         id: openvmm
@@ -101,7 +95,7 @@ jobs:
           done
           git -C openvmm log -1 --format='OpenVMM %H %s'
 
-      # Read the versions that CI and the runner bootstrap pin, so this
+      # Read the versions that CI and the setup tool manifest pin, so this
       # environment follows their updates.
       - name: Resolve pinned tool versions
         id: versions
@@ -109,28 +103,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          crate_toolchain=$(sed -n '/^  toolchain:/,/^  [^ ]/ s/^    default: "\(.*\)"$/\1/p' \
-            .github/actions/check-aci-edge-sandboxes/action.yml)
-          crate_msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' aci_edge_sandboxes/Cargo.toml)
-          nextest=$(sed -n 's/^CARGO_NEXTEST_VERSION=//p' scripts/setup/setup-linux-runner.sh)
+          rust_toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          # The minimum supported Rust version of the nvx crate, with which
+          # check-nvx-rs also checks the runtime adapter.
+          crate_msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' nvx-rs/Cargo.toml)
+          nextest=$(sed -n 's/^cargo_nextest\.version=//p' scripts/setup/tool-versions.conf)
           {
-            echo "crate-toolchain=${crate_toolchain}"
+            echo "rust-toolchain=${rust_toolchain}"
             echo "crate-msrv=${crate_msrv}"
             echo "nextest=${nextest}"
           } | tee -a "${GITHUB_OUTPUT}"
-          test -n "${crate_toolchain}" && test -n "${crate_msrv}" && test -n "${nextest}"
+          test -n "${rust_toolchain}" && test -n "${crate_msrv}" && test -n "${nextest}"
 
-      # OpenVMM builds with stable plus its guest, UEFI, and musl targets. The
-      # aci_edge_sandboxes checks use the MXC toolchain, the crate MSRV, and a
-      # macOS target. OpenVMM keeps full debug info in release builds, so the
-      # session limits debug info and disables incremental artifacts to save
-      # disk space and link time.
+      # The toolchain that rust-toolchain.toml pins builds OpenVMM with its
+      # guest, UEFI, and musl targets and runs the nvx-rs checks, which also
+      # need a macOS target and the crate's MSRV. OpenVMM
+      # keeps full debug info in release builds, so the session limits debug
+      # info and disables incremental artifacts to save disk space and link time.
       - name: Install Rust toolchains
         id: rust
         continue-on-error: true
         shell: bash
         env:
-          CRATE_TOOLCHAIN: ${{ steps.versions.outputs.crate-toolchain }}
+          RUST_TOOLCHAIN: ${{ steps.versions.outputs.rust-toolchain }}
           CRATE_MSRV: ${{ steps.versions.outputs.crate-msrv }}
         run: |
           set -euo pipefail
@@ -139,13 +134,13 @@ jobs:
             echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only"
             echo "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
           } >> "${GITHUB_ENV}"
-          rustup toolchain install stable --profile minimal \
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal \
             --component clippy,rustfmt \
-            --target x86_64-unknown-linux-musl,x86_64-unknown-none,x86_64-unknown-uefi
-          rustup default stable
-          rustup toolchain install "${CRATE_TOOLCHAIN}" --profile minimal \
-            --component clippy,rustfmt --target aarch64-apple-darwin
-          rustup toolchain install "${CRATE_MSRV}" --profile minimal
+            --target x86_64-unknown-linux-musl,x86_64-unknown-none,x86_64-unknown-uefi,aarch64-apple-darwin
+          rustup default "${RUST_TOOLCHAIN}"
+          for msrv in ${CRATE_MSRV}; do
+            rustup toolchain install "${msrv}" --profile minimal
+          done
           rustup toolchain list
 
       - name: Install cargo-nextest
@@ -182,7 +177,7 @@ jobs:
           fi
           ls -l /dev/kvm
           if ! grep -qw nonstop_tsc /proc/cpuinfo; then
-            echo "::notice::The host CPU has no invariant TSC; snapshot restore tests may be unstable"
+            echo "::notice::The host CPU has no invariant TSC; the microVM scenarios' guest warp probe measures the cross-vCPU skew that this can cause"
           fi
 
       - name: Restore guest artifacts built by CI
@@ -222,7 +217,7 @@ jobs:
           path: |
             build/openvmm.provenance.json
             openvmm/target/release/openvmm
-          key: openvmm-binary-v6-kvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.openvmm-cache.outputs.sha }}
+          key: openvmm-binary-v6-kvm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ steps.openvmm-cache.outputs.sha }}
 
       # Native guest builds are the in-session way to rebuild guest artifacts.
       # Install the Debian/Ubuntu prerequisites listed in doc/setup.md. Alpine's
@@ -236,8 +231,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            bc binutils bison build-essential ca-certificates cpio curl erofs-utils flex \
-            gzip libelf-dev libssl-dev rsync tar xz-utils zstd
+            bc binutils bison build-essential ca-certificates cpio curl e2fsprogs \
+            erofs-utils flex gzip libelf-dev libssl-dev rsync tar xz-utils zstd
           userns_policy=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
           if [[ -e "${userns_policy}" ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0

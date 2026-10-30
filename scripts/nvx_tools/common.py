@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +29,22 @@ from .build_constants import (
 
 class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
+
+
+def is_link_or_junction(path: Path) -> bool:
+    """Return whether ``path`` is a symbolic link or, on Windows, a junction.
+
+    ``Path.is_symlink()`` misses junctions, which redirect a path the same way.
+    """
+    try:
+        metadata = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    if sys.platform == "win32":
+        return metadata.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    return False
 
 
 def strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -56,6 +73,10 @@ def bytes_to_mib(value: int | float) -> float:
 
 def artifact_path(name: str) -> Path:
     return BuildConstants.BUILD_DIR / name
+
+
+def path_exists(path: Path) -> bool:
+    return os.path.lexists(path)
 
 
 def cache_root() -> Path:
@@ -113,6 +134,10 @@ def require_success(result: CommandResult, label: str) -> None:
     raise ScriptError(f"{label} exited {result.returncode}{suffix}")
 
 
+def _command_start_error(command: Sequence[str], error: OSError) -> ScriptError:
+    return ScriptError(f"failed to run command {' '.join(command)}: {error}")
+
+
 def run_capture(
     args: Sequence[str | os.PathLike[str]],
     *,
@@ -120,12 +145,15 @@ def run_capture(
     env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     command = tuple(os.fspath(arg) for arg in args)
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+        )
+    except OSError as error:
+        raise _command_start_error(command, error) from error
     return CommandResult(command, result.returncode, result.stdout, result.stderr)
 
 
@@ -163,6 +191,44 @@ def repository_metadata() -> dict[str, object]:
         "machine": platform.machine(),
         "python": platform.python_version(),
     }
+
+
+# The GitHub Actions variables that identify the job that wrote a duration
+# report, under the names that the report gives them.
+GITHUB_VARIABLES = (
+    ("repository", "GITHUB_REPOSITORY"),
+    ("workflow", "GITHUB_WORKFLOW"),
+    ("run_id", "GITHUB_RUN_ID"),
+    ("run_attempt", "GITHUB_RUN_ATTEMPT"),
+    ("job", "GITHUB_JOB"),
+    ("event_name", "GITHUB_EVENT_NAME"),
+    ("ref", "GITHUB_REF"),
+    ("sha", "GITHUB_SHA"),
+    ("runner_name", "RUNNER_NAME"),
+    ("runner_os", "RUNNER_OS"),
+)
+
+
+def github_job(environment: Mapping[str, str]) -> dict[str, str | None] | None:
+    """Return the GitHub Actions job that an environment describes, or None
+    outside GitHub Actions."""
+    if environment.get("GITHUB_ACTIONS") != "true":
+        return None
+    return {name: environment.get(variable) for name, variable in GITHUB_VARIABLES}
+
+
+def workflow_path(workflow_ref: str, repository: str) -> str:
+    """Return the path of the workflow that `workflow_ref`, the
+    GITHUB_WORKFLOW_REF of a run of `repository`, names."""
+    reference, separator, _ = workflow_ref.partition("@")
+    path = reference.removeprefix(f"{repository}/")
+    if (
+        not separator
+        or path == reference
+        or PurePosixPath(path).parent != PurePosixPath(".github/workflows")
+    ):
+        raise ScriptError(f"{workflow_ref!r} names no workflow of {repository}")
+    return path
 
 
 def openvmm_git_state(directory: Path) -> tuple[str, bool]:
@@ -220,6 +286,13 @@ def _checksummed_tree_files(directory: Path) -> list[Path]:
         if relative != "SHA256SUMS":
             files.append(path)
     return files
+
+
+def normalized_sha256_file(path: Path) -> str:
+    contents = path.read_bytes().replace(b"\r\n", b"\n")
+    if b"\r" in contents:
+        raise ScriptError(f"{path} contains unsupported carriage returns")
+    return hashlib.sha256(contents).hexdigest()
 
 
 def write_sha256_sums(directory: Path) -> None:
@@ -309,6 +382,8 @@ def run_checked(
         raise ScriptError(
             f"command failed with exit {error.returncode}: {' '.join(command)}"
         ) from error
+    except OSError as error:
+        raise _command_start_error(command, error) from error
 
 
 class _CrossOriginRedirectHandler(urllib.request.HTTPRedirectHandler):

@@ -13,10 +13,12 @@ use super::console::microvm_console_socket_cleanup;
 use super::console::microvm_control_broker_config;
 use super::console::validate_microvm_console_attachment_namespace;
 use super::filesystem::EffectiveMicrovmFilesystem;
-use super::filesystem::effective_microvm_filesystems;
+use super::filesystem::MicrovmFilesystemRequest;
+use super::filesystem::effective_microvm_filesystem;
 use super::filesystem::microvm_filesystem_slot_from_snapshot;
 use super::network::EffectiveMicrovmNetwork;
 use super::network::effective_microvm_network;
+use super::network::microvm_ingress;
 use super::network::microvm_network_endpoint;
 use super::output::MicrovmOutputDrain;
 use super::output::OutputCompletion;
@@ -42,6 +44,7 @@ use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::microvm::MachineProfile;
+use openvmm_defs::microvm::MicrovmSandboxBlockRole;
 use openvmm_defs::microvm::build_microvm_command_line;
 use openvmm_defs::microvm::build_microvm_control_command_line;
 use pal_async::DefaultDriver;
@@ -69,8 +72,8 @@ pub(crate) struct MicrovmConfigBuilder<'a> {
     active: bool,
     network: Option<EffectiveMicrovmNetwork>,
     filesystem_slot: bool,
-    filesystems: Vec<EffectiveMicrovmFilesystem>,
-    gateway_dns: bool,
+    filesystem: Option<EffectiveMicrovmFilesystem>,
+    gateway_dns: Option<std::net::IpAddr>,
     console: Option<ConsoleEndpoint>,
     control_console: Option<ConsoleEndpoint>,
     control_broker_config: Option<VirtioControlConsoleBrokerConfig>,
@@ -102,10 +105,14 @@ impl<'a> MicrovmConfigBuilder<'a> {
         } else {
             false
         };
-        let filesystems = if active {
-            effective_microvm_filesystems(
-                &opt.microvm.microvm_mount,
-                &opt.microvm.microvm_mount_deny,
+        let filesystem = if active {
+            effective_microvm_filesystem(
+                MicrovmFilesystemRequest::from_options(opt),
+                super::filesystem::MicrovmFilesystemPolicyPaths {
+                    denied: &opt.microvm.microvm_mount_deny,
+                    allowed: &opt.microvm.microvm_mount_allow,
+                    writable: &opt.microvm.microvm_mount_write,
+                },
                 opt.microvm.microvm_mount_owner.map_or(
                     openvmm_defs::microvm::MicrovmFilesystemOwner::Vmm,
                     Into::into,
@@ -113,20 +120,20 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 restore_machine_contract,
             )?
         } else {
-            Vec::new()
+            None
         };
-        if opt.microvm.snapshot_destination.is_some() {
-            for filesystem in &filesystems {
-                tracing::warn!(
-                    stable_id = filesystem.attachment.stable_id,
-                    access_mode = filesystem.config.access.as_str(),
-                    "microVM snapshot excludes live host filesystem contents; restore revalidates the external directory and may fail after host changes"
-                );
-            }
+        if opt.microvm.snapshot_destination.is_some()
+            && let Some(filesystem) = &filesystem
+        {
+            tracing::warn!(
+                stable_id = filesystem.attachment.stable_id,
+                access_mode = filesystem.config.access.as_str(),
+                "microVM snapshot excludes live host filesystem contents; restore revalidates the external directory and may fail after host changes"
+            );
         }
         let gateway_dns = network
             .as_ref()
-            .is_some_and(|network| network.policy.allows_gateway_dns());
+            .and_then(|network| network.policy.gateway_dns_server());
 
         if active
             && (opt.com1.is_some()
@@ -195,15 +202,22 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 .as_ref()
                 .map(|(_, _, attachment)| attachment.clone()),
             network_attachment: network.as_ref().map(|network| network.attachment.clone()),
-            egress_policy: network.as_ref().map(|network| network.policy.clone()),
-            filesystem_attachments: filesystems
-                .iter()
-                .map(|filesystem| filesystem.attachment.clone())
-                .collect(),
-            filesystem_root_paths: filesystems
-                .iter()
-                .map(|filesystem| PathBuf::from(&filesystem.root_path))
-                .collect(),
+            egress_policy: network
+                .as_ref()
+                .map(|network| network.contract_policy.clone()),
+            filesystem: filesystem
+                .as_ref()
+                .map(|filesystem| super::MicrovmFilesystemHost {
+                    attachment: filesystem.attachment.clone(),
+                    root_path: PathBuf::from(&filesystem.root_path),
+                    children: filesystem
+                        .children
+                        .iter()
+                        .map(|(root_path, attachment)| {
+                            (PathBuf::from(root_path), attachment.clone())
+                        })
+                        .collect(),
+                }),
             ..Default::default()
         };
 
@@ -213,7 +227,7 @@ impl<'a> MicrovmConfigBuilder<'a> {
             active,
             network,
             filesystem_slot,
-            filesystems,
+            filesystem,
             gateway_dns,
             console,
             control_console,
@@ -356,7 +370,8 @@ impl<'a> MicrovmConfigBuilder<'a> {
         Ok(virtio_console_backend)
     }
 
-    /// Adds the fixed-role sandbox block devices.
+    /// Adds the fixed-role sandbox block devices, with a platform restore's
+    /// absent fresh scratch.
     pub(crate) async fn add_sandbox_blocks(
         &self,
         storage: &mut StorageBuilder,
@@ -381,8 +396,14 @@ impl<'a> MicrovmConfigBuilder<'a> {
                     &disk.kind,
                     disk.read_only,
                     opt.microvm.snapshot_destination.is_some() || opt.restore_snapshot.is_some(),
+                    self.restore
+                        .distro_capacity
+                        .filter(|_| block.role == MicrovmSandboxBlockRole::Distro),
                 )
                 .await?;
+        }
+        if let Some(geometry) = self.restore.absent_scratch {
+            storage.add_microvm_absent_scratch(geometry);
         }
         Ok(())
     }
@@ -525,6 +546,7 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 config,
                 &network.policy,
                 &self.opt.microvm.host_loopback_forward,
+                self.opt.microvm_private_network_ingress(),
                 resources,
             )?;
             add_virtio_device(
@@ -549,15 +571,52 @@ impl<'a> MicrovmConfigBuilder<'a> {
 
         let slot_count = openvmm_defs::microvm::microvm_filesystem_slot_count(
             self.filesystem_slot,
-            self.filesystems.len(),
+            usize::from(self.filesystem.is_some()),
         )?;
-        for (index, slot) in openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS
+        for slot in openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS
             .iter()
             .take(slot_count)
-            .enumerate()
         {
-            let (fs, profile) = if let Some(filesystem) = self.filesystems.get(index) {
-                (
+            let (fs, profile) = match &self.filesystem {
+                Some(filesystem) if filesystem.config.is_aggregate() => (
+                    virtio_resources::fs::VirtioFsBackend::Aggregate {
+                        children: filesystem
+                            .config
+                            .children
+                            .iter()
+                            .zip(&filesystem.children)
+                            .map(|(child, (root_path, _))| {
+                                virtio_resources::fs::VirtioFsAggregateChild {
+                                    name: child.name.clone(),
+                                    root_path: root_path.clone(),
+                                    mount_options: String::new(),
+                                }
+                            })
+                            .collect(),
+                    },
+                    virtio_resources::fs::microvm::VirtioFsProfile::MicrovmAggregate {
+                        stable_id: slot.stable_id.to_owned(),
+                        children: filesystem
+                            .config
+                            .children
+                            .iter()
+                            .zip(&filesystem.children)
+                            .map(|(child, (_, attachment))| {
+                                virtio_resources::fs::microvm::MicrovmAggregateChild {
+                                    name: child.name.clone(),
+                                    kind: aggregate_child_kind(child.kind),
+                                    root_identity: attachment.identity.clone(),
+                                    read_only: child.access.is_read_only(),
+                                    denied_paths: child.denied_paths.clone(),
+                                    allowed_paths: child.allowed_paths.clone(),
+                                    writable_paths: child.writable_paths.clone(),
+                                }
+                            })
+                            .collect(),
+                        caller_identity: filesystem.config.owner.is_caller(),
+                    },
+                ),
+                Some(filesystem) => (
                     virtio_resources::fs::VirtioFsBackend::HostFs {
                         root_path: filesystem.root_path.clone(),
                         mount_options: String::new(),
@@ -567,16 +626,17 @@ impl<'a> MicrovmConfigBuilder<'a> {
                         root_identity: filesystem.attachment.identity.clone(),
                         read_only: filesystem.config.access.is_read_only(),
                         denied_paths: filesystem.config.denied_paths.clone(),
+                        allowed_paths: filesystem.config.allowed_paths.clone(),
+                        writable_paths: filesystem.config.writable_paths.clone(),
                         caller_identity: filesystem.config.owner.is_caller(),
                     },
-                )
-            } else {
-                (
+                ),
+                None => (
                     virtio_resources::fs::VirtioFsBackend::Dormant,
                     virtio_resources::fs::microvm::VirtioFsProfile::MicrovmDormant {
                         stable_id: slot.stable_id.to_owned(),
                     },
-                )
+                ),
             };
             add_virtio_device(
                 VirtioBusCli::Mmio,
@@ -662,7 +722,7 @@ impl<'a> MicrovmConfigBuilder<'a> {
         }
         cfg.microvm.network = self.network.as_ref().map(|network| network.config.clone());
         let microvm_filesystems = self
-            .filesystems
+            .filesystem
             .iter()
             .map(|filesystem| filesystem.config.clone())
             .collect::<Vec<_>>();
@@ -753,12 +813,16 @@ impl<'a> MicrovmConfigBuilder<'a> {
                 .as_ref()
                 .map(|_| openvmm_defs::microvm::microvm_virtio_net_irq(requested_hypervisor))
                 .transpose()?;
+            let ingress = self
+                .network
+                .as_ref()
+                .and_then(|network| microvm_ingress(&network.policy));
             let network = cfg
                 .microvm
                 .network
                 .as_ref()
                 .zip(network_irq)
-                .map(|(network, irq)| (network, irq, self.gateway_dns));
+                .map(|(network, irq)| (network, irq, self.gateway_dns, ingress));
             if let Some(snapshot_tier) = opt.microvm.snapshot_tier {
                 anyhow::ensure!(
                     !cmdline
@@ -790,6 +854,18 @@ impl<'a> MicrovmConfigBuilder<'a> {
             ..std::mem::take(&mut self.resources)
         };
         Ok(())
+    }
+}
+
+/// Returns the virtio-fs resource kind of a microVM aggregate child of `kind`.
+fn aggregate_child_kind(
+    kind: openvmm_defs::microvm::MicrovmFilesystemChildKind,
+) -> virtio_resources::fs::microvm::MicrovmAggregateChildKind {
+    use openvmm_defs::microvm::MicrovmFilesystemChildKind;
+    use virtio_resources::fs::microvm::MicrovmAggregateChildKind;
+    match kind {
+        MicrovmFilesystemChildKind::Directory => MicrovmAggregateChildKind::Directory,
+        MicrovmFilesystemChildKind::File => MicrovmAggregateChildKind::File,
     }
 }
 
@@ -865,6 +941,9 @@ fn build_effective_microvm_command_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openvmm_defs::microvm::MICROVM_COMMAND_LINE_MAX_SIZE;
+    use openvmm_defs::microvm::MICROVM_CONSOLE_COMMAND_LINE;
+    use openvmm_defs::microvm::check_microvm_command_line;
     use test_with_tracing::test;
 
     #[test]
@@ -934,5 +1013,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn effective_command_line_limit_includes_the_profile_tokens() {
+        let build = |fill: usize| {
+            build_effective_microvm_command_line(
+                &["x".repeat(fill)],
+                8,
+                true,
+                true,
+                Some(cli_args::microvm::MicrovmWorkloadIdentityCli {
+                    uid: u32::MAX,
+                    gid: u32::MAX,
+                }),
+                Some(cli_args::microvm::MicrovmLifecycleCli::OneShot),
+            )
+        };
+        // The profile's tokens follow the caller's, and the guest kernel must
+        // receive both: 2,047 bytes of text pass, and 2,048 fail with the
+        // shared check's error, whose text openvmm_defs tests. The expected
+        // line joins the console command line, the caller's argument, and the
+        // tokens as the profile's own functions write them, whose formats
+        // openvmm_defs tests, so it does not come from the builder.
+        let mut profile_tokens = String::new();
+        openvmm_defs::microvm::append_microvm_processor_limit(&mut profile_tokens, 8).unwrap();
+        openvmm_defs::microvm::append_microvm_workload_identity(
+            &mut profile_tokens,
+            u32::MAX,
+            u32::MAX,
+        )
+        .unwrap();
+        openvmm_defs::microvm::append_microvm_lifecycle(&mut profile_tokens, false).unwrap();
+        let expected = |fill: usize| {
+            format!(
+                "{MICROVM_CONSOLE_COMMAND_LINE} {}{profile_tokens}",
+                "x".repeat(fill)
+            )
+        };
+        let fill = (MICROVM_COMMAND_LINE_MAX_SIZE - 1)
+            .checked_sub(MICROVM_CONSOLE_COMMAND_LINE.len() + 1 + profile_tokens.len())
+            .expect("the profile's tokens leave room for the caller's argument");
+        let longest = build(fill).unwrap();
+        assert_eq!(longest, expected(fill));
+        assert_eq!(longest.len(), MICROVM_COMMAND_LINE_MAX_SIZE - 1);
+        let over = check_microvm_command_line(&expected(fill + 1)).unwrap_err();
+        assert_eq!(build(fill + 1).unwrap_err().to_string(), over.to_string());
     }
 }

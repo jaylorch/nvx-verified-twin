@@ -57,6 +57,8 @@ vm_resource::register_static_resolvers! {
 
     // Serial ports
     serial_core::disconnected::resolver::DisconnectedSerialBackendResolver,
+    serial_core::null::resolver::NullSerialBackendResolver,
+    serial_socket::file::FileSerialResolver,
     #[cfg(windows)]
     serial_socket::windows::WindowsPipeSerialResolver,
     serial_socket::net::SocketSerialResolver,
@@ -84,6 +86,7 @@ vm_resource::register_static_resolvers! {
     disk_vhdmp::VhdmpDiskResolver,
     #[cfg(feature = "disk_blob")]
     disk_blob::resolver::BlobDiskResolver,
+    disk_zerofill::resolver::ZeroFillDiskResolver,
 
     // Disk Layers
     disklayer_ram::resolver::RamDiskLayerResolver,
@@ -92,7 +95,7 @@ vm_resource::register_static_resolvers! {
     disklayer_vhdx::resolver::VhdxDiskLayerResolver,
 
     // PCI devices
-    cxl_spec::test::resolver::CxlTestDeviceResolver,
+    cxl::test::resolver::CxlTestDeviceResolver,
     gdma::resolver::GdmaDeviceResolver,
     nvme::resolver::NvmeControllerResolver,
     nvme_test::resolver::NvmeFaultControllerResolver,

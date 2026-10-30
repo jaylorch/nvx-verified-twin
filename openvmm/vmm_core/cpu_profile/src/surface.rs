@@ -17,7 +17,7 @@ use crate::unlisted::unlisted_cpuid_error;
 use crate::unlisted::unlisted_cpuid_violations;
 
 /// The register names, for messages.
-const REGISTERS: [&str; 4] = ["EAX", "EBX", "ECX", "EDX"];
+pub(crate) const REGISTERS: [&str; 4] = ["EAX", "EBX", "ECX", "EDX"];
 
 /// The CPU surface a backend supports on this host, which it reports through
 /// `supported_cpu_surface()` and which the CPU fingerprint records.
@@ -155,14 +155,18 @@ pub(crate) enum RegisterClass {
 pub(crate) fn register_class(leaf: u32, subleaf: u32, register: usize) -> RegisterClass {
     const ALL: &[(u32, u32)] = &[(0, 32)];
     const ADDRESS_WIDTHS: &[(u32, u32)] = &[(0, 8), (8, 8)];
+    // AMD's INVLPGB page count and RDPRU's largest register index; Intel
+    // reserves the register.
+    const AMD_INSTRUCTION_LIMITS: &[(u32, u32)] = &[(0, 16), (16, 10)];
     match (leaf, subleaf, register) {
         (0x0, _, 0) | (0x8000_0000, _, 0) | (0x7, 0, 0) => RegisterClass::Limits(ALL),
         (0x8000_0008, _, 0) => RegisterClass::Limits(ADDRESS_WIDTHS),
+        (0x8000_0008, _, 3) => RegisterClass::Limits(AMD_INSTRUCTION_LIMITS),
         (0x0 | 0x2 | 0x3 | 0x4 | 0xd | 0x18 | 0x8000_001d, _, _)
         | (0x1 | 0x8000_0001, _, 0)
         | (0x1, _, 1)
         | (0x8000_0002..=0x8000_0006, _, _)
-        | (0x8000_0008, _, 2 | 3) => RegisterClass::Informational,
+        | (0x8000_0008, _, 2) => RegisterClass::Informational,
         _ => RegisterClass::Features,
     }
 }
@@ -371,7 +375,7 @@ pub(crate) fn field_value(value: u32, shift: u32, width: u32) -> u32 {
 }
 
 /// Returns `bit 16 is` or `bits 3, 7 are`.
-fn bits_phrase(bits: u64) -> String {
+pub(crate) fn bits_phrase(bits: u64) -> String {
     let list = (0..64)
         .filter(|bit| bits & (1 << bit) != 0)
         .map(|bit| bit.to_string())

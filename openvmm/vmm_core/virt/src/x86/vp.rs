@@ -26,7 +26,6 @@ use hvdef::HvX64SegmentRegister;
 use hvdef::HvX64TableRegister;
 use inspect::Inspect;
 use mesh_protobuf::Protobuf;
-pub use snapshot::TscDeadline;
 use std::fmt::Debug;
 use vm_topology::processor::x86::X86VpInfo;
 use x86defs::RFlags;
@@ -1613,6 +1612,51 @@ impl StateElement<X86PartitionCapabilities, X86VpInfo> for Tsc {
     }
 }
 
+/// The architectural IA32_TSC_DEADLINE MSR, in guest TSC ticks.
+///
+/// Zero disarms the timer. Restore after both APIC configuration and TSC;
+/// changing APIC mode or rebasing TSC can otherwise change the expiration.
+#[repr(C)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Protobuf, Inspect)]
+#[mesh(package = "virt.x86")]
+pub struct TscDeadline {
+    #[mesh(1)]
+    #[inspect(hex)]
+    pub value: u64,
+}
+
+impl HvRegisterState<HvX64RegisterName, 1> for TscDeadline {
+    fn names(&self) -> &'static [HvX64RegisterName; 1] {
+        &[HvX64RegisterName::TscDeadline]
+    }
+
+    fn get_values<'a>(&self, it: impl Iterator<Item = &'a mut HvRegisterValue>) {
+        for (dest, src) in it.zip([self.value]) {
+            *dest = src.into();
+        }
+    }
+
+    fn set_values(&mut self, it: impl Iterator<Item = HvRegisterValue>) {
+        for (src, dest) in it.zip([&mut self.value]) {
+            *dest = src.as_u64();
+        }
+    }
+}
+
+impl StateElement<X86PartitionCapabilities, X86VpInfo> for TscDeadline {
+    fn is_present(caps: &X86PartitionCapabilities) -> bool {
+        caps.tsc_deadline
+    }
+
+    fn at_reset(_caps: &X86PartitionCapabilities, _vp_info: &X86VpInfo) -> Self {
+        Self::default()
+    }
+
+    fn can_compare(caps: &X86PartitionCapabilities) -> bool {
+        caps.can_freeze_time
+    }
+}
+
 #[repr(C)]
 #[derive(Default, Debug, PartialEq, Eq, Protobuf, Inspect)]
 #[mesh(package = "virt.x86")]
@@ -1965,6 +2009,7 @@ state_trait! {
     (12, "cet", cet, set_cet, Cet),
     (13, "cet_ss", cet_ss, set_cet_ss, CetSs),
     (14, "tsc_aux", tsc_aux, set_tsc_aux, TscAux),
+    // The deadline must be restored after APIC mode and guest TSC.
     (15, "tsc_deadline", tsc_deadline, set_tsc_deadline, TscDeadline),
 
     // Synic state
@@ -2027,6 +2072,9 @@ pub fn x86_init<T: AccessVpState>(access: &mut T, vp_info: &X86VpInfo) -> Result
         current_apic.registers[x86defs::apic::ApicRegister::ID.0 as usize];
     apic.apic_base = current_apic.apic_base;
     access.set_apic(&apic)?;
+    if TscDeadline::is_present(access.caps()) {
+        access.set_tsc_deadline(&TscDeadline::at_reset(access.caps(), vp_info))?;
+    }
 
     // Enable the wait-for-SIPI state.
     if !vp_info.base.is_bsp() {

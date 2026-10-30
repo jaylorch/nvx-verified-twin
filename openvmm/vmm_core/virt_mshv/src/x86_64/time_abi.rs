@@ -1028,7 +1028,7 @@ impl MshvPartitionInner {
 /// falling back to one read per entry, with a warning, if the bulk call
 /// fails. Returns the values and whether the bulk call served them; a read
 /// that fails fails with `code`.
-fn vp0_cpuid_entries(
+pub(super) fn vp0_cpuid_entries(
     bsp: &VcpuFd,
     entries: &[(u32, u32)],
     code: TimeAbiCode,
@@ -2403,7 +2403,8 @@ mod hw {
         }
         assert!(far_unlisted.is_empty(), "{far_unlisted:#?}");
 
-        // The negative path of verification step 6. A non-zero value at a
+        // The negative path of the unlisted-entry check,
+        // `cpu_profile::check_unlisted_cpuid`. A non-zero value at a
         // reserved entry that the host enumerates, planted here as a
         // registered result, must reach the backend's effective CPUID report,
         // which core then rejects with E_CPU_UNLISTED: the report reads the

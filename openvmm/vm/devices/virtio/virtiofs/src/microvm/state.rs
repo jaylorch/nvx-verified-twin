@@ -4,14 +4,18 @@
 //! microVM virtio-fs state encoding and validation.
 
 use super::MAX_FUSE_REQUEST_BYTES;
+use super::policy::SubtreePolicy;
 use super::profile::MICROVM_FUSE_MAJOR;
 use super::profile::MICROVM_FUSE_MAX_WRITE;
 use super::profile::MICROVM_FUSE_MIN_MINOR;
 use super::profile::MICROVM_REQUEST_QUEUES;
 use super::profile::MicroVmAccessMode;
+use super::profile::MicroVmAggregateChild;
 use super::profile::MicroVmOwnerMode;
 use super::profile::MicroVmVirtioFsProfile;
+use super::saved_state::AGGREGATE_SCHEMA_VERSION;
 use super::saved_state::CALLER_IDENTITY_SCHEMA_VERSION;
+use super::saved_state::FILE_CHILD_SCHEMA_VERSION;
 use super::saved_state::MAX_ALIAS_BYTES;
 use super::saved_state::MAX_ALIASES;
 use super::saved_state::MAX_ALIASES_PER_INODE;
@@ -22,7 +26,11 @@ use super::saved_state::MAX_HANDLES;
 use super::saved_state::MAX_INODES;
 use super::saved_state::MAX_PATH_BYTES;
 use super::saved_state::PREVIOUS_SCHEMA_VERSION;
+use super::saved_state::SAVED_DIRECTORY_CHILD;
+use super::saved_state::SAVED_FILE_CHILD;
 use super::saved_state::SCHEMA_VERSION;
+use super::saved_state::SUBTREE_POLICY_SCHEMA_VERSION;
+use super::saved_state::SavedAggregateChild;
 use super::saved_state::SavedNegotiation;
 use super::saved_state::SavedObjectIdentity;
 use super::saved_state::SavedState;
@@ -33,6 +41,7 @@ use anyhow::Context;
 use fuse::SessionInfoState;
 use fuse::SessionState;
 use fuse::protocol::*;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::Path;
@@ -129,6 +138,40 @@ pub(crate) fn saved_identity(stat: &lx::Stat) -> SavedObjectIdentity {
     }
 }
 
+/// Returns the canonical `/`-separated spelling of share-relative policy
+/// paths, as the attachment's resource and the snapshot contract spell them.
+pub(crate) fn saved_policy_paths(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            path.iter()
+                .map(|component| component.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect()
+}
+
+/// Returns the oldest schema version that can record the state of `profile`'s
+/// attachment, so that releases that cannot enforce its policy reject it.
+pub(crate) fn schema_version(profile: &MicroVmVirtioFsProfile) -> u32 {
+    if profile
+        .children()
+        .iter()
+        .any(MicroVmAggregateChild::is_file)
+    {
+        FILE_CHILD_SCHEMA_VERSION
+    } else if profile.is_aggregate() {
+        AGGREGATE_SCHEMA_VERSION
+    } else if profile.subtree_policy().restricts_writes() {
+        SUBTREE_POLICY_SCHEMA_VERSION
+    } else if profile.owner_mode() == MicroVmOwnerMode::Caller {
+        CALLER_IDENTITY_SCHEMA_VERSION
+    } else {
+        SCHEMA_VERSION
+    }
+}
+
 pub(crate) fn validate_identity(
     stat: &lx::Stat,
     saved: &SavedObjectIdentity,
@@ -218,6 +261,10 @@ pub(crate) fn save_dormant_microvm_state(
         maximum_request_size: MAX_FUSE_REQUEST_BYTES as u32,
         dormant: true,
         caller_identity: false,
+        denied_paths: Vec::new(),
+        allowed_paths: Vec::new(),
+        writable_paths: Vec::new(),
+        aggregate_children: Vec::new(),
     })
 }
 
@@ -247,7 +294,11 @@ pub(crate) fn validate_dormant_microvm_state(
             && state.inodes.is_empty()
             && state.handles.is_empty()
             && state.attachment_root_identity.is_empty()
-            && !state.caller_identity,
+            && !state.caller_identity
+            && state.denied_paths.is_empty()
+            && state.allowed_paths.is_empty()
+            && state.writable_paths.is_empty()
+            && state.aggregate_children.is_empty(),
         "dormant virtio-fs state contains active filesystem policy or objects"
     );
     let session_state = session_state_from_saved(&state.negotiation)?;
@@ -258,6 +309,50 @@ pub(crate) fn validate_dormant_microvm_state(
     Ok(session_state)
 }
 
+/// Returns the saved children of an aggregate `profile`, in order.
+pub(crate) fn saved_aggregate_children(
+    profile: &MicroVmVirtioFsProfile,
+) -> Vec<SavedAggregateChild> {
+    profile
+        .children()
+        .iter()
+        .map(|child| {
+            let policy = child.subtree_policy();
+            SavedAggregateChild {
+                name: child.name().to_owned(),
+                root_identity: child.root_identity().to_vec(),
+                access_mode: saved_access_mode(child.access_mode()),
+                denied_paths: saved_policy_paths(policy.denied_paths()),
+                allowed_paths: saved_policy_paths(policy.allowed_paths()),
+                writable_paths: saved_policy_paths(policy.writable_paths()),
+                kind: if child.is_file() {
+                    SAVED_FILE_CHILD
+                } else {
+                    SAVED_DIRECTORY_CHILD
+                },
+            }
+        })
+        .collect()
+}
+
+/// Returns the access policy and read-only setting of volume `volume_id` of
+/// `profile`: volume 0 of a single share, or volume `index + 1` of the
+/// aggregate child `index`.
+fn volume_policy(
+    profile: &MicroVmVirtioFsProfile,
+    volume_id: u32,
+) -> Option<(&SubtreePolicy, bool)> {
+    if profile.is_aggregate() {
+        let index = usize::try_from(volume_id).ok()?.checked_sub(1)?;
+        profile
+            .children()
+            .get(index)
+            .map(|child| (child.subtree_policy(), child.is_readonly()))
+    } else {
+        (volume_id == 0).then(|| (profile.subtree_policy(), profile.is_readonly()))
+    }
+}
+
 pub(crate) fn validate_microvm_state(
     state: &SavedState,
     profile: &MicroVmVirtioFsProfile,
@@ -265,13 +360,40 @@ pub(crate) fn validate_microvm_state(
     anyhow::ensure!(
         matches!(
             state.schema_version,
-            PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION | CALLER_IDENTITY_SCHEMA_VERSION
+            PREVIOUS_SCHEMA_VERSION
+                | SCHEMA_VERSION
+                | CALLER_IDENTITY_SCHEMA_VERSION
+                | SUBTREE_POLICY_SCHEMA_VERSION
+                | AGGREGATE_SCHEMA_VERSION
+                | FILE_CHILD_SCHEMA_VERSION
         ) && !state.dormant,
         "unsupported virtio-fs state schema version {}",
         state.schema_version
     );
+    let aggregate_state = matches!(
+        state.schema_version,
+        AGGREGATE_SCHEMA_VERSION | FILE_CHILD_SCHEMA_VERSION
+    );
     anyhow::ensure!(
-        state.caller_identity == (state.schema_version == CALLER_IDENTITY_SCHEMA_VERSION),
+        aggregate_state == profile.is_aggregate(),
+        "saved aggregate layout does not match the restore profile"
+    );
+    anyhow::ensure!(
+        (state.schema_version == FILE_CHILD_SCHEMA_VERSION)
+            == profile
+                .children()
+                .iter()
+                .any(MicroVmAggregateChild::is_file),
+        "saved aggregate file children do not match the restore profile"
+    );
+    anyhow::ensure!(
+        match state.schema_version {
+            CALLER_IDENTITY_SCHEMA_VERSION => state.caller_identity,
+            SUBTREE_POLICY_SCHEMA_VERSION
+            | AGGREGATE_SCHEMA_VERSION
+            | FILE_CHILD_SCHEMA_VERSION => true,
+            _ => !state.caller_identity,
+        },
         "saved ownership mode does not match the virtio-fs state schema version"
     );
     anyhow::ensure!(
@@ -290,6 +412,45 @@ pub(crate) fn validate_microvm_state(
         state.caller_identity == (profile.owner_mode() == MicroVmOwnerMode::Caller),
         "saved ownership mode does not match the restore profile"
     );
+    let saved_policy = (
+        &state.denied_paths,
+        &state.allowed_paths,
+        &state.writable_paths,
+    );
+    if aggregate_state {
+        // Each child records its own policy, and so its own root identity.
+        anyhow::ensure!(
+            state.denied_paths.is_empty()
+                && state.allowed_paths.is_empty()
+                && state.writable_paths.is_empty()
+                && state.aggregate_children == saved_aggregate_children(profile),
+            "saved aggregate children do not match the restore profile"
+        );
+    } else if state.schema_version == SUBTREE_POLICY_SCHEMA_VERSION {
+        let policy = profile.subtree_policy();
+        anyhow::ensure!(
+            policy.restricts_writes()
+                && saved_policy
+                    == (
+                        &saved_policy_paths(policy.denied_paths()),
+                        &saved_policy_paths(policy.allowed_paths()),
+                        &saved_policy_paths(policy.writable_paths()),
+                    )
+                && state.aggregate_children.is_empty(),
+            "saved access policy does not match the restore profile"
+        );
+    } else {
+        // Earlier states record no access policy, and their attachments had
+        // neither allowed nor writable paths.
+        anyhow::ensure!(
+            !profile.subtree_policy().restricts_writes()
+                && state.denied_paths.is_empty()
+                && state.allowed_paths.is_empty()
+                && state.writable_paths.is_empty()
+                && state.aggregate_children.is_empty(),
+            "saved access policy does not match the restore profile"
+        );
+    }
     anyhow::ensure!(
         state.request_queues == profile.request_queues()
             && state.shared_memory_size == 0
@@ -338,23 +499,25 @@ pub(crate) fn validate_microvm_state(
 
     let mut root_count = 0;
     let mut largest_node_id = 0;
-    let mut inode_ids = HashSet::with_capacity(state.inodes.len());
+    let mut inode_volumes = HashMap::with_capacity(state.inodes.len());
     let mut alias_paths = HashSet::new();
     let mut alias_count = 0usize;
     let mut alias_bytes = 0usize;
+    // Every alias of each inode is writable, when the access policy restricts
+    // writes.
+    let mut writable_inodes = HashSet::new();
     for inode in &state.inodes {
         anyhow::ensure!(
-            inode.node_id != 0 && inode_ids.insert(inode.node_id),
+            inode.node_id != 0 && !inode_volumes.contains_key(&inode.node_id),
             "saved inode IDs are invalid or duplicated"
         );
+        inode_volumes.insert(inode.node_id, inode.volume_id);
         largest_node_id = largest_node_id.max(inode.node_id);
         if inode.node_id == FUSE_ROOT_ID {
             root_count += 1;
         }
-        anyhow::ensure!(
-            inode.volume_id == 0,
-            "saved aggregate volumes are unsupported"
-        );
+        let (policy, _) = volume_policy(profile, inode.volume_id)
+            .context("saved inode belongs to an unknown volume")?;
         anyhow::ensure!(
             inode.lookup_count != 0,
             "saved inode lookup count is invalid"
@@ -368,6 +531,15 @@ pub(crate) fn validate_microvm_state(
             .checked_add(inode.relative_aliases.len())
             .context("saved alias count overflow")?;
         anyhow::ensure!(alias_count <= MAX_ALIASES, "saved alias table is too large");
+        // The root of a single share is node 1, but node 1 of an aggregate is
+        // its synthetic root, which has no saved inode, and each child's root
+        // is the inode with the empty alias in its volume.
+        let volume_root = if profile.is_aggregate() {
+            inode.relative_aliases.first().is_some_and(Vec::is_empty)
+        } else {
+            inode.node_id == FUSE_ROOT_ID
+        };
+        let mut writable = true;
         for alias in &inode.relative_aliases {
             anyhow::ensure!(
                 alias.len() <= MAX_PATH_BYTES,
@@ -382,7 +554,7 @@ pub(crate) fn validate_microvm_state(
             );
             let path = decode_relative_path(alias)?;
             validate_relative_path(&path, true).map_err(anyhow::Error::from)?;
-            if inode.node_id == FUSE_ROOT_ID {
+            if volume_root {
                 anyhow::ensure!(
                     path.as_os_str().is_empty(),
                     "root inode has a non-root alias"
@@ -393,13 +565,24 @@ pub(crate) fn validate_microvm_state(
                     "non-root inode has a root alias"
                 );
             }
+            writable &= policy.is_writable(&path);
             anyhow::ensure!(
-                alias_paths.insert(path),
+                alias_paths.insert((inode.volume_id, path)),
                 "saved aliases are duplicated or ambiguous"
             );
         }
+        if writable {
+            writable_inodes.insert(inode.node_id);
+        }
     }
-    anyhow::ensure!(root_count == 1, "saved inode table must contain one root");
+    if profile.is_aggregate() {
+        anyhow::ensure!(
+            root_count == 0,
+            "saved aggregate inode table contains the synthetic root"
+        );
+    } else {
+        anyhow::ensure!(root_count == 1, "saved inode table must contain one root");
+    }
     anyhow::ensure!(
         state.next_node_id > largest_node_id,
         "saved next inode ID can reuse an active ID"
@@ -415,19 +598,26 @@ pub(crate) fn validate_microvm_state(
             "saved handle IDs are invalid or duplicated"
         );
         largest_handle_id = largest_handle_id.max(handle.handle_id);
-        anyhow::ensure!(
-            inode_ids.contains(&handle.node_id),
-            "saved handle refers to an unknown inode"
-        );
+        let (policy, readonly) = inode_volumes
+            .get(&handle.node_id)
+            .and_then(|volume_id| volume_policy(profile, *volume_id))
+            .context("saved handle refers to an unknown inode")?;
         anyhow::ensure!(
             handle.object_identity.kind == handle.kind && handle.kind != lx::S_IFLNK,
             "saved handle has an unsupported object kind"
         );
         let reopen_flags = reopen_flags(handle.open_flags)?;
-        if profile.is_readonly() {
+        let writable_handle = reopen_flags & lx::O_ACCESS_MASK as u32 != lx::O_RDONLY as u32;
+        if readonly {
             anyhow::ensure!(
-                reopen_flags & lx::O_ACCESS_MASK as u32 == lx::O_RDONLY as u32,
+                !writable_handle,
                 "read-only microVM profile cannot restore a writable handle"
+            );
+        }
+        if policy.restricts_writes() {
+            anyhow::ensure!(
+                !writable_handle || writable_inodes.contains(&handle.node_id),
+                "microVM access policy cannot restore a writable handle outside its writable paths"
             );
         }
         anyhow::ensure!(

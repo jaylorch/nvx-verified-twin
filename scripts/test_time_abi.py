@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
+import dataclasses
 import io
 import json
+import math
 import queue
 import re
 import shutil
@@ -13,8 +16,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import types
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -62,6 +69,110 @@ def warp_output(
         f"stalled_pairs={stalled} cpus=0-3 duration_ms=100 tsc_hz=2194804000 "
         f"tsc_hz_source=kmsg-detected-processor conclusive={conclusive}\n"
     )
+
+
+def write_openvmm_profiles(
+    checkout: Path, *generations: time_abi.CpuGeneration, revision: int = 1
+) -> Path:
+    """Write ``generations`` as revision ``revision`` of the pinned CPU
+    profiles of an OpenVMM checkout at ``checkout``, with the fields that NVX
+    reads, and return the checkout."""
+    directory = checkout / time_abi.OPENVMM_CPU_PROFILES
+    directory.mkdir(parents=True, exist_ok=True)
+    for generation in generations:
+        profile_id = (
+            f"{time_abi.PROFILE_VENDORS[generation.vendor]}.{generation.name}"
+            f".v{revision}"
+        )
+        document = {
+            "id": profile_id,
+            "vendor": generation.vendor,
+            "generation": {
+                "name": generation.name,
+                "cpus": [
+                    {
+                        "family": cpu.family,
+                        "model": cpu.model,
+                        "steppings": [cpu.steppings.start, cpu.steppings.stop - 1],
+                    }
+                    for cpu in generation.cpus
+                ],
+            },
+        }
+        (directory / f"{profile_id}.json").write_text(
+            json.dumps(document), encoding="utf-8"
+        )
+    return checkout
+
+
+# A Rust integer constant, `[pub] const NAME: TYPE = EXPRESSION;`.
+RUST_INTEGER_CONSTANT = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?const\s+(\w+)\s*:\s*[iu](?:8|16|32|64|128|size)"
+    r"\s*=\s*([^;]+);",
+    re.MULTILINE,
+)
+
+
+def rust_integer_constants(source: str) -> dict[str, int]:
+    """Return the integer constants of a Rust source whose values are integer
+    literals, or sums, differences, products, and left shifts of literals and
+    of earlier such constants."""
+    constants: dict[str, int] = {}
+
+    def evaluate(node: ast.expr) -> int:
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.Name):
+            return constants[node.id]
+        if isinstance(node, ast.BinOp):
+            left, right = evaluate(node.left), evaluate(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.LShift):
+                return left << right
+        raise ValueError(f"unsupported expression {ast.dump(node)}")
+
+    for name, expression in RUST_INTEGER_CONSTANT.findall(source):
+        try:
+            constants[name] = evaluate(ast.parse(expression.strip(), mode="eval").body)
+        except (KeyError, SyntaxError, ValueError):
+            continue
+    return constants
+
+
+def pinned_openvmm_file(test: unittest.TestCase, path: str) -> str:
+    """Return the file at ``path`` in the OpenVMM submodule's pinned revision.
+
+    The file is read from the gitlink's commit, not from the submodule's
+    working tree, which can hold another revision: a self-hosted CI runner
+    keeps an earlier job's OpenVMM checkout until the job checks out its own.
+    Skips ``test`` where the submodule lacks the pinned revision.
+    """
+    root = Path(__file__).resolve().parents[1]
+    submodule = root / "openvmm"
+    if not (submodule / ".git").exists():
+        test.skipTest("the OpenVMM submodule is not initialized")
+
+    def git(directory: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(directory), *arguments],
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+        )
+
+    pin = git(root, "rev-parse", ":openvmm").stdout.strip()
+    if not pin or git(submodule, "cat-file", "-e", f"{pin}^{{commit}}").returncode:
+        test.skipTest(
+            f"the OpenVMM submodule lacks its pinned revision {pin or '(unknown)'}"
+        )
+    shown = git(submodule, "show", f"{pin}:{path}")
+    test.assertEqual(shown.returncode, 0, f"{path} at {pin}: {shown.stderr}")
+    return shown.stdout
 
 
 class FieldParsingTests(unittest.TestCase):
@@ -136,22 +247,38 @@ class FieldParsingTests(unittest.TestCase):
         self.assertIsNone(name(183, 1))
         self.assertIsNone(name(1, 1, "AuthenticAMD"))
         # Milan's profile serves every stepping of AMD's family 25 model 1,
-        # Milan-X's 2 included, and no other vendor's CPU with its signature.
-        for stepping in (0, 1, 2, 15):
-            generation = time_abi.cpu_generation("AuthenticAMD", 25, 1, stepping)
-            assert generation is not None
-            self.assertEqual(generation.name, "milan")
+        # Milan-X's 2 included, Genoa's every stepping of model 17, and
+        # Turin's every stepping of family 26 model 2, and none of them
+        # another vendor's CPU with its signature.
+        for family, model, expected in (
+            (25, 1, "milan"),
+            (25, 17, "genoa"),
+            (26, 2, "turin"),
+        ):
+            for stepping in (0, 1, 2, 15):
+                generation = time_abi.cpu_generation(
+                    "AuthenticAMD", family, model, stepping
+                )
+                assert generation is not None
+                self.assertEqual(generation.name, expected)
+        # Vermeer and Raphael (Ryzen), Turin Dense, and Granite Ridge have no
+        # profile, and neither has another vendor's CPU with the signature of
+        # an AMD generation.
         for vendor, family, model in (
-            ("AuthenticAMD", 25, 17),
             ("AuthenticAMD", 25, 33),
+            ("AuthenticAMD", 25, 97),
+            ("AuthenticAMD", 26, 17),
+            ("AuthenticAMD", 26, 68),
             ("GenuineIntel", 25, 1),
             ("HygonGenuine", 25, 1),
+            ("GenuineIntel", 26, 2),
         ):
             with self.subTest(vendor=vendor, family=family, model=model):
                 self.assertIsNone(time_abi.cpu_generation(vendor, family, model, 1))
 
     def test_names_the_catalog_profiles(self):
-        # One profile per generation serves every backend.
+        # Each generation's latest profile, which auto selects, serves every
+        # backend.
         self.assertEqual(
             [generation.profile_id for generation in time_abi.CPU_GENERATIONS],
             [
@@ -160,12 +287,19 @@ class FieldParsingTests(unittest.TestCase):
                 "intel.emeraldrapids.v1",
                 "intel.alderlake.v1",
                 "amd.milan.v1",
+                "amd.genoa.v2",
+                "amd.turin.v1",
             ],
         )
+        # A generation is the CPUs that it covers, whatever its profile's
+        # revision.
+        genoa = time_abi.cpu_generation("AuthenticAMD", 25, 17, 1)
+        assert genoa is not None
+        self.assertEqual(dataclasses.replace(genoa, revision=1), genoa)
         self.assertEqual(
             time_abi.describe_cpu_generations(),
             "skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids 6/207, "
-            "alderlake 6/151 and 6/154, milan 25/1",
+            "alderlake 6/151 and 6/154, milan 25/1, genoa 25/17, turin 26/2",
         )
 
     def test_the_catalog_copy_matches_openvmm_pinned_profiles(self):
@@ -203,15 +337,21 @@ class FieldParsingTests(unittest.TestCase):
         )
         assert listing is not None
         pinned: dict[str, tuple[str, str, tuple[tuple[int, int, range], ...]]] = {}
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        checkout = Path(temporary.name)
+        profiles = checkout / time_abi.OPENVMM_CPU_PROFILES
+        profiles.mkdir(parents=True)
         for path in sorted(listing.split("\0")):
             if not path.endswith(".json"):
                 continue
             content = git(submodule, "show", f"{pin}:{path}")
             assert content is not None
+            (profiles / Path(path).name).write_text(content, encoding="utf-8")
             document = json.loads(content)
             generation = document["generation"]
-            # Keyed by profile ID, so that a second pinned revision of a
-            # generation fails the comparison instead of replacing the first.
+            # Keyed by profile ID, so that a revision that the copy lacks fails
+            # the comparison instead of replacing another.
             pinned[document["id"]] = (
                 generation["name"],
                 document["vendor"],
@@ -225,8 +365,11 @@ class FieldParsingTests(unittest.TestCase):
                 ),
             )
         self.assertTrue(pinned)
+        # OpenVMM keeps every earlier revision of a generation's profile
+        # pinned.
         copy = {
-            generation.profile_id: (
+            f"{time_abi.PROFILE_VENDORS[generation.vendor]}.{generation.name}"
+            f".v{revision}": (
                 generation.name,
                 generation.vendor,
                 tuple(
@@ -234,8 +377,110 @@ class FieldParsingTests(unittest.TestCase):
                 ),
             )
             for generation in time_abi.CPU_GENERATIONS
+            for revision in range(1, generation.revision + 1)
         }
         self.assertEqual(copy, pinned)
+        # benchmark reads the same generations from these documents, as it
+        # reads them from the OpenVMM checkout that it builds.
+        self.assertEqual(
+            set(time_abi.openvmm_cpu_generations(checkout)),
+            set(time_abi.CPU_GENERATIONS),
+        )
+
+    def test_reads_the_cpu_profiles_of_an_openvmm_checkout(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name)
+        icelake, alderlake = time_abi.CPU_GENERATIONS[1], time_abi.CPU_GENERATIONS[3]
+        granite_rapids = time_abi.CpuGeneration(
+            "graniterapids", "GenuineIntel", (time_abi.CpuModel(6, 173),)
+        )
+        checkout = write_openvmm_profiles(
+            directory / "openvmm", icelake, alderlake, granite_rapids
+        )
+        # A second revision of a generation's profile adds no generation.
+        write_openvmm_profiles(checkout, icelake, revision=2)
+        generations = time_abi.openvmm_cpu_generations(checkout)
+        self.assertEqual(set(generations), {icelake, alderlake, granite_rapids})
+        self.assertEqual(len(generations), 3)
+        # A CPU that only the checkout's profiles cover is benchmarked with
+        # them, and not with NVX's copy of the catalog.
+        granite_rapids_host = time_abi.HostCpu("GenuineIntel", 6, 173, 1)
+        self.assertIsNone(
+            time_abi.benchmark_cpu_profile_refusal(
+                granite_rapids_host, "openvmm", "kvm", generations
+            )
+        )
+        self.assertIsNotNone(
+            time_abi.benchmark_cpu_profile_refusal(
+                granite_rapids_host, "openvmm", "kvm"
+            )
+        )
+        # A checkout that pins no profile, and a malformed profile, are errors,
+        # naming the checkout or the profile.
+        with self.assertRaisesRegex(ValueError, "pins no CPU profile"):
+            time_abi.openvmm_cpu_generations(directory / "empty")
+        valid = {
+            "vendor": "GenuineIntel",
+            "generation": {
+                "name": "icelake-sp",
+                "cpus": [{"family": 6, "model": 106, "steppings": [0, 15]}],
+            },
+        }
+        cases: tuple[tuple[str, object, str], ...] = (
+            ("not-json", None, "cannot read the CPU profile .*not-json.json"),
+            ("list", [], "it is not a JSON object"),
+            ("no-generation", {"vendor": "GenuineIntel"}, "names no vendor"),
+            (
+                "no-cpus",
+                {**valid, "generation": {"name": "icelake-sp", "cpus": []}},
+                "names no CPU models",
+            ),
+            (
+                "stepping-pair",
+                {
+                    **valid,
+                    "generation": {
+                        "name": "icelake-sp",
+                        "cpus": [{"family": 6, "model": 106, "steppings": [3]}],
+                    },
+                },
+                "not a first and a last",
+            ),
+            (
+                "stepping-order",
+                {
+                    **valid,
+                    "generation": {
+                        "name": "icelake-sp",
+                        "cpus": [{"family": 6, "model": 106, "steppings": [9, 3]}],
+                    },
+                },
+                "steppings 9 to 3 are not a range",
+            ),
+            (
+                "boolean-family",
+                {
+                    **valid,
+                    "generation": {
+                        "name": "icelake-sp",
+                        "cpus": [{"family": True, "model": 106, "steppings": [0, 1]}],
+                    },
+                },
+                "its family is not an integer",
+            ),
+        )
+        for name, document, message in cases:
+            with self.subTest(name=name):
+                malformed = directory / name
+                profiles = malformed / time_abi.OPENVMM_CPU_PROFILES
+                profiles.mkdir(parents=True)
+                (profiles / f"{name}.json").write_text(
+                    "{" if document is None else json.dumps(document),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    time_abi.openvmm_cpu_generations(malformed)
 
     def test_tells_catalog_profiles_from_host_profiles(self):
         for profile_id, catalog, host in (
@@ -256,78 +501,246 @@ class FieldParsingTests(unittest.TestCase):
                 self.assertEqual(time_abi.is_catalog_profile_id(profile_id), catalog)
                 self.assertEqual(time_abi.is_host_profile_id(profile_id), host)
 
-    def test_guides_hosts_that_no_built_in_profile_serves(self):
-        tiger_lake = time_abi.HostCpu("GenuineIntel", 6, 140, 1)
-        guidance = time_abi.host_cpu_unsupported_guidance(None, tiger_lake)
-        assert guidance is not None
-        # The guidance says what a cold boot with auto does on the CPU, not
-        # which code ended this run, which run cannot read.
-        self.assertIn(
-            "this host's CPU, GenuineIntel 6/140/1, so a cold boot with "
-            "--cpu-profile auto, the default, fails on it with "
-            "E_PROFILE_HOST_UNKNOWN;",
-            guidance,
+    def test_names_cpus_and_prefills_cpu_profile_requests(self):
+        granite_rapids = time_abi.HostCpu(
+            "GenuineIntel", 6, 173, 1, "Intel(R) Xeon(R) 6973P-C"
         )
-        self.assertIn(time_abi.describe_cpu_generations(), guidance)
-        self.assertIn("rerun with --cpu-profile host", guidance)
-        self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+        self.assertEqual(granite_rapids.signature(), "GenuineIntel 6/173/1")
         self.assertEqual(
-            guidance, time_abi.host_cpu_unsupported_guidance("auto", tiger_lake)
+            granite_rapids.describe(), "GenuineIntel 6/173/1 (Intel(R) Xeon(R) 6973P-C)"
         )
-        # Host profiles serve Intel CPUs, so a host profile fails on this one
-        # for another reason, which OpenVMM's own error explains.
-        self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", tiger_lake))
-
-        # Host profiles serve AMD CPUs too: an AMD CPU without a built-in
-        # profile, such as Genoa, gets the same suggestion as an Intel one,
-        # and the issue that tracks profiles for more AMD CPUs.
-        genoa = time_abi.HostCpu("AuthenticAMD", 25, 17, 1)
-        guidance = time_abi.host_cpu_unsupported_guidance(None, genoa)
-        assert guidance is not None
-        self.assertIn(
-            "this host's CPU, AuthenticAMD 25/17/1, so a cold boot with "
-            "--cpu-profile auto, the default, fails on it with "
-            "E_PROFILE_HOST_UNKNOWN;",
-            guidance,
-        )
-        self.assertIn(time_abi.describe_cpu_generations(), guidance)
-        self.assertIn("rerun with --cpu-profile host", guidance)
-        self.assertIn("https://github.com/microsoft/nvx/issues/396", guidance)
-        self.assertNotIn("issues/390", guidance)
-        self.assertIsNone(time_abi.host_cpu_unsupported_guidance("host", genoa))
-        # Another vendor gets no suggestion, with either request.
-        hygon = time_abi.HostCpu("HygonGenuine", 24, 0, 1)
-        guidance = time_abi.host_cpu_unsupported_guidance("auto", hygon)
-        assert guidance is not None
-        self.assertNotIn("rerun with", guidance)
-        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", guidance)
-        self.assertIn("https://github.com/microsoft/nvx/issues/390", guidance)
+        # The link that OpenVMM's fallback warning gives the same CPU
+        # (openvmm_core's time_abi tests).
         self.assertEqual(
-            guidance, time_abi.host_cpu_unsupported_guidance("host", hygon)
+            time_abi.cpu_profile_request_url(granite_rapids),
+            "https://github.com/microsoft/nvx/issues/new?template=cpu-profile.yml"
+            "&title=CPU%20profile%3A%20GenuineIntel%206%2F173%2F1%20%28Intel%28R%29"
+            "%20Xeon%28R%29%206973P-C%29&signature=GenuineIntel%206%2F173%2F1"
+            "&cpu=Intel%28R%29%20Xeon%28R%29%206973P-C",
+        )
+        # A CPU without a brand string prefills only its signature.
+        brandless = time_abi.HostCpu("GenuineIntel", 6, 173, 1)
+        self.assertEqual(brandless.describe(), "GenuineIntel 6/173/1")
+        self.assertEqual(
+            time_abi.cpu_profile_request_url(brandless),
+            f"{time_abi.CPU_PROFILE_REQUEST_URL}&title=CPU%20profile%3A%20"
+            "GenuineIntel%206%2F173%2F1&signature=GenuineIntel%206%2F173%2F1",
+        )
+        self.assertIn(
+            "%26%3D%3F%23%25%2B",
+            time_abi.cpu_profile_request_url(
+                time_abi.HostCpu("GenuineIntel", 6, 173, 1, "&=?#%+")
+            ),
         )
 
-        # A CPU that a built-in profile serves, an explicit profile, and an
-        # unknown CPU get none.
-        alder_lake = time_abi.HostCpu("GenuineIntel", 6, 154, 3)
-        milan = time_abi.HostCpu("AuthenticAMD", 25, 1, 1)
-        for cpu_profile, host in (
-            (None, alder_lake),
-            ("host", alder_lake),
-            (None, milan),
-            ("host", milan),
-            ("intel.alderlake.v1", tiger_lake),
-            ("intel.alderlake.v1", genoa),
-            ("intel.skylake-sp.v1", milan),
-            (None, None),
+    def test_parses_the_cpu_profile_fallback_warning(self):
+        digest = "ab" * 32
+        warning = (
+            "   0.012345s  WARN openvmm_core::worker::dispatch::time_abi: "
+            "NVX-CPU-PROFILE-FALLBACK: no built-in CPU profile serves this host's "
+            "CPU, GenuineIntel 6/173/1 (Intel(R) Xeon(R) 6973P-C), so --cpu-profile "
+            f"auto fell back to intel.host.v1 (sha256:{digest}), a profile derived "
+            "from this host's kvm backend for development.\n"
+            "It is not pinned: a microcode, firmware, hypervisor, or OS update can "
+            "change it.\n"
+        )
+        self.assertEqual(time_abi.parse_cpu_profile_fallback(warning), "intel.host.v1")
+        self.assertEqual(
+            time_abi.parse_cpu_profile_fallback(
+                warning.replace("intel.host.v1", "amd.host.v1")
+            ),
+            "amd.host.v1",
+        )
+        self.assertIsNone(time_abi.parse_cpu_profile_fallback("no warning\n"))
+        for output, message in (
+            (warning + warning, "logged 2 NVX-CPU-PROFILE-FALLBACK: warnings"),
+            (warning.replace("intel.host.v1", "intel.icelake-sp.v1"), "malformed"),
+            (warning.replace(f"sha256:{digest}", "sha256:ab"), "malformed"),
+            (warning.replace("fell back to", "selected"), "malformed"),
         ):
-            with self.subTest(cpu_profile=cpu_profile, host=host):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    time_abi.parse_cpu_profile_fallback(output)
+
+    def test_benchmark_refuses_cpus_that_no_built_in_profile_serves(self):
+        granite_rapids = time_abi.HostCpu(
+            "GenuineIntel", 6, 173, 1, "Intel(R) Xeon(R) 6973P-C"
+        )
+        refusal = time_abi.benchmark_cpu_profile_refusal(
+            granite_rapids, "openvmm", "kvm"
+        )
+        assert refusal is not None
+        self.assertTrue(
+            refusal.startswith(
+                "benchmark refuses this host: no built-in CPU profile serves its CPU, "
+                "GenuineIntel 6/173/1 (Intel(R) Xeon(R) 6973P-C), so --cpu-profile "
+                "auto would fall back to a CPU profile derived from this host, whose "
+                "every cold boot fingerprints the hypervisor first"
+            ),
+            refusal,
+        )
+        self.assertIn(time_abi.describe_cpu_generations(), refusal)
+        self.assertIn(
+            "\n  openvmm --hypervisor kvm --cpu-fingerprint fingerprint.json\n", refusal
+        )
+        self.assertTrue(
+            refusal.endswith(time_abi.cpu_profile_request_url(granite_rapids)), refusal
+        )
+        # Another vendor's CPU cannot boot at all, and gets no request form.
+        hygon = time_abi.benchmark_cpu_profile_refusal(
+            time_abi.HostCpu("HygonGenuine", 24, 0, 1), "openvmm", "kvm"
+        )
+        assert hygon is not None
+        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", hygon)
+        self.assertIn("E_PROFILE_HOST_UNKNOWN", hygon)
+        self.assertNotIn("github.com", hygon)
+        # A CPU that cannot be identified is refused too: OpenVMM, which reads
+        # the CPU itself, could fall back on it.
+        unknown = time_abi.benchmark_cpu_profile_refusal(None, "openvmm", "kvm")
+        assert unknown is not None
+        self.assertTrue(
+            unknown.startswith(
+                "benchmark refuses this host: it cannot identify the host's CPU"
+            ),
+            unknown,
+        )
+        # Its vendor is unknown too, so the refusal qualifies the fallback by
+        # vendor.
+        self.assertIn(
+            "On an Intel or AMD CPU that none serves, --cpu-profile auto falls "
+            "back to a CPU profile",
+            unknown,
+        )
+        self.assertIn(
+            "on another vendor's CPU, every cold boot fails with "
+            f"{time_abi.PROFILE_HOST_UNKNOWN}",
+            unknown,
+        )
+        # A CPU that a built-in profile serves is benchmarked.
+        for host in (
+            time_abi.HostCpu("GenuineIntel", 6, 106, 6),
+            time_abi.HostCpu("AuthenticAMD", 25, 1, 1),
+        ):
+            with self.subTest(host=host):
                 self.assertIsNone(
-                    time_abi.host_cpu_unsupported_guidance(cpu_profile, host)
+                    time_abi.benchmark_cpu_profile_refusal(host, "openvmm", "whp")
                 )
+        # The profiles that decide are those of the OpenVMM that benchmark
+        # builds: one that adds a profile for a CPU serves it, and one that
+        # lacks a profile refuses its CPU, listing its own profiles.
+        graniterapids = time_abi.CpuGeneration(
+            "graniterapids", "GenuineIntel", (time_abi.CpuModel(6, 173),)
+        )
+        self.assertIsNone(
+            time_abi.benchmark_cpu_profile_refusal(
+                granite_rapids,
+                "openvmm",
+                "kvm",
+                (*time_abi.CPU_GENERATIONS, graniterapids),
+            )
+        )
+        icelake = time_abi.HostCpu("GenuineIntel", 6, 106, 6)
+        refusal = time_abi.benchmark_cpu_profile_refusal(
+            icelake, "openvmm", "kvm", (graniterapids,)
+        )
+        assert refusal is not None
+        self.assertIn(
+            "no built-in CPU profile serves its CPU, GenuineIntel 6/106/6", refusal
+        )
+        self.assertIn("The built-in profiles cover graniterapids 6/173.\n", refusal)
+        # A CPU in more than one generation fails every cold boot, because
+        # auto rejects it as a catalog defect without falling back, as OpenVMM
+        # does; revisions of one generation's profile do not make it ambiguous.
+        icelake_x = time_abi.CpuGeneration(
+            "icelake-x", "GenuineIntel", (time_abi.CpuModel(6, 106),)
+        )
+        ambiguous = time_abi.benchmark_cpu_profile_refusal(
+            icelake, "openvmm", "kvm", (*time_abi.CPU_GENERATIONS, icelake_x)
+        )
+        assert ambiguous is not None
+        self.assertTrue(
+            ambiguous.startswith(
+                "benchmark refuses this host: its CPU, GenuineIntel 6/106/6, is in "
+                "more than one generation of the built-in CPU profiles (icelake-sp, "
+                "icelake-x), so every cold boot with --cpu-profile auto fails with "
+                f"{time_abi.PROFILE_HOST_UNKNOWN}."
+            ),
+            ambiguous,
+        )
+        self.assertNotIn("github.com", ambiguous)
+        revised = time_abi.CpuGeneration(
+            "icelake-sp",
+            "GenuineIntel",
+            (time_abi.CpuModel(6, 106), time_abi.CpuModel(6, 108)),
+        )
+        self.assertIsNone(
+            time_abi.benchmark_cpu_profile_refusal(
+                icelake, "openvmm", "kvm", (*time_abi.CPU_GENERATIONS, revised)
+            )
+        )
+
+    def test_cpu_profile_requests_match_openvmm_and_the_issue_form(self):
+        # OpenVMM's fallback warning and NVX link to the same form, which must
+        # define the text fields that the links prefill, and NVX matches the
+        # warning's marker. OpenVMM's constants are read from the gitlink's
+        # commit, as the catalog copy's comparison reads its profiles.
+        root = Path(__file__).resolve().parents[1]
+        form = (root / ".github" / "ISSUE_TEMPLATE" / "cpu-profile.yml").read_text(
+            encoding="utf-8"
+        )
+        fields = re.findall(r"^  - type: (\w+)\n    id: ([\w-]+)$", form, re.MULTILINE)
+        for prefilled in ("cpu", "signature"):
+            self.assertIn(("input", prefilled), fields)
+        self.assertRegex(form, r"(?m)^name: CPU profile request$")
+        self.assertEqual(
+            time_abi.CPU_PROFILE_REQUEST_URL.rpartition("template=")[2],
+            "cpu-profile.yml",
+        )
+
+        submodule = root / "openvmm"
+        if not (submodule / ".git").exists():
+            self.skipTest("the OpenVMM submodule is not initialized")
+        pin = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", ":openvmm"],
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+        ).stdout.strip()
+        source = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(submodule),
+                "show",
+                f"{pin}:openvmm/openvmm_core/src/worker/dispatch/time_abi.rs",
+            ],
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+        )
+        if not pin or source.returncode != 0:
+            self.skipTest(
+                f"the OpenVMM submodule lacks its pinned revision {pin or '(unknown)'}"
+            )
+        constants = dict(
+            re.findall(
+                r'const (FALLBACK_MARKER|CPU_PROFILE_REQUEST_URL): &str =\s*"([^"]*)";',
+                source.stdout,
+            )
+        )
+        self.assertEqual(
+            constants,
+            {
+                "FALLBACK_MARKER": time_abi.CPU_PROFILE_FALLBACK_MARKER,
+                "CPU_PROFILE_REQUEST_URL": time_abi.CPU_PROFILE_REQUEST_URL,
+            },
+        )
+        for key in ("&title=", "&signature=", "&cpu="):
+            self.assertIn(key, source.stdout)
 
     def test_computes_the_checks_cpu_time_budget(self):
-        # The spec's final budgets: a base plus an increment per additional
-        # CPU, one budget per backend and phase.
+        # The final budgets: a base plus an increment per additional CPU, one
+        # budget per backend and phase.
         for backend in ("kvm", "mshv", "whp"):
             self.assertEqual(
                 set(time_abi.CHECK_CPU_BUDGET_US[backend]),
@@ -338,12 +751,12 @@ class FieldParsingTests(unittest.TestCase):
         self.assertEqual(time_abi.check_cpu_budget_us("kvm", "capture", 8), 4_300)
         self.assertEqual(time_abi.check_cpu_budget_us("kvm", "restore", 1), 7_000)
         self.assertEqual(time_abi.check_cpu_budget_us("kvm", "restore", 8), 21_000)
-        # The spec's binding MSHV boot cell: 4 vCPUs (4.94 ms measured).
+        # The binding MSHV boot cell: 4 vCPUs (4.94 ms measured).
         self.assertEqual(time_abi.check_cpu_budget_us("mshv", "boot", 4), 6_000)
         self.assertEqual(time_abi.check_cpu_budget_us("mshv", "restore", 8), 6_000)
         self.assertEqual(time_abi.check_cpu_budget_us("whp", "restore", 1), 35_000)
-        # The spec's binding WHP cells: boot at 2 vCPUs (21.84 ms measured on an
-        # 8573C runner), capture at 1 (0.986 ms), and restore at 4 (42.20 ms).
+        # The binding WHP cells: boot at 2 vCPUs (21.84 ms measured on an 8573C
+        # runner), capture at 1 (0.986 ms), and restore at 4 (42.20 ms).
         self.assertEqual(time_abi.check_cpu_budget_us("whp", "boot", 2), 26_500)
         self.assertEqual(time_abi.check_cpu_budget_us("whp", "capture", 1), 1_200)
         self.assertEqual(time_abi.check_cpu_budget_us("whp", "capture", 2), 1_600)
@@ -1436,6 +1849,45 @@ class RunnerWiringTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no time ABI monitor"):
             openvmm_process.TcpConsole(unmonitored).wait_for_time_abi_status(1.0)
 
+    def test_tcp_console_status_query_consumed_with_restore_milestone(self):
+        class ScriptedConnection:
+            """Returns each scripted chunk from one recv, so the reads do not depend on TCP segmenting."""
+
+            def __init__(self, *chunks: bytes) -> None:
+                self._chunks = list(chunks)
+
+            def settimeout(self, _timeout: float) -> None:
+                pass
+
+            def recv(self, _size: int) -> bytes:
+                if not self._chunks:
+                    raise TimeoutError("scripted console is quiet")
+                return self._chunks.pop(0)
+
+            def close(self) -> None:
+                pass
+
+        monitor = TimeAbiMonitor(MSHV_RESTORE)
+        restore = RESTORE_LINE.replace("lapic_hz=1000000000", "lapic_hz=200000000")
+        # One read carries the milestone and the whole status query after it.
+        connection = ScriptedConnection(
+            (
+                "NVX-SNAPSHOT-TIER-RELEASED\n" + restore + RUNTIME_LINE + STATUS_OK
+            ).encode()
+        )
+        console = openvmm_process.TcpConsole(cast(socket.socket, connection), monitor)
+        baseline = console.status_queries
+        console.wait_for(b"NVX-SNAPSHOT-TIER-RELEASED", 1.0)
+        self.assertEqual(monitor.status_queries, 1)
+        # The query the milestone read consumed counts for a wait since the baseline.
+        console.wait_for_time_abi_status(0.2, since=baseline)
+        self.assertEqual(monitor.status_queries, 1)
+        self.assertEqual(len(monitor.restores), 1)
+        # Without a baseline the wait is for the next query, which never comes.
+        with self.assertRaisesRegex(TimeoutError, "did not exit"):
+            console.wait_for_time_abi_status(0.2)
+        console.close()
+
     def test_tcp_console_queries_only_cold_boots_that_ask(self):
         for command, enabled in (
             (MSHV_RESTORE, True),
@@ -1471,6 +1923,25 @@ def doctor_context(root: Path, backend: str = "kvm") -> doctor.DoctorContext:
 
 def completed(stdout: str, returncode: int = 0, stderr: str = ""):
     return subprocess.CompletedProcess(["x"], returncode, stdout, stderr)
+
+
+# Why a host whose chronyd keeps the kernel's PLL off has no PLL frequency.
+PLL_OFF = "the kernel PLL is off (adjtimex status=0x0000)"
+
+
+class FakeClock:
+    """A monotonic clock that advances only when something sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 CPU = {
@@ -1768,17 +2239,81 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(fields["model"], "85")
         self.assertIn("nonstop_tsc", fields["flags"])
 
+    def test_qualification_rejects_a_host_on_which_auto_falls_back(self):
+        """auto falls back to a host profile on a CPU that no built-in profile
+        serves, but qualification does not: H2's fingerprint check never falls
+        back, and H3 rejects the host profile that OpenVMM's preflight selects,
+        so CI's microVM jobs still require a built-in profile."""
+        granite_rapids = dict(
+            CPU, model="173", stepping="1", brand="Intel(R) Xeon(R) 6973P-C"
+        )
+        fingerprint = self.root / "fingerprint.json"
+        unknown = (
+            "NVX-CPU-PROFILE: status=fail backend=kvm generation=none profile=none "
+            "surface_digest=sha256:1 host_invariant_tsc=yes "
+            'code=E_PROFILE_HOST_UNKNOWN detail="no pinned CPU profile serves '
+            'the host CPU, GenuineIntel family 6 model 173 stepping 1"\n'
+        )
+        fallback = (
+            "NVX-TIME-ABI-VERIFY: v=1 status=ok backend=kvm cpu_profile=intel.host.v1 "
+            "tsc_hz=2793437000 native_tsc_hz=2793437000 lapic_hz=1000000000 "
+            "msr_route=ExitToVmm sync=CommonOffset\n"
+        )
+
+        def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            if "--cpu-fingerprint" in command:
+                return completed("", 1, unknown)
+            return completed(fallback)
+
+        context = doctor_context(self.root)
+        for path in (context.openvmm, context.kernel, context.initrd):
+            path.write_bytes(b"")
+        context.fingerprint = fingerprint
+        with (
+            patch.object(doctor, "host_cpu", return_value=granite_rapids),
+            patch.object(doctor.subprocess, "run", side_effect=run),
+            contextlib.redirect_stdout(io.StringIO()) as lines,
+        ):
+            cpu, preflight = doctor.run_checks(context, ("H2", "H3"))
+        self.assertIn("NVX-DOCTOR: check=H2 status=fail", lines.getvalue())
+        self.assertIn("NVX-DOCTOR: check=H3 status=fail", lines.getvalue())
+        self.assertEqual((cpu.check, cpu.passed), ("H2", False))
+        self.assertTrue(cpu.detail.startswith("[E_PROFILE_HOST_UNKNOWN] "), cpu.detail)
+        self.assertEqual((preflight.check, preflight.passed), ("H3", False))
+        self.assertIn(
+            "cpu_profile=intel.host.v1 (a host profile, to which --cpu-profile auto "
+            "falls back",
+            preflight.detail,
+        )
+        # Without OpenVMM, NVX's copy of the catalog fails the CPU too.
+        context.fingerprint = None
+        with patch.object(doctor, "host_cpu", return_value=granite_rapids):
+            result = doctor.check_cpu(context)
+        self.assertFalse(result.passed)
+        self.assertTrue(result.detail.startswith("[E_PROFILE_HOST_UNKNOWN] "))
+
     def test_identifies_the_host_cpu_signature(self):
         HostCpu = time_abi.HostCpu
-        with patch.object(doctor, "host_is_windows", return_value=True):
+        brand = "12th Gen Intel(R) Core(TM) i9-12900H"
+
+        def registry(key: str, name: str) -> object:
+            self.assertEqual(
+                (key, name), (doctor.WINDOWS_PROCESSOR_KEY, "ProcessorNameString")
+            )
+            return f"{brand}  "
+
+        with (
+            patch.object(doctor, "host_is_windows", return_value=True),
+            patch.object(doctor, "_windows_registry_value", side_effect=registry),
+        ):
             for processor, expected in (
                 (
                     "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
-                    HostCpu("GenuineIntel", 6, 154, 3),
+                    HostCpu("GenuineIntel", 6, 154, 3, brand),
                 ),
                 (
                     "AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD",
-                    HostCpu("AuthenticAMD", 25, 33, 0),
+                    HostCpu("AuthenticAMD", 25, 33, 0, brand),
                 ),
                 ("", None),
             ):
@@ -1787,6 +2322,21 @@ class DoctorTests(unittest.TestCase):
                     patch.object(doctor.platform, "processor", return_value=processor),
                 ):
                     self.assertEqual(doctor.host_cpu_signature(), expected)
+        # A brand string that the registry lacks leaves the signature.
+        with (
+            patch.object(doctor, "host_is_windows", return_value=True),
+            patch.object(
+                doctor.platform,
+                "processor",
+                return_value="Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+            ),
+            patch.object(
+                doctor, "_windows_registry_value", side_effect=OSError("no value")
+            ),
+        ):
+            self.assertEqual(
+                doctor.host_cpu_signature(), HostCpu("GenuineIntel", 6, 154, 3)
+            )
         cpuinfo = {
             "vendor_id": "AuthenticAMD",
             "cpu family": "25",
@@ -1796,6 +2346,12 @@ class DoctorTests(unittest.TestCase):
         with patch.object(doctor, "host_is_windows", return_value=False):
             for fields, expected in (
                 (cpuinfo, HostCpu("AuthenticAMD", 25, 17, 1)),
+                (
+                    {**cpuinfo, "model name": "AMD EPYC 9V74 80-Core Processor"},
+                    HostCpu(
+                        "AuthenticAMD", 25, 17, 1, "AMD EPYC 9V74 80-Core Processor"
+                    ),
+                ),
                 ({**cpuinfo, "model": "?"}, None),
                 ({"vendor_id": "AuthenticAMD"}, None),
             ):
@@ -1885,11 +2441,13 @@ class DoctorTests(unittest.TestCase):
                 completed(line.replace("intel.icelake-sp.v1", "interim.host.kvm.v1")),
                 "verified no catalog CPU profile: cpu_profile=interim.host.kvm.v1",
             ),
-            # Qualification never accepts a host profile.
+            # Qualification never accepts a host profile, such as the one to
+            # which auto falls back on a CPU that no built-in profile serves.
             (
                 completed(line.replace("intel.icelake-sp.v1", "intel.host.v1")),
                 "verified no catalog CPU profile: cpu_profile=intel.host.v1 (a host "
-                "profile, which qualification never accepts)",
+                "profile, to which --cpu-profile auto falls back on a CPU that no "
+                "built-in profile serves, and which qualification never accepts)",
             ),
         )
         for result_value, message in cases:
@@ -1937,6 +2495,36 @@ class DoctorTests(unittest.TestCase):
             result = doctor.check_openvmm_preflight(context_with_files())
         self.assertTrue(result.passed, result.detail)
 
+    def test_the_rate_limit_is_the_guests_frequency_budget(self):
+        # #1008: H4's limit is what the guest's wall-clock discipline leaves
+        # for the host's clock correction: Linux's frequency limit, to which
+        # nvx-rs clamps the correction, less a restore's rate deviation,
+        # which nvx-rs's restore packet decoder bounds by the time ABI's
+        # restore tolerance, the one that OpenVMM's rate policy applies.
+        root = Path(__file__).resolve().parents[1]
+        decoders = rust_integer_constants(
+            (root / "nvx-rs" / "src" / "guest" / "time" / "decoders.rs").read_text(
+                encoding="utf-8"
+            )
+        )
+        scaled_ppm = decoders["SCALED_PPM"]
+        self.assertEqual(scaled_ppm, 1 << 16)
+        self.assertEqual(
+            decoders["FREQUENCY_LIMIT"], doctor.GUEST_FREQUENCY_LIMIT_PPM * scaled_ppm
+        )
+        self.assertEqual(
+            decoders["RATE_DEVIATION_LIMIT"], doctor.RESTORE_TOLERANCE_PPM * scaled_ppm
+        )
+        self.assertEqual(
+            doctor.RATE_TOLERANCE_PPM,
+            (decoders["FREQUENCY_LIMIT"] - decoders["RATE_DEVIATION_LIMIT"])
+            / scaled_ppm,
+        )
+        rate = rust_integer_constants(
+            pinned_openvmm_file(self, "vmm_core/virt/src/time_abi/rate.rs")
+        )
+        self.assertEqual(rate["TSC_TOLERANCE_PPM"], doctor.RESTORE_TOLERANCE_PPM)
+
     def test_rate_check_applies_the_spec_bounds_to_sleep_separated_samples(self):
         def records(
             rates: list[float],
@@ -1977,13 +2565,38 @@ class DoctorTests(unittest.TestCase):
             probe_records: list[tuple[str, dict[str, str]]],
             clocksource: str = "tsc",
             windows: bool = False,
+            chrony: doctor.ChronyFrequency
+            | str
+            | Sequence[doctor.ChronyFrequency | str] = "chronyc is not installed",
+            clock: FakeClock | None = None,
+            kernel: doctor.KernelFrequency | str = PLL_OFF,
+            boot: doctor.BootCorrection | None = None,
         ) -> doctor.CheckResult:
+            """Run H4; a list of chronyd readings answers its re-reads too."""
+            clock = clock or FakeClock()
+            readings = chrony if isinstance(chrony, list | tuple) else None
             with (
                 patch.object(doctor, "run_probe", return_value=probe_records) as run,
                 patch.object(doctor, "host_clocksource", return_value=clocksource),
                 patch.object(doctor, "host_is_windows", return_value=windows),
+                patch.object(
+                    doctor,
+                    "chrony_frequency",
+                    return_value=None if readings else chrony,
+                    side_effect=readings,
+                ) as frequency,
+                patch.object(doctor, "kernel_frequency", return_value=kernel) as pll,
+                patch.object(doctor, "boot_correction", return_value=boot) as average,
+                patch.object(doctor.time, "monotonic", clock.monotonic),
+                patch.object(doctor.time, "sleep", clock.sleep),
             ):
                 result = doctor.check_rate(context)
+            # Windows reads QueryPerformanceCounter, which no daemon steers.
+            self.assertEqual(frequency.called, not windows)
+            self.assertEqual(average.called, not windows)
+            # H4 reads the kernel's PLL only without chronyd's estimate.
+            first = readings[0] if readings else chrony
+            self.assertEqual(pll.called, not windows and isinstance(first, str))
             self.assertEqual(
                 run.call_args.args[1:],
                 (
@@ -1993,6 +2606,16 @@ class DoctorTests(unittest.TestCase):
                     "--interval-ms",
                     str(context.schedule.rate_interval_ms),
                 ),
+            )
+            # The probe sleeps through its sampling window, which the timeout
+            # allows on top of --timeout (120 s on the qualification schedule).
+            self.assertEqual(
+                run.call_args.kwargs,
+                {
+                    "duration": (context.schedule.rate_samples - 1)
+                    * context.schedule.rate_interval_ms
+                    / 1000
+                },
             )
             return result
 
@@ -2012,10 +2635,16 @@ class DoctorTests(unittest.TestCase):
             "0.125 ppm, largest interval uncertainty 0.004 ppm",
             result.detail,
         )
-        self.assertIn("0.0 ppm from the backend's 2793437000 Hz", result.detail)
+        self.assertIn("0.013 ppm from the backend's 2793437000 Hz", result.detail)
         self.assertIn("host clocksource tsc (evidence)", result.detail)
+        self.assertIn(
+            "no chronyd frequency estimate: chronyc is not installed (evidence); "
+            f"no kernel PLL frequency: {PLL_OFF} (evidence)",
+            result.detail,
+        )
         self.assertEqual(context.facts["rate_agreement_ppm"], "0.125")
-        self.assertEqual(context.facts["rate_deviation_ppm"], "0.0")
+        self.assertEqual(context.facts["rate_deviation_ppm"], "0.013")
+        self.assertEqual(context.facts["rate_reference"], "CLOCK_MONOTONIC")
         # chrony steers CLOCK_MONOTONIC's rate by ppm between seconds, which
         # says nothing about the TSC: the undisciplined clock judges stability,
         # and the disciplined one the rate.
@@ -2026,7 +2655,7 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(result.passed, result.detail)
         self.assertIn("agree within 0.000 ppm", result.detail)
         self.assertEqual(context.facts["measured_tsc_hz"], "2300000867")
-        self.assertIn("0.4 ppm from the backend's 2300000000 Hz", result.detail)
+        self.assertIn("0.377 ppm from the backend's 2300000000 Hz", result.detail)
         # CI's short schedule; Windows reads QueryPerformanceCounter, which time
         # synchronization never steers, in both roles. Its 100 ns tick keeps a
         # 1 s interval conclusive at 0.1 ppm.
@@ -2071,7 +2700,7 @@ class DoctorTests(unittest.TestCase):
                 records([2793437000.0] * 2, interval_s=1.0, bracket=400),
                 "inconclusive: an interval's uncertainty is 0.401 ppm > 0.25 ppm",
             ),
-            (records([2794000000.0] * 12), "201.5 ppm from the measured rate"),
+            (records([2794200000.0] * 12), "273.140 ppm from the measured rate"),
             (records([100_000_000.0] * 12), "[E_TSC_RATE_IMPLAUSIBLE]"),
         ):
             with self.subTest(message=message):
@@ -2104,6 +2733,450 @@ class DoctorTests(unittest.TestCase):
         standalone = check(ci_context(), records([2300000100.0] * 2, interval_s=1.0))
         self.assertTrue(standalone.passed, standalone.detail)
         self.assertIn("not compared with the backend's rate", standalone.detail)
+        # #768: on azure-mshv-1, whose host clock jumps, chronyd slewed
+        # CLOCK_MONOTONIC so that a 2 s window read 946.1 ppm, while the
+        # TSC ran at its usual rate, 44 ppm from the declared one, against
+        # chronyd's frequency estimate.
+        slewed = records(
+            [2300000000.0] * 2, disciplined=[2302176486.0] * 2, interval_s=1.0
+        )
+        estimate = doctor.ChronyFrequency("PHC0", 44.3, 4.2)
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, slewed, chrony=estimate)
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn(
+            "tsc_hz=2300101895 against CLOCK_MONOTONIC_RAW corrected by chronyd's "
+            "frequency estimate of +44.300 ppm (skew 4.200 ppm, reference PHC0) "
+            "from 3 samples 1 s apart",
+            result.detail,
+        )
+        self.assertIn("44.082 ppm from the backend's 2300000507 Hz", result.detail)
+        self.assertIn(
+            "2302176486 Hz against CLOCK_MONOTONIC, which chronyd also slews "
+            "(evidence)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["measured_tsc_hz"], "2300101895")
+        self.assertEqual(
+            context.facts["rate_reference"], "chronyd +44.300 ppm (skew 4.200 ppm)"
+        )
+        # Without chronyd's estimate or a kernel PLL, the slewed window is all
+        # H4 can measure; a chronyd that isn't synchronized leaves the kernel
+        # clock unsynchronized too.
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        unsynchronized = (
+            "the kernel clock is not synchronized (adjtimex state=5 status=0x0041)"
+        )
+        result = check(
+            context,
+            slewed,
+            chrony="chronyd is not synchronized",
+            kernel=unsynchronized,
+        )
+        self.assertFalse(result.passed)
+        self.assertIn(
+            "the backend rate is 946.078 ppm from the measured rate (limit 250 ppm)",
+            result.detail,
+        )
+        self.assertIn(
+            "no chronyd frequency estimate: chronyd is not synchronized (evidence); "
+            f"no kernel PLL frequency: {unsynchronized} (evidence)",
+            result.detail,
+        )
+        # #1008: a kernel PLL that another time service drives, such as
+        # systemd-timesyncd, keeps its frequency estimate apart from the
+        # offsets that it slews, so H4 corrects CLOCK_MONOTONIC_RAW by that
+        # instead of reading the slewed window.
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, slewed, kernel=doctor.KernelFrequency(-44.3))
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn(
+            "tsc_hz=2300101895 against CLOCK_MONOTONIC_RAW corrected by the kernel "
+            "PLL's frequency of -44.300 ppm from 3 samples 1 s apart",
+            result.detail,
+        )
+        self.assertIn("44.082 ppm from the backend's 2300000507 Hz", result.detail)
+        self.assertIn(
+            "no chronyd frequency estimate: chronyc is not installed (evidence); "
+            "2302176486 Hz against CLOCK_MONOTONIC, which the kernel PLL also slews "
+            "(evidence)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["rate_reference"], "kernel PLL -44.300 ppm")
+        # #1008: the average correction since boot, CLOCK_MONOTONIC_RAW's rate
+        # against CLOCK_MONOTONIC over the uptime, averages the reference's
+        # wander out. On azure-mshv-1, it read +43.559 ppm over 38.5 h while
+        # chronyd's estimate wandered. It is evidence only.
+        boot = doctor.BootCorrection(43.559, 138_435.1)
+        average = (
+            "2300100190 Hz against CLOCK_MONOTONIC_RAW corrected by the average "
+            "correction since boot, +43.559 ppm over 38.5 h"
+        )
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        wandering = doctor.ChronyFrequency("PHC0", 189.3, 1)
+        result = check(context, slewed, chrony=wandering, boot=boot)
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn("189.115 ppm from the backend's 2300000507 Hz", result.detail)
+        self.assertIn(
+            f"; {average}, 43.340 ppm from the backend's rate (evidence)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["boot_correction"], "+43.559 ppm over 38.5 h")
+        # Without H3, it has no rate to compare.
+        result = check(ci_context("mshv"), slewed, chrony=wandering, boot=boot)
+        self.assertIn(f"; {average} (evidence)", result.detail)
+        # chronyd's estimate gates the backend's rate, whatever the window
+        # reads, and its skew bounds the estimate: the rate passes only when
+        # every rate within the skew lies within the limit.
+        steady = records([2300000000.0] * 2, interval_s=1.0)
+        for estimate, declared, passed, message in (
+            (
+                doctor.ChronyFrequency("PHC0", 80, 10),
+                "2300000507",
+                True,
+                "79.786 ppm from the",
+            ),
+            # #1008: the 100 ppm of the time ABI v1 bounded the TSC's error
+            # alone, which a measurement can't tell from the reference's
+            # wander; azure-mshv-1 failed at +127.9 ppm, 117.3 to 138.6 ppm
+            # within chronyd's skew.
+            (
+                doctor.ChronyFrequency("PHC0", 150, 1),
+                "2300000507",
+                True,
+                "149.802 ppm from the",
+            ),
+            (
+                doctor.ChronyFrequency("PHC0", 240, 15),
+                "2300000507",
+                False,
+                "the measurement is inconclusive: the backend rate is 239.837 ppm "
+                "from the measured rate, 224.830 to 254.845 ppm within chronyd's "
+                "skew of 15.000 ppm, which straddles the limit of 250 ppm",
+            ),
+            (
+                doctor.ChronyFrequency("PHC0", 300, 1),
+                "2300000507",
+                False,
+                "the backend rate is 299.870 ppm from the measured rate, 298.869 "
+                "to 300.870 ppm within chronyd's skew of 1.000 ppm (limit 250 ppm)",
+            ),
+            # The correction isn't linear in the frequency: the estimate's
+            # upper bound, 250 ppm from the declared rate, corrects the rate
+            # by 250.063 ppm, and a range that includes the declared rate
+            # starts at zero.
+            (
+                doctor.ChronyFrequency("PHC0", 0, 250),
+                "2300000000",
+                False,
+                "the measurement is inconclusive: the backend rate is 0.000 ppm "
+                "from the measured rate, 0.000 to 250.063 ppm within chronyd's "
+                "skew of 250.000 ppm, which straddles the limit of 250 ppm",
+            ),
+        ):
+            with self.subTest(estimate=estimate):
+                context = ci_context("mshv")
+                context.facts["native_tsc_hz"] = declared
+                clock = FakeClock()
+                result = check(context, steady, chrony=estimate, clock=clock)
+                self.assertEqual(result.passed, passed, result.detail)
+                self.assertIn(message, result.detail)
+                # Only a deviation that passes above 100 ppm warns.
+                deviation = float(context.facts["rate_deviation_ppm"])
+                self.assertEqual(bool(result.warning), passed and deviation > 100)
+                # A range that straddles the limit stays inconclusive when
+                # chronyd's estimate doesn't move for the 60 s of re-reads.
+                straddles = "straddles" in message
+                self.assertEqual(clock.sleeps, [2.0] * 30 if straddles else [])
+                self.assertEqual(
+                    "no re-read of chronyd's estimate in 60 s was conclusive"
+                    in result.detail,
+                    straddles,
+                )
+        # #1008: a range that straddles the limit makes H4 re-read chronyd's
+        # estimate every 2 s, for up to 60 s, and use the first conclusive
+        # one. On azure-mshv-1, chronyd's estimate read +189.3 ppm with a skew
+        # of 130.6 ppm, and +117.1 ppm with a skew of 55.1 ppm 50 s later.
+        straddling = doctor.ChronyFrequency("PHC0", 189.3, 130.6)
+        for readings, passed, measured, message in (
+            (
+                [
+                    straddling,
+                    straddling,
+                    "chronyc tracking exited 1: 506 Cannot talk to daemon",
+                    doctor.ChronyFrequency("PHC0", 117.1, 55.1),
+                ],
+                True,
+                "2300269362",
+                "116.893 ppm from the backend's 2300000507 Hz; chronyd's first "
+                "estimate, +189.300 ppm (skew 130.600 ppm), straddled the limit, "
+                "so H4 re-read it for 6 s (evidence)",
+            ),
+            # The first conclusive estimate decides, even when it fails.
+            (
+                [straddling, doctor.ChronyFrequency("PHC0", 300, 1)],
+                False,
+                "2300690207",
+                "the backend rate is 299.870 ppm from the measured rate, 298.869 "
+                "to 300.870 ppm within chronyd's skew of 1.000 ppm (limit 250 ppm)",
+            ),
+        ):
+            with self.subTest(readings=readings):
+                context = ci_context("mshv")
+                context.facts["native_tsc_hz"] = "2300000507"
+                clock = FakeClock()
+                result = check(context, steady, chrony=readings, clock=clock)
+                self.assertEqual(result.passed, passed, result.detail)
+                self.assertIn(message, result.detail)
+                self.assertEqual(clock.sleeps, [2.0] * (len(readings) - 1))
+                # The settled +117.1 ppm passes with a warning.
+                self.assertEqual(bool(result.warning), passed)
+                # Only chronyd's estimate changes, so H4 corrects the same
+                # samples by the estimate that it uses.
+                self.assertEqual(context.facts["measured_tsc_hz"], measured)
+                used = cast(doctor.ChronyFrequency, readings[-1])
+                self.assertEqual(
+                    context.facts["rate_reference"],
+                    f"chronyd {used.ppm:+.3f} ppm (skew {used.skew_ppm:.3f} ppm)",
+                )
+        # Without the backend's rate, H4 has no range to re-read for.
+        clock = FakeClock()
+        result = check(ci_context("mshv"), steady, chrony=straddling, clock=clock)
+        self.assertTrue(result.passed, result.detail)
+        self.assertEqual(clock.sleeps, [])
+        # The deviation keeps three decimals, so a failure never reads as the
+        # limit itself: #768's second failure was 100.027 ppm, at the 100 ppm
+        # limit of the time.
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, records([2300575569.0] * 2, interval_s=1.0))
+        self.assertFalse(result.passed)
+        self.assertIn(
+            "the backend rate is 250.027 ppm from the measured rate (limit 250 ppm)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["rate_deviation_ppm"], "250.027")
+        self.assertEqual(result.warning, "")
+        # #1008: above the time ABI v1's 100 ppm, H4 passes with a warning
+        # that leads its detail and says how much of the guest's budget the
+        # host's correction uses; 100 ppm itself doesn't warn.
+        for rate, warning in (
+            (
+                2300230569.0,
+                "the backend rate is 100.027 ppm from the measured rate, more than "
+                "100 ppm: the host's clock correction uses 40% of the guest's "
+                "250 ppm budget, and one run can't tell the TSC's error from the "
+                "reference clock's wander",
+            ),
+            (2300230507.0, ""),
+        ):
+            with self.subTest(rate=rate):
+                context = ci_context("mshv")
+                context.facts["native_tsc_hz"] = "2300000507"
+                result = check(context, records([rate] * 2, interval_s=1.0))
+                self.assertTrue(result.passed, result.detail)
+                self.assertEqual(result.warning, warning)
+                self.assertEqual(
+                    result.detail.startswith(f"warning: {warning}; tsc_hz="),
+                    bool(warning),
+                )
+
+    def test_chrony_frequency_reads_a_synchronized_tracking_report(self):
+        report = (
+            "50484330,PHC0,1,1792707652.172549767,-0.000001016,-0.000001624,"
+            "0.000031799,38.638,-0.024,4.116,0.000000001,0.000059705,8.0,{leap}\n"
+        )
+        chronyc = "/usr/bin/chronyc"
+        with (
+            patch.object(doctor.shutil, "which", return_value=chronyc),
+            patch.object(
+                doctor.subprocess,
+                "run",
+                return_value=completed(report.format(leap="Normal")),
+            ) as run,
+        ):
+            self.assertEqual(
+                doctor.chrony_frequency(),
+                doctor.ChronyFrequency("PHC0", 38.638, 4.116),
+            )
+        self.assertEqual(run.call_args.args[0], [chronyc, "-c", "-n", "tracking"])
+        self.assertEqual(
+            run.call_args.kwargs["timeout"], doctor.CHRONYC_TIMEOUT_SECONDS
+        )
+        unrecognized = "chronyc tracking printed an unrecognized report"
+        for result_value, reason in (
+            (
+                completed(report.format(leap="Not synchronised")),
+                "chronyd is not synchronized",
+            ),
+            (
+                completed("", 1, "506 Cannot talk to daemon\n"),
+                "chronyc tracking exited 1: 506 Cannot talk to daemon",
+            ),
+            (completed("Reference ID : 50484330 (PHC0)\n"), unrecognized),
+            (
+                completed(report.format(leap="Normal").replace("38.638", "nan")),
+                unrecognized,
+            ),
+            (completed(report.format(leap="Normal,extra")), unrecognized),
+            # chronyd's skew is an error bound, never negative.
+            (
+                completed(report.format(leap="Normal").replace("4.116", "-4.116")),
+                unrecognized,
+            ),
+            (subprocess.TimeoutExpired(["chronyc"], 5), "chronyc tracking failed"),
+            (
+                FileNotFoundError(2, "No such file or directory"),
+                "chronyc tracking failed",
+            ),
+        ):
+            with self.subTest(reason=reason, result=result_value):
+                run_patch = (
+                    patch.object(doctor.subprocess, "run", side_effect=result_value)
+                    if isinstance(result_value, BaseException)
+                    else patch.object(
+                        doctor.subprocess, "run", return_value=result_value
+                    )
+                )
+                with (
+                    patch.object(doctor.shutil, "which", return_value=chronyc),
+                    run_patch,
+                ):
+                    frequency = doctor.chrony_frequency()
+                self.assertIsInstance(frequency, str)
+                self.assertIn(reason, cast(str, frequency))
+        with patch.object(doctor.shutil, "which", return_value=None):
+            self.assertEqual(doctor.chrony_frequency(), "chronyc is not installed")
+
+    def test_kernel_frequency_reads_a_synchronized_kernel_pll(self):
+        # adjtimex's state and the status, freq, and tick of its struct timex.
+        def kernel(state: int, status: int, freq: int, tick: int = 10_000):
+            timex = types.SimpleNamespace(status=status, freq=freq, tick=tick)
+            return patch.object(doctor, "_adjtimex", return_value=(state, timex))
+
+        # systemd-timesyncd sets STA_PLL and STA_NANO. The frequency is in ppm
+        # scaled by 2^16, and each microsecond of tick above 10,000 adds
+        # 100 ppm, as chronyd's ticks of 9,999 take 100 ppm away.
+        for tick, ppm in ((10_000, -44.25), (10_001, 55.75), (9_999, -144.25)):
+            with self.subTest(tick=tick), kernel(0, 0x2001, -2_899_968, tick):
+                self.assertEqual(doctor.kernel_frequency(), doctor.KernelFrequency(ppm))
+        for state, status, reason in (
+            # chronyd keeps the PLL off, and slews through the frequency.
+            (0, 0x0000, "the kernel PLL is off (adjtimex status=0x0000)"),
+            (
+                5,
+                0x2041,
+                "the kernel clock is not synchronized (adjtimex state=5 status=0x2041)",
+            ),
+            (
+                5,
+                0x2001,
+                "the kernel clock is not synchronized (adjtimex state=5 status=0x2001)",
+            ),
+            (
+                0,
+                0x0041,
+                "the kernel clock is not synchronized (adjtimex state=0 status=0x0041)",
+            ),
+        ):
+            with self.subTest(state=state, status=status):
+                with kernel(state, status, -2_899_968):
+                    self.assertEqual(doctor.kernel_frequency(), reason)
+        with patch.object(doctor.ctypes, "CDLL", side_effect=OSError("no libc")):
+            self.assertEqual(
+                doctor.kernel_frequency(), "adjtimex is unavailable: no libc"
+            )
+
+    def test_boot_correction_averages_the_clocks_since_boot(self):
+        if sys.platform == "win32":
+            # Windows has no CLOCK_MONOTONIC_RAW, and no daemon steers
+            # QueryPerformanceCounter.
+            self.assertIsNone(doctor.boot_correction())
+            return
+        # azure-mshv-1, 38.5 h after boot: CLOCK_MONOTONIC trailed
+        # CLOCK_MONOTONIC_RAW by 6.03 s.
+        clocks = {
+            time.CLOCK_MONOTONIC_RAW: 138_435_100_000_000,
+            time.CLOCK_MONOTONIC: 138_429_069_887_000,
+        }
+        with patch.object(
+            doctor.time, "clock_gettime_ns", side_effect=clocks.__getitem__
+        ):
+            correction = doctor.boot_correction()
+        assert correction is not None
+        self.assertAlmostEqual(correction.ppm, 43.559, places=3)
+        self.assertEqual(correction.seconds, 138_435.1)
+        # This host's clocks give a finite average over its uptime.
+        correction = doctor.boot_correction()
+        assert correction is not None
+        self.assertTrue(math.isfinite(correction.ppm))
+        self.assertGreater(correction.seconds, 0)
+
+    def test_rate_check_continues_when_the_clocksource_is_unreadable(self):
+        # #507: the host clocksource is evidence only, so an unreadable
+        # sysfs file must not fail H4; the native probe still runs and the
+        # verdict depends on the measurements alone.
+        def records(gaps: tuple[int, int]) -> list[tuple[str, dict[str, str]]]:
+            result: list[tuple[str, dict[str, str]]] = [
+                (
+                    "clock",
+                    {
+                        "role": role,
+                        "name": name,
+                        "hz": "1000000000",
+                        "resolution_ns": "1.000",
+                    },
+                )
+                for role, name in (
+                    ("rate", "CLOCK_MONOTONIC"),
+                    ("stability", "CLOCK_MONOTONIC_RAW"),
+                )
+            ]
+            tsc = 0
+            for index in range(3):
+                sample = {"index": str(index)}
+                for role in ("rate", "stability"):
+                    sample[f"{role}_tsc"] = str(tsc)
+                    sample[f"{role}_clock"] = str(index * 1_000_000_000)
+                    sample[f"{role}_bracket"] = "20"
+                tsc += gaps[min(index, 1)]
+                result.append(("sample", sample))
+            return result
+
+        error = FileNotFoundError(2, "No such file or directory", "/sys/fake")
+        for gaps, passed, marker in (
+            ((3_000_000_000, 3_000_000_000), True, "host clocksource unknown"),
+            ((3_000_000_000, 3_100_000_000), False, "interval rates differ"),
+        ):
+            with self.subTest(passed=passed):
+                context = doctor_context(self.root)
+                context.schedule = doctor.CI_SCHEDULE
+                with (
+                    patch.object(
+                        doctor, "run_probe", return_value=records(gaps)
+                    ) as run,
+                    patch.object(doctor, "host_clocksource", side_effect=error),
+                    patch.object(doctor, "host_is_windows", return_value=False),
+                    patch.object(
+                        doctor,
+                        "chrony_frequency",
+                        return_value="chronyc is not installed",
+                    ),
+                    patch.object(doctor, "kernel_frequency", return_value=PLL_OFF),
+                ):
+                    result = doctor.check_rate(context)
+                self.assertTrue(run.called)
+                self.assertEqual(result.passed, passed, result.detail)
+                self.assertIn(marker, result.detail)
+                self.assertIn("evidence", result.detail)
+                self.assertEqual(
+                    context.facts["host_clocksource"],
+                    f"unknown ({error})",
+                )
 
     def test_host_skew_check_applies_the_bound(self):
         summary = {
@@ -2378,6 +3451,41 @@ class DoctorTests(unittest.TestCase):
         )
         self.assertIn("check=H5 status=pass", stdout.getvalue())
 
+    def test_warnings_reach_the_line_the_summary_and_ci_annotations(self):
+        warning = "the host's clock correction uses 60% of the guest's 250 ppm budget"
+
+        def warned(context: doctor.DoctorContext) -> doctor.CheckResult:
+            del context
+            return doctor.CheckResult(
+                "H4", True, f"warning: {warning}; tsc_hz=2300000000", warning
+            )
+
+        context = doctor_context(self.root, "mshv")
+        results: list[doctor.CheckResult] = []
+        for actions, annotated in (("true", True), ("", False)):
+            with self.subTest(actions=actions):
+                stdout = io.StringIO()
+                with (
+                    patch.dict(doctor.CHECKS, {"H4": warned}),
+                    patch.dict(doctor.os.environ, {"GITHUB_ACTIONS": actions}),
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    results = doctor.run_checks(context, ("H4",))
+                lines = stdout.getvalue().splitlines()
+                # The check passes, and its line states the warning.
+                self.assertEqual(lines[0], results[0].line())
+                self.assertIn('status=pass detail="warning: ', lines[0])
+                # In GitHub Actions, an annotation repeats it, escaped.
+                annotation = (
+                    "::warning title=Time ABI host qualification (mshv)::H4 host TSC "
+                    "rate stability: the host's clock correction uses 60%25 of the "
+                    "guest's 250 ppm budget"
+                )
+                self.assertEqual(lines[1:], [annotation] if annotated else [])
+        summary = doctor.summary_markdown("mshv", results, {})
+        self.assertIn("(mshv): passed", summary)
+        self.assertIn(f"\n\n**H4 warning:** {warning}\n", summary)
+
     def test_run_selects_the_cpu_fingerprint_or_runs_without_openvmm(self):
         seen: list[Path | None] = []
         schedules: list[doctor.Schedule] = []
@@ -2435,11 +3543,16 @@ class DoctorTests(unittest.TestCase):
             Path(command[command.index("-o") + 1]).write_bytes(b"probe")
             return completed("")
 
-        with patch.object(doctor.shutil, "which", return_value=None):
+        with patch.object(
+            doctor, "require_tool", side_effect=doctor.ScriptError("rustc is required")
+        ) as require_tool:
             with self.assertRaisesRegex(doctor.ScriptError, "rustc is required"):
                 doctor.build_probe(self.root)
+        require_tool.assert_called_once_with(
+            "rustc", "rustc is required to build the host time probe"
+        )
         with (
-            patch.object(doctor.shutil, "which", return_value="rustc"),
+            patch.object(doctor, "require_tool", return_value="rustc"),
             patch.object(doctor.subprocess, "run", side_effect=rustc) as run,
         ):
             self.assertEqual(doctor.build_probe(self.root), target)
@@ -2448,7 +3561,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"probe")
         target.unlink()
         with (
-            patch.object(doctor.shutil, "which", return_value="rustc"),
+            patch.object(doctor, "require_tool", return_value="rustc"),
             patch.object(
                 doctor.subprocess, "run", return_value=completed("", 1, "error[E0425]")
             ),
@@ -2463,8 +3576,11 @@ class DoctorTests(unittest.TestCase):
             "noise\nNVX-HOST-TIME-PROBE rate index=1 tsc_hz=1.5\n"
             "NVX-HOST-TIME-PROBE skew pairs=1 cpus=0-1\n"
         )
-        with patch.object(doctor.subprocess, "run", return_value=completed(output)):
+        with patch.object(
+            doctor.subprocess, "run", return_value=completed(output)
+        ) as run:
             records = doctor.run_probe(context, "skew")
+        self.assertEqual(run.call_args.kwargs["timeout"], context.timeout)
         self.assertEqual(
             records,
             [
@@ -2472,6 +3588,11 @@ class DoctorTests(unittest.TestCase):
                 ("skew", {"pairs": "1", "cpus": "0-1"}),
             ],
         )
+        with patch.object(
+            doctor.subprocess, "run", return_value=completed(output)
+        ) as run:
+            doctor.run_probe(context, "rate", duration=120.0)
+        self.assertEqual(run.call_args.kwargs["timeout"], context.timeout + 120.0)
         with patch.object(
             doctor.subprocess, "run", return_value=completed("", 3, "no CPU")
         ):

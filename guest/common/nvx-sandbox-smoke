@@ -1,6 +1,358 @@
 #!/bin/sh
 set -eu
 
+# The fixed workload identity, as the four real, effective, saved, and
+# file-system IDs that /proc/self/status lists.
+workload_ids="65534 65534 65534 65534"
+# Linux 6.18 fixes the inode numbers of the initial namespaces in its UAPI
+# (enum init_ns_ino in linux/nsfs.h). The agent runs in the initial mount,
+# PID, and UTS namespaces, so a workload namespace with another number is
+# private.
+initial_namespaces="mnt:4026531832 pid:4026531836 uts:4026531838"
+# The private /dev that the container runtime creates, in byte order.
+device_view="fd full null ptmx pts random shm stderr stdin stdout tty urandom zero"
+
+fail() {
+    echo "NVX-UBUNTU-SANDBOX-FAIL: $*" >&2
+    exit 1
+}
+
+# Prints the values of field $2 of the process status file $1, separated by
+# single spaces.
+status_field() {
+    while IFS= read -r status_line; do
+        case "$status_line" in
+            "$2":*)
+                set -f
+                # The values are tab-separated words.
+                # shellcheck disable=SC2086
+                set -- ${status_line#*:}
+                set +f
+                printf '%s\n' "$*"
+                return 0
+                ;;
+        esac
+    done <"$1"
+    fail "$1 has no $2 field"
+}
+
+check_identity() {
+    [ "$(id -u):$(id -g)" = 65534:65534 ] ||
+        fail "the workload runs as $(id -u):$(id -g)"
+    uids=$(status_field /proc/self/status Uid)
+    [ "$uids" = "$workload_ids" ] || fail "the workload UIDs are $uids"
+    gids=$(status_field /proc/self/status Gid)
+    [ "$gids" = "$workload_ids" ] || fail "the workload GIDs are $gids"
+    groups=$(status_field /proc/self/status Groups)
+    [ -z "$groups" ] || fail "the workload has supplementary groups $groups"
+    [ "${HOME:-}" = /nonexistent ] || fail "the workload home is ${HOME:-unset}"
+}
+
+# The workload holds no capability in any set and cannot gain privileges
+# through execve.
+check_capabilities() {
+    for capability_set in CapInh CapPrm CapEff CapBnd CapAmb; do
+        capabilities=$(status_field /proc/self/status "$capability_set")
+        [ "$capabilities" = 0000000000000000 ] ||
+            fail "the workload $capability_set set is $capabilities"
+    done
+    no_new_privs=$(status_field /proc/self/status NoNewPrivs)
+    [ "$no_new_privs" = 1 ] || fail "the workload NoNewPrivs is $no_new_privs"
+}
+
+check_namespaces() {
+    for initial_namespace in $initial_namespaces; do
+        namespace_type=${initial_namespace%%:*}
+        initial_inode=${initial_namespace#*:}
+        namespace_link=$(readlink "/proc/self/ns/$namespace_type") ||
+            fail "cannot read the workload $namespace_type namespace"
+        namespace_inode=${namespace_link#"$namespace_type:["}
+        namespace_inode=${namespace_inode%"]"}
+        case "$namespace_link" in
+            "$namespace_type:[$namespace_inode]") ;;
+            *) fail "unexpected $namespace_type namespace link $namespace_link" ;;
+        esac
+        case "$namespace_inode" in
+            '' | *[!0-9]*)
+                fail "unexpected $namespace_type namespace link $namespace_link"
+                ;;
+        esac
+        [ "$namespace_inode" != "$initial_inode" ] ||
+            fail "the workload shares the initial $namespace_type namespace"
+    done
+    # PID 1 of the workload's PID namespace is the workload, not the guest's
+    # root-owned init.
+    init_uids=$(status_field /proc/1/status Uid)
+    [ "$init_uids" = "$workload_ids" ] ||
+        fail "PID 1 of the workload PID namespace runs as $init_uids"
+    expected_hostname=nvx-sandbox
+    # Read the whole file: a caller's --cmdline keeps its newlines, so tokens
+    # may follow a line break.
+    kernel_command_line=$(cat /proc/cmdline)
+    set -f
+    # Kernel command-line tokens are deliberately split on whitespace.
+    # shellcheck disable=SC2086
+    for token in $kernel_command_line; do
+        case "$token" in
+            nvx_hostname=*) expected_hostname=${token#*=} ;;
+        esac
+    done
+    set +f
+    read -r workload_hostname </proc/sys/kernel/hostname
+    [ "$workload_hostname" = "$expected_hostname" ] ||
+        fail "the workload hostname is $workload_hostname, expected $expected_hostname"
+}
+
+# Prints the mount options, file-system type, source, and super options of
+# each mount at $1 in the workload's mount namespace, one mount per line.
+mount_records() {
+    while read -r _ _ _ _ mount_point mount_options mount_rest; do
+        [ "$mount_point" = "$1" ] || continue
+        while :; do
+            case "$mount_rest" in
+                "- "*)
+                    mount_rest=${mount_rest#- }
+                    break
+                    ;;
+                *" "*) mount_rest=${mount_rest#* } ;;
+                *) fail "malformed mount record for $1" ;;
+            esac
+        done
+        printf '%s %s\n' "$mount_options" "$mount_rest"
+    done </proc/self/mountinfo
+}
+
+# Requires exactly one mount at $1, of file-system type $2, with each of the
+# remaining mount options, and leaves its super options in mount_super.
+require_mount() {
+    mount_target=$1
+    mount_type=$2
+    shift 2
+    mount_record=$(mount_records "$mount_target")
+    [ -n "$mount_record" ] || fail "nothing is mounted at $mount_target"
+    case "$mount_record" in
+        *"
+"*) fail "several mounts are stacked at $mount_target" ;;
+    esac
+    mount_options=${mount_record%% *}
+    mount_rest=${mount_record#* }
+    [ "${mount_rest%% *}" = "$mount_type" ] ||
+        fail "$mount_target is ${mount_rest%% *}, expected $mount_type"
+    for mount_option in "$@"; do
+        case ",$mount_options," in
+            *",$mount_option,"*) ;;
+            *) fail "$mount_target is mounted $mount_options, without $mount_option" ;;
+        esac
+    done
+    mount_super=${mount_record##* }
+}
+
+# The workload sees its own overlay root over the image layers, with the
+# overlay options that the init agent sets, and with its upper layer where the
+# kernel command line declares it: on scratch, or on a tmpfs for
+# nvx_overlay_upper=ramfs. It also sees private proc, read-only sysfs, and
+# device mounts. Each container runtime mount appears once: a managed exec
+# that made its mounts in the agent's namespace would stack them on those of
+# the earlier execs. No mount propagates to or from another namespace.
+check_mounts() {
+    while read -r _ _ _ _ mount_point _ mount_rest; do
+        case "$mount_rest" in
+            "- "*) ;;
+            *) fail "the mount at $mount_point propagates: ${mount_rest%% - *}" ;;
+        esac
+    done </proc/self/mountinfo
+    require_mount / overlay rw
+    case ",$mount_super," in
+        *,lowerdir=/run/nvx/layers/*) ;;
+        *) fail "the root overlay does not use the image layers: $mount_super" ;;
+    esac
+    declared_upper=scratch
+    # Read the whole file: a caller's --cmdline keeps its newlines, so the
+    # root's tokens may follow a line break.
+    kernel_command_line=$(cat /proc/cmdline)
+    set -f
+    # Kernel command-line tokens are deliberately split on whitespace.
+    # shellcheck disable=SC2086
+    for token in $kernel_command_line; do
+        case "$token" in
+            nvx_overlay_upper=ramfs) declared_upper=tmpfs ;;
+        esac
+    done
+    set +f
+    case ",$mount_super," in
+        *",upperdir=/run/nvx/$declared_upper/upper,"*) ;;
+        *) fail "the root overlay upper layer is not on $declared_upper: $mount_super" ;;
+    esac
+    for overlay_option in metacopy=on xino=on; do
+        case ",$mount_super," in
+            *",$overlay_option,"*) ;;
+            *) fail "the root overlay is mounted without $overlay_option: $mount_super" ;;
+        esac
+    done
+    require_mount /proc proc nosuid nodev noexec
+    require_mount /sys sysfs ro nosuid nodev noexec
+    require_mount /dev tmpfs nosuid
+    require_mount /dev/pts devpts
+    require_mount /dev/shm tmpfs nosuid nodev
+}
+
+check_devices() {
+    devices=
+    for device in /dev/.* /dev/*; do
+        case "${device#/dev/}" in
+            . | ..) continue ;;
+        esac
+        [ -e "$device" ] || [ -L "$device" ] || continue
+        devices="${devices:+$devices }${device#/dev/}"
+    done
+    [ "$devices" = "$device_view" ] || fail "the workload device view is $devices"
+    for device in full null random tty urandom zero; do
+        [ -c "/dev/$device" ] && [ ! -L "/dev/$device" ] ||
+            fail "/dev/$device is not a character device"
+    done
+    [ "$(LC_ALL=C ls -A /dev/pts)" = ptmx ] ||
+        fail "the workload devpts instance is not private"
+}
+
+# Without capabilities, the workload cannot create a device node of its own
+# to reach a device that /dev leaves out.
+check_device_creation() {
+    command -v mknod >/dev/null || fail "mknod is unavailable"
+    if mknod /tmp/nvx-sandbox-device c 1 3 2>/dev/null; then
+        rm -f /tmp/nvx-sandbox-device
+        fail "the workload can create device nodes"
+    fi
+}
+
+# The workload sees the machine ID that the guest generated for this boot,
+# bound read-only over the image's, which it cannot replace.
+check_machine_id() {
+    read -r machine_id </etc/machine-id ||
+        fail "the workload cannot read its machine ID"
+    case "$machine_id" in
+        *[!0-9a-f]*) fail "the workload machine ID is $machine_id" ;;
+    esac
+    [ "${#machine_id}" -eq 32 ] || fail "the workload machine ID is $machine_id"
+    require_mount /etc/machine-id tmpfs ro nosuid nodev
+    if (: >/etc/machine-id) 2>/dev/null; then
+        fail "the workload can replace its machine ID"
+    fi
+}
+
+# The workload can neither use the processor's I/O ports, whose read ends
+# the reader with SIGSEGV without the permission, nor obtain the permission.
+check_ports() {
+    port_status=0
+    # The shell reports the signal on standard error, so silence it.
+    { /sbin/nvx-time test port-probe snapshot; } 2>/dev/null || port_status=$?
+    [ "$port_status" -eq 139 ] ||
+        fail "a port read without the permission ended with status $port_status"
+    port_status=0
+    /sbin/nvx-time test port-probe snapshot grant 2>/dev/null || port_status=$?
+    [ "$port_status" -eq 1 ] ||
+        fail "a request for the port permission ended with status $port_status"
+}
+
+# A managed execution enters its root through the agent's entry, which also
+# makes every mount but /dev and its devpts nodev.
+check_entry() {
+    while read -r _ _ _ _ mount_point mount_options _; do
+        case "$mount_point" in
+            /dev | /dev/pts) continue ;;
+        esac
+        case ",$mount_options," in
+            *,nodev,*) ;;
+            *) fail "$mount_point is mounted $mount_options, without nodev" ;;
+        esac
+    done </proc/self/mountinfo
+    echo "NVX-UBUNTU-SANDBOX-ENTRY-OK"
+}
+
+check_cgroup() {
+    workload_cgroup=
+    while IFS= read -r cgroup_line; do
+        case "$cgroup_line" in
+            0::*) workload_cgroup=${cgroup_line#0::} ;;
+        esac
+    done </proc/self/cgroup
+    [ "$workload_cgroup" = /container ] ||
+        fail "the workload runs in cgroup ${workload_cgroup:-unknown}"
+}
+
+# The workload cannot modify the image's files, and its writes land in the
+# overlay, on its upper.
+check_image() {
+    grep -qx 'ID=ubuntu' /etc/os-release || fail "the image is not Ubuntu"
+    for image_file in /etc/passwd /usr/bin/env; do
+        if (: >>"$image_file") 2>/dev/null; then
+            fail "the workload can modify image file $image_file"
+        fi
+    done
+    if (: >/usr/nvx-sandbox-image-write) 2>/dev/null; then
+        fail "the workload can create files in image directory /usr"
+    fi
+    printf 'upper-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
+    [ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = upper-write ] ||
+        fail "the write to the upper did not persist"
+    [ "$(stat -f -c %T /tmp/nvx-ubuntu-sandbox-smoke)" = overlayfs ] ||
+        fail "the write to the upper did not land in the overlay"
+}
+
+# Starts sleepers until a fork fails or $2 have started, then stops and reaps
+# them and records how many started in $1. A refused fork ends the shell,
+# which still runs its exit trap.
+start_sleepers() {
+    sleepers_file=$1
+    sleepers=
+    sleepers_started=0
+    trap 'kill $sleepers 2>/dev/null || :; wait; echo "$sleepers_started" >"$sleepers_file"' EXIT
+    while [ "$sleepers_started" -lt "$2" ]; do
+        sleep 600 &
+        sleepers="$sleepers $!"
+        sleepers_started=$((sleepers_started + 1))
+    done
+}
+
+# The workload's memory.max is $1 bytes, and its pids.max lets it run $2
+# processes, itself included. Keep twice $1 within the guest's free memory,
+# so that an unenforced memory.max fails the check instead of the guest.
+check_limits() {
+    memory_max=$1
+    pids_max=$2
+    for limit in "$memory_max" "$pids_max"; do
+        case "$limit" in
+            '' | *[!0-9]*) fail "limits requires numeric MEMORY_MAX and PIDS_MAX" ;;
+        esac
+    done
+    [ "$pids_max" -ge 3 ] || fail "the process limit check requires PIDS_MAX of at least 3"
+    dd if=/dev/zero of=/dev/null bs=1M count=1 2>/dev/null ||
+        fail "a 1 MiB allocation failed under memory.max"
+    # The memory controller kills an allocation of twice the limit. The shell
+    # reports the kill on standard error, so silence it.
+    memory_status=0
+    { dd if=/dev/zero of=/dev/null bs="$((memory_max * 2))" count=1; } \
+        2>/dev/null || memory_status=$?
+    [ "$memory_status" -eq 137 ] ||
+        fail "memory.max did not kill an allocation of $((memory_max * 2)) bytes: status $memory_status"
+    # `--pids-max N` admits N workload processes: the CLI sets the container
+    # cgroup's pids.max to N + 1 for the one-shot launcher's `unshare` parent,
+    # which waits outside the workload's PID namespace, and the init agent
+    # gives that process back for a managed sandbox, whose executions have no
+    # such parent. The probe and the subshell are two of the N, so the
+    # subshell can start $2 - 2 sleepers. The bound stops a subshell whose
+    # forks the controller does not refuse.
+    sleepers_record=/tmp/nvx-ubuntu-sandbox-sleepers
+    rm -f "$sleepers_record"
+    (start_sleepers "$sleepers_record" "$((pids_max * 4))") 2>/dev/null || :
+    read -r started <"$sleepers_record" ||
+        fail "the process limit check did not record its sleepers"
+    rm -f "$sleepers_record"
+    [ "$started" = "$((pids_max - 2))" ] ||
+        fail "pids.max let the workload start $started sleepers beside the probe and a subshell, expected $((pids_max - 2))"
+    /bin/true || fail "the workload cannot fork after its processes exit"
+    echo "NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max=$memory_max pids_max=$pids_max"
+}
+
 check_share() {
     share=$1
     share_mode=$2
@@ -9,6 +361,18 @@ check_share() {
         echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
         return
     fi
+    if [ "$share_mode" = policy ]; then
+        check_share_policy "$share"
+        echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+        return
+    fi
+    case "$share_mode" in
+        file-ro | file-rw)
+            check_file_share "$share" "${share_mode#file-}"
+            echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+            return
+            ;;
+    esac
     [ "$(cat "$share/nvx-host-marker")" = host-to-guest ]
     [ ! -e "$share/nvx-denied" ]
     case "$share_mode" in
@@ -35,6 +399,32 @@ check_share() {
         *) exit 2 ;;
     esac
     echo "NVX-UBUNTU-SANDBOX-SHARE-OK target=$share mode=$share_mode"
+}
+
+# A share of one host file, bound with mode $2, ro or rw, at a regular file
+# that the agent created in a directory of the container root. The workload
+# reaches the file and nothing beside it, cannot remove or rename it, and gets
+# EROFS from a read-only file; it rewrites a read-write one, and the host
+# checks the file and its siblings.
+check_file_share() {
+    share=$1
+    require_mount "$share" virtiofs "$2" nosuid nodev
+    if [ ! -f "$share" ] || [ -L "$share" ]; then
+        fail "$share is not a regular file"
+    fi
+    [ "$(ls -A "${share%/*}")" = "${share##*/}" ] ||
+        fail "${share%/*} holds more than the shared file"
+    [ "$(cat "$share")" = host-to-guest ] ||
+        fail "$share does not hold the host's contents"
+    if [ "$2" = ro ]; then
+        expect_erofs "$share"
+    else
+        printf 'guest-to-host\n' >"$share" ||
+            fail "the workload cannot rewrite $share"
+    fi
+    if rm -f "$share" 2>/dev/null || mv "$share" "$share.moved" 2>/dev/null; then
+        fail "the workload removed or renamed $share"
+    fi
 }
 
 # With --mount-owner caller, the workload owns what it creates, so it can
@@ -81,6 +471,73 @@ expect_eperm() {
         *'Operation not permitted'*) ;;
         *)
             echo "unexpected share error: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# A read-write share with --mount-write nvx-writable, --mount-deny nvx-denied,
+# and --mount-allow nvx-denied/nvx-allowed. The host grants every guest
+# identity write permission, so only OpenVMM's policy can refuse a write:
+# outside nvx-writable, it refuses each one with EROFS. The denied directory
+# lists only the way to the allowed path, which stays readable.
+check_share_policy() {
+    share=$1
+    [ "$(cat "$share/nvx-host-marker")" = host-to-guest ]
+    expect_erofs "$share/nvx-guest-marker"
+    expect_erofs "$share/nvx-host-marker"
+    expect_erofs "$share/nvx-denied/nvx-allowed/nvx-guest-marker"
+    if (: >>"$share/nvx-denied/nvx-guest-marker") 2>/dev/null; then
+        exit 1
+    fi
+    if mkdir "$share/nvx-guest-directory" 2>/dev/null; then
+        exit 1
+    fi
+    if ln -s nvx-host-marker "$share/nvx-guest-link" 2>/dev/null; then
+        exit 1
+    fi
+    if rm "$share/nvx-host-marker" 2>/dev/null; then
+        exit 1
+    fi
+    if mv "$share/nvx-host-marker" "$share/nvx-writable/" 2>/dev/null; then
+        exit 1
+    fi
+    # A hard link would make a read-only file writable through the link.
+    if ln "$share/nvx-host-marker" "$share/nvx-writable/nvx-hard-link" 2>/dev/null; then
+        exit 1
+    fi
+
+    # The workload creates, renames, and removes entries in the writable path.
+    printf 'guest-to-host\n' >"$share/nvx-writable/nvx-guest-marker"
+    mkdir "$share/nvx-writable/nvx-guest-directory"
+    printf 'temporary\n' >"$share/nvx-writable/nvx-temporary"
+    mv "$share/nvx-writable/nvx-temporary" "$share/nvx-writable/nvx-renamed"
+    rm "$share/nvx-writable/nvx-renamed"
+    if mv "$share/nvx-writable/nvx-guest-marker" "$share/" 2>/dev/null; then
+        exit 1
+    fi
+
+    [ "$(ls -A "$share/nvx-denied")" = nvx-allowed ]
+    [ "$(cat "$share/nvx-denied/nvx-allowed/payload")" = payload ]
+    if cat "$share/nvx-denied/secret" >/dev/null 2>&1; then
+        exit 1
+    fi
+    if ls "$share/nvx-denied/secret" >/dev/null 2>&1; then
+        exit 1
+    fi
+    echo "NVX-UBUNTU-SANDBOX-POLICY-OK target=$share"
+}
+
+# Opening `$1` to append must fail with EROFS. The shell reports a failed
+# redirection with the C library's message.
+expect_erofs() {
+    if error=$( (: >>"$1") 2>&1); then
+        exit 1
+    fi
+    case "$error" in
+        *'Read-only file system'*) ;;
+        *)
+            echo "unexpected share error: $error" >&2
             exit 1
             ;;
     esac
@@ -150,16 +607,35 @@ check_shares_isolated() {
     echo "NVX-UBUNTU-SANDBOX-SHARES-ISOLATED-OK rw=$rw_share ro=$ro_share"
 }
 
-[ "$(id -u)" = 65534 ]
-[ "$(id -g)" = 65534 ]
-[ "${HOME:-}" = /nonexistent ]
-grep -qx 'ID=ubuntu' /etc/os-release
-printf 'scratch-backed-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
-[ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = scratch-backed-write ]
-# Each share is a TARGET MODE pair; a final TARGET alone is read-only.
+check_identity
+check_capabilities
+check_namespaces
+check_mounts
+check_devices
+check_device_creation
+check_machine_id
+check_ports
+check_cgroup
+check_image
+echo "NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534"
+# Each share is a TARGET MODE pair; a final TARGET alone is read-only. A MODE
+# of file-ro or file-rw checks a shared file.
+# `limits MEMORY_MAX PIDS_MAX` checks the workload's resource limits, and
+# `entry` what a managed execution's entry adds.
 rw_share=
 ro_share=
 while [ "$#" -gt 0 ]; do
+    if [ "$1" = limits ]; then
+        [ "$#" -ge 3 ] || fail "limits requires MEMORY_MAX and PIDS_MAX"
+        check_limits "$2" "$3"
+        shift 3
+        continue
+    fi
+    if [ "$1" = entry ]; then
+        check_entry
+        shift
+        continue
+    fi
     share_mode=${2:-ro}
     check_share "$1" "$share_mode"
     case "$share_mode" in

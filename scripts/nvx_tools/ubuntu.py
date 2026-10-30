@@ -28,9 +28,12 @@ from .common import (
     ScriptError,
     cache_root,
     download_verified,
+    normalized_sha256_file,
+    path_exists,
     require_tool,
     sha256_file,
 )
+from .guest_binaries import guest_binary_source_files
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]*")
@@ -197,10 +200,7 @@ def load_package_lock(
 
 
 def package_lock_sha256(path: Path = UbuntuBuildConstants.PACKAGE_LOCK) -> str:
-    contents = path.read_bytes().replace(b"\r\n", b"\n")
-    if b"\r" in contents:
-        raise ScriptError(f"{path} contains unsupported carriage returns")
-    return hashlib.sha256(contents).hexdigest()
+    return normalized_sha256_file(path)
 
 
 def _normalize_archive_path(raw_name: str, label: str) -> PurePosixPath:
@@ -255,15 +255,11 @@ def _member_kind(member: tarfile.TarInfo) -> str:
     return "socket-or-unknown"
 
 
-def _path_exists(path: Path) -> bool:
-    return os.path.lexists(path)
-
-
 def _destination_path(root: Path, relative: PurePosixPath, label: str) -> Path:
     current = root
     for part in relative.parts[:-1]:
         current /= part
-        if _path_exists(current) and current.is_symlink():
+        if path_exists(current) and current.is_symlink():
             raise ScriptError(
                 f"{label} would write through archive-controlled symlink {current}"
             )
@@ -325,7 +321,7 @@ def _safe_extract_open_tar(
     )
     for path, _member in directory_members:
         target = _destination_path(destination, path, label)
-        if _path_exists(target):
+        if path_exists(target):
             if target.is_symlink() or not target.is_dir():
                 raise ScriptError(f"{label} directory conflicts with {target}")
         else:
@@ -336,7 +332,7 @@ def _safe_extract_open_tar(
         if kind not in ("file", "symlink"):
             continue
         target = _destination_path(destination, path, label)
-        if _path_exists(target):
+        if path_exists(target):
             raise ScriptError(f"{label} member conflicts with existing path {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         if kind == "symlink":
@@ -358,13 +354,13 @@ def _safe_extract_open_tar(
         progress = False
         for path, member in tuple(pending_hardlinks.items()):
             target = _destination_path(destination, path, label)
-            if _path_exists(target):
+            if path_exists(target):
                 raise ScriptError(
                     f"{label} hard link conflicts with existing path {target}"
                 )
             link_path = _normalize_archive_path(member.linkname, label)
             source = _destination_path(destination, link_path, label)
-            if not _path_exists(source):
+            if not path_exists(source):
                 continue
             if source.is_symlink() or not source.is_file():
                 raise ScriptError(
@@ -646,7 +642,7 @@ def _install_deb(
 
 def _ensure_symlink(root: Path, relative: str, target: str) -> None:
     path = root / relative
-    if _path_exists(path):
+    if path_exists(path):
         if path.is_symlink() and os.readlink(path) == target:
             return
         raise ScriptError(f"Ubuntu customization path already exists: /{relative}")
@@ -721,7 +717,7 @@ def _customize_root(root: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         path.chmod(mode)
     resolver = root / "etc" / "resolv.conf"
-    if _path_exists(resolver):
+    if path_exists(resolver):
         resolver.unlink()
     resolver.touch(mode=0o644)
     for relative in (
@@ -738,7 +734,7 @@ def _customize_root(root: Path) -> None:
         "var/lib/systemd/random-seed",
     ):
         path = root / relative
-        if _path_exists(path):
+        if path_exists(path):
             path.unlink()
     ssh = root / "etc" / "ssh"
     if ssh.is_dir():
@@ -1014,6 +1010,7 @@ def customization_files() -> tuple[Path, ...]:
             if path.is_file()
         ),
         UbuntuBuildConstants.PACKAGE_LOCK,
+        *guest_binary_source_files(),
     )
 
 
@@ -1031,9 +1028,20 @@ def converter_input_sha256(customization_files: Sequence[Path]) -> str:
         "customization_files": [
             {
                 "path": path.relative_to(BuildConstants.REPO_ROOT).as_posix(),
-                "sha256": sha256_file(path),
+                "sha256": normalized_sha256_file(path),
             }
-            for path in sorted(customization_files)
+            # In the order of POSIX paths, whose names compare with case, as
+            # on the Linux hosts that build the artifacts; Windows paths
+            # compare without it, which put nvx-rs/build.rs before
+            # nvx-rs/Cargo.toml and changed the digest.
+            for path in sorted(
+                customization_files,
+                key=lambda path: (
+                    PurePosixPath(
+                        path.relative_to(BuildConstants.REPO_ROOT).as_posix()
+                    ).parts
+                ),
+            )
         ],
     }
     encoded = json.dumps(

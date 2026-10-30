@@ -12,6 +12,13 @@ inputs:
       artifacts must be in their build paths
     required: false
     default: "false"
+  warp-probe:
+    description: >-
+      Also run the guest warp probe (doctor H6) on CI's schedule, for jobs
+      that boot guests without the microVM scenarios' own probes; requires
+      verify-openvmm
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -19,6 +26,10 @@ runs:
     - name: Validate Linux toolchain
       if: runner.os != 'Windows'
       shell: bash
+      env:
+        # Report a missing pinned toolchain instead of installing it into the
+        # read-only RUSTUP_HOME.
+        RUSTUP_AUTO_INSTALL: "0"
       run: |
         set -euo pipefail
         test -n "${CARGO_HOME:-}" || {
@@ -27,7 +38,19 @@ runs:
         }
         mkdir -p "${CARGO_HOME}/bin"
         python3 --version
-        rustc --version
+        toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+        test -n "${toolchain}"
+        if ! rustup toolchain list | awk -v name="${toolchain}" \
+          'index($1, name "-") == 1 { found = 1 } END { exit !found }'; then
+          echo "::error::Rust ${toolchain}, which rust-toolchain.toml pins, is not installed; rerun scripts/setup/setup-linux.sh --runner-only" >&2
+          exit 1
+        fi
+        rust_version=$(rustc --version)
+        echo "${rust_version}"
+        if [[ "${rust_version}" != "rustc ${toolchain} "* ]]; then
+          echo "::error::${rust_version} does not match Rust ${toolchain}, which rust-toolchain.toml pins" >&2
+          exit 1
+        fi
         cargo --version
         cargo nextest --version
         sccache --version
@@ -58,6 +81,10 @@ runs:
     - name: Validate Windows toolchain
       if: runner.os == 'Windows'
       shell: powershell
+      env:
+        # Report a missing pinned toolchain instead of installing it into the
+        # read-only RUSTUP_HOME.
+        RUSTUP_AUTO_INSTALL: "0"
       run: |
         if ([string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
             throw "CARGO_HOME is not configured"
@@ -65,7 +92,23 @@ runs:
         New-Item -ItemType Directory -Path "$env:CARGO_HOME\bin" -Force |
             Out-Null
         python --version
-        rustc --version
+        $channel = Select-String -LiteralPath "rust-toolchain.toml" `
+          -Pattern '^channel = "([^"]+)"' | Select-Object -First 1
+        if ($null -eq $channel) {
+          throw "rust-toolchain.toml does not pin a Rust release"
+        }
+        $toolchain = $channel.Matches[0].Groups[1].Value
+        $installed = @(rustup toolchain list | ForEach-Object {
+            ($_ -split '\s+')[0]
+          } | Where-Object { $_.StartsWith("$toolchain-") })
+        if ($installed.Count -eq 0) {
+          throw "Rust $toolchain, which rust-toolchain.toml pins, is not installed; rerun scripts\setup\setup-windows-whp.ps1"
+        }
+        $rustVersion = rustc --version
+        $rustVersion
+        if ($rustVersion -notlike "rustc $toolchain *") {
+          throw "$rustVersion does not match Rust $toolchain, which rust-toolchain.toml pins"
+        }
         cargo --version
         cargo nextest --version
         sccache --version
@@ -124,23 +167,87 @@ runs:
           throw "Hyper-V SVGA firmware was not found: $svgaFirmware"
         }
 
-    # Host time. On Linux, the nonstop_tsc gate stays fail-closed in front of
-    # the time ABI host qualification (doc/design/time-abi.md, "Host
-    # qualification"), which then checks the backend, the CPU fingerprint and
-    # generation, and the TSC rate stability on its short CI schedule, and,
-    # in jobs that downloaded OpenVMM, its CPU profile check (H2) and
-    # preflight (H3); other jobs qualify without OpenVMM. These checks are
-    # host-level, and the guest warp probe (H6) runs only in the microVM
-    # scenarios, so the gate keeps a host whose guests warp (#265) out of
-    # every other job.
-    - name: Validate host TSC
+    # A cancelled job's harness can start OpenVMM after the runner's orphan
+    # cleanup has listed the job's processes, and then die without stopping
+    # it, which leaves the VM loading a CPU for days (#768). A runner runs one
+    # job at a time and no step before this one starts OpenVMM, so any
+    # OpenVMM process of the runner's account is left from an earlier job.
+    - name: Terminate OpenVMM left by earlier jobs
       if: runner.os != 'Windows'
       shell: bash
       run: |
         set -euo pipefail
-        # Guests on a host without an invariant TSC intermittently see
-        # cross-vCPU TSC warps, which make Linux mark the guest TSC unstable
-        # (#211).
+        name=openvmm
+        user=$(id -u)
+        # Lists the account's OpenVMM processes; a zombie has already exited.
+        live() {
+          ps -u "${user}" -o pid=,stat=,comm= |
+            awk -v name="${name}" '$3 == name && $2 !~ /^Z/ { print $1 }'
+        }
+        leaked=$(live)
+        if [ -z "${leaked}" ]; then
+          exit 0
+        fi
+        for pid in ${leaked}; do
+          started=$(ps -o lstart= -p "${pid}" || true)
+          echo "::warning::Terminating OpenVMM process ${pid}, started ${started:-at an unknown time}, which an earlier job left running"
+          echo "  command: $(ps -o args= -p "${pid}" || true)"
+        done
+        # shellcheck disable=SC2086
+        kill -TERM ${leaked} 2>/dev/null || true
+        for _ in $(seq 50); do
+          remaining=$(live)
+          if [ -z "${remaining}" ]; then
+            exit 0
+          fi
+          sleep 0.1
+        done
+        # shellcheck disable=SC2086
+        kill -KILL ${remaining} 2>/dev/null || true
+        sleep 1
+        remaining=$(live)
+        if [ -n "${remaining}" ]; then
+          echo "::error::OpenVMM processes that an earlier job left running did not exit: ${remaining//$'\n'/ }" >&2
+          exit 1
+        fi
+
+    # A harness that something killed outright, as the runner's orphan
+    # cleanup killed those of cancelled jobs, leaves its scenarios' scratch
+    # directories in the temporary directory (#946). As with OpenVMM, no step
+    # before this one runs the harness, so the account's harness directories
+    # there are left from earlier jobs.
+    - name: Remove scratch left by earlier jobs
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        temporary=$(python3 -c 'import tempfile; print(tempfile.gettempdir())')
+        find "${temporary}" -mindepth 1 -maxdepth 1 -type d -user "$(id -u)" \
+          \( -name 'nvx-*' -o -name 'openvmm-*' \) -print0 |
+          while IFS= read -r -d '' directory; do
+            modified=$(stat -c %y "${directory}" || true)
+            echo "::notice::Removing ${directory}, last modified ${modified:-at an unknown time}, which an earlier job left behind"
+            # A scenario can leave a directory that even its owner can't write.
+            chmod -R u+rwX -- "${directory}" 2>/dev/null || true
+            if ! rm -rf --one-file-system -- "${directory}"; then
+              echo "::warning::Could not remove ${directory}, which an earlier job left behind"
+            fi
+          done
+
+    # Host time. The time ABI host qualification (doc/ci.md,
+    # "Host qualification") checks the backend, the CPU fingerprint and
+    # generation, and the TSC rate stability on its short CI schedule, and,
+    # in jobs that downloaded OpenVMM, its CPU profile check (H2) and
+    # preflight (H3); other jobs qualify without OpenVMM. Jobs whose guests
+    # run without the microVM scenarios' warp probes add the guest warp probe
+    # (H6). The host's invariant-TSC flags are evidence only: the guest warp
+    # probe measures the cross-vCPU skew that a host without one can cause
+    # (#265).
+    - name: Report host TSC
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
         echo "Kernel: $(uname -r)"
         echo "CPU: $(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo)"
         echo "Clocksource: $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null || echo unknown)"
@@ -154,8 +261,7 @@ runs:
         case "${flags}" in
           *" nonstop_tsc "*) ;;
           *)
-            echo "::error::Runner host does not expose an invariant TSC (nonstop_tsc); redeploy the VM on a host that does" >&2
-            exit 1
+            echo "::notice::Runner host does not expose an invariant TSC (nonstop_tsc); the guest warp probe measures the cross-vCPU skew that this can cause (#265)"
             ;;
         esac
 
@@ -166,6 +272,7 @@ runs:
         python3 scripts/nvx.py doctor
         --backend "${{ inputs.backend }}"
         --checks H1 H2 H4
+        ${{ inputs.warp-probe == 'true' && 'H6' || '' }}
         ${{ inputs.verify-openvmm == 'true' && 'H3 --cpu-fingerprint "${RUNNER_TEMP}/nvx-cpu-fingerprint.json"' || '--no-openvmm' }}
         --ci-schedule
         --summary "${GITHUB_STEP_SUMMARY}"
@@ -177,6 +284,7 @@ runs:
         python scripts\nvx.py doctor
         --backend "${{ inputs.backend }}"
         --checks H1 H2 H4
+        ${{ inputs.warp-probe == 'true' && 'H6' || '' }}
         ${{ inputs.verify-openvmm == 'true' && 'H3 --cpu-fingerprint "$env:RUNNER_TEMP\nvx-cpu-fingerprint.json"' || '--no-openvmm' }}
         --ci-schedule
         --summary "$env:GITHUB_STEP_SUMMARY"

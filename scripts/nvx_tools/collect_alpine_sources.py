@@ -8,9 +8,7 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
-import sys
 import tarfile
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -19,7 +17,7 @@ from .build_constants import (
     AlpineBuildConstants,
     BuildConstants,
 )
-from .common import write_sha256_sums
+from .common import is_link_or_junction, write_sha256_sums
 
 
 class SourceError(RuntimeError):
@@ -295,6 +293,10 @@ def _extract_recipe(
     result = _run(
         [
             "git",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.eol=lf",
             "-C",
             cache,
             "archive",
@@ -357,6 +359,11 @@ done
             "--rm",
             "--volume",
             f"{output.resolve()}:/bundle",
+            "--env",
+            (
+                "DISTFILES_MIRROR=https://distfiles.alpinelinux.org/"
+                f"distfiles/v{alpine_version}"
+            ),
             f"alpine:{alpine_version}",
             "sh",
             "-c",
@@ -365,22 +372,9 @@ done
     )
 
 
-def _is_link(path: Path) -> bool:
-    # Path.is_symlink() misses Windows junctions, which redirect a path the same way.
-    try:
-        metadata = path.lstat()
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    if stat.S_ISLNK(metadata.st_mode):
-        return True
-    if sys.platform == "win32":
-        return metadata.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
-    return False
-
-
 def _resolve_source_output(output: Path) -> Path:
     # Check the path as given, so a link there is refused instead of followed.
-    if _is_link(output) or (output.exists() and not output.is_dir()):
+    if is_link_or_junction(output) or (output.exists() and not output.is_dir()):
         raise SourceError(f"Alpine source output is not a directory: {output}")
     if output.exists():
         unexpected = sorted(
@@ -398,7 +392,9 @@ def _resolve_source_output(output: Path) -> Path:
 
 def _reset_source_output(output: Path) -> None:
     for generated in (output / "recipes", output / "upstream"):
-        if _is_link(generated) or (generated.exists() and not generated.is_dir()):
+        if is_link_or_junction(generated) or (
+            generated.exists() and not generated.is_dir()
+        ):
             raise SourceError(
                 f"Alpine source generated path is not a directory: {generated}"
             )
@@ -412,7 +408,9 @@ def _reset_source_output(output: Path) -> None:
                     "root-owned files, so remove it manually"
                 ) from error
     for generated in (output / "manifest.json", output / "SHA256SUMS"):
-        if _is_link(generated) or (generated.exists() and not generated.is_file()):
+        if is_link_or_junction(generated) or (
+            generated.exists() and not generated.is_file()
+        ):
             raise SourceError(
                 f"Alpine source generated path is not a file: {generated}"
             )

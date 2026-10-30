@@ -32,6 +32,7 @@ use virtio_resources::blk::VirtioBlkHandle;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
 use vm_resource::kind::DiskHandleKind;
+use vm_resource::kind::VirtioDeviceHandle;
 use vm_resource::kind::VmbusDeviceHandleKind;
 use vtl2_settings_proto::Lun;
 use vtl2_settings_proto::StorageController;
@@ -141,7 +142,19 @@ pub(super) struct StorageBuilder {
 struct VirtioBlkDisk {
     disk: Resource<DiskHandleKind>,
     read_only: bool,
+    serial: Option<String>,
     microvm: Option<microvm::SandboxBlock>,
+}
+
+impl VirtioBlkDisk {
+    fn into_resource(self) -> Resource<VirtioDeviceHandle> {
+        VirtioBlkHandle {
+            disk: self.disk,
+            read_only: self.read_only,
+            serial: self.serial,
+        }
+        .into_resource()
+    }
 }
 
 #[derive(Clone)]
@@ -157,7 +170,10 @@ pub enum DiskLocation {
         nsid: Option<u32>,
         lun: Option<u8>,
     },
-    VirtioBlk(Option<String>),
+    VirtioBlk {
+        pcie_port: Option<String>,
+        serial: Option<String>,
+    },
 }
 
 impl From<UnderhillDiskSource> for DiskLocation {
@@ -509,7 +525,7 @@ impl StorageBuilder {
                     anyhow::bail!("unknown controller: '{controller}'");
                 }
             },
-            DiskLocation::VirtioBlk(pcie_port) => {
+            DiskLocation::VirtioBlk { pcie_port, serial } => {
                 if vtl != DeviceVtl::Vtl0 {
                     anyhow::bail!("virtio-blk only supported for VTL0");
                 }
@@ -519,6 +535,7 @@ impl StorageBuilder {
                 let vblk = VirtioBlkDisk {
                     disk,
                     read_only,
+                    serial,
                     microvm: None,
                 };
                 if let Some(port) = pcie_port {
@@ -661,7 +678,7 @@ impl StorageBuilder {
                     NVME_VTL0_INSTANCE_ID
                 },
             ),
-            DiskLocation::VirtioBlk(_) => {
+            DiskLocation::VirtioBlk { .. } => {
                 anyhow::bail!("OpenHCL relay not supported with virtio-blk")
             }
             DiskLocation::Named { .. } => {
@@ -681,7 +698,7 @@ impl StorageBuilder {
                 let nsid = nsid.unwrap_or(self.underhill_nvme_luns.len() as u32 + 1);
                 (&mut self.underhill_nvme_luns, nsid)
             }
-            DiskLocation::VirtioBlk(_) => {
+            DiskLocation::VirtioBlk { .. } => {
                 anyhow::bail!("OpenHCL relay not supported with virtio-blk")
             }
             DiskLocation::Named { .. } => {
@@ -897,14 +914,7 @@ impl StorageBuilder {
             config.vpci_devices.push(VpciDeviceConfig {
                 vtl: DeviceVtl::Vtl0,
                 instance_id,
-                resource: VirtioPciDeviceHandle(
-                    VirtioBlkHandle {
-                        disk: vblk.disk,
-                        read_only: vblk.read_only,
-                    }
-                    .into_resource(),
-                )
-                .into_resource(),
+                resource: VirtioPciDeviceHandle(vblk.into_resource()).into_resource(),
                 vnode: None,
             });
         }
@@ -912,14 +922,7 @@ impl StorageBuilder {
         for (port_name, vblk) in std::mem::take(&mut self.pcie_virtio_blk_disks) {
             config.pcie_devices.push(PcieDeviceConfig {
                 port_name,
-                resource: VirtioPciDeviceHandle(
-                    VirtioBlkHandle {
-                        disk: vblk.disk,
-                        read_only: vblk.read_only,
-                    }
-                    .into_resource(),
-                )
-                .into_resource(),
+                resource: VirtioPciDeviceHandle(vblk.into_resource()).into_resource(),
             });
         }
 

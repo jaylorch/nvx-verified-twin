@@ -19,6 +19,9 @@ param(
     [string]$RunnerName,
 
     [Parameter()]
+    [switch]$BenchmarkRunner,
+
+    [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$RepositoryUrl = "https://github.com/microsoft/nvx",
 
@@ -30,11 +33,154 @@ param(
     [string]$BenchmarkScratchDirectory,
 
     [Parameter()]
-    [switch]$RunnerTokenStdin
+    [switch]$RunnerTokenStdin,
+
+    [Parameter()]
+    [ValidatePattern('^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$')]
+    [string]$ExtraRunnerLabels
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+
+# Reads the tool manifest as data, without evaluating it, and rejects it
+# unless every line is well formed.
+function Read-ToolManifest {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "tool manifest not found: $Path"
+    }
+    $entries = New-Object 'System.Collections.Generic.Dictionary[string,string]' `
+        ([StringComparer]::Ordinal)
+    $keyPattern = '^[a-z][a-z0-9_]*\.(version|toolchain|artifacts\.([a-z0-9_-]+)\.(name|sha256))$'
+    $lineNumber = 0
+    $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path))
+    foreach ($line in $text.Split([char]10)) {
+        $lineNumber += 1
+        # Ordinal comparisons keep characters such as a byte order mark that
+        # culture-aware ones ignore, as the shell reader does.
+        if ($line.EndsWith([string][char]13, [StringComparison]::Ordinal)) {
+            $line = $line.Substring(0, $line.Length - 1)
+        }
+        if ($line.Length -eq 0 -or $line.StartsWith("#", [StringComparison]::Ordinal)) {
+            continue
+        }
+        $location = "invalid tool manifest ${Path}:${lineNumber}"
+        $separator = $line.IndexOf([char]"=")
+        if ($line -cmatch '[ \t]' -or $separator -lt 0) {
+            throw "${location}: expected KEY=VALUE without spaces"
+        }
+        $key = $line.Substring(0, $separator)
+        $value = $line.Substring($separator + 1)
+        if ($key -cnotmatch $keyPattern) {
+            throw "${location}: unsupported key: $key"
+        }
+        $field = $Matches[1]
+        if ($field.StartsWith("artifacts.")) {
+            $platform = $Matches[2]
+            $field = $Matches[3]
+            if ($platform -cnotin @("linux-x86_64", "windows-x86_64")) {
+                throw "${location}: unsupported platform: $platform"
+            }
+        }
+        if ($entries.ContainsKey($key)) {
+            throw "${location}: duplicate key: $key"
+        }
+        $candidate = $value
+        $pattern = '^[0-9]+\.[0-9]+\.[0-9]+$'
+        if ($field -ceq "sha256") {
+            $pattern = '^[0-9a-f]{64}$'
+        }
+        elseif ($field -ceq "name") {
+            $candidate = $value.Replace("{version}", "v")
+            $pattern = '^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$'
+        }
+        if ($candidate -cnotmatch $pattern) {
+            throw "${location}: invalid value for ${key}: $value"
+        }
+        $entries[$key] = $value
+    }
+    return [pscustomobject]@{ Path = $Path; Entries = $entries }
+}
+
+function Get-ToolManifestValue {
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+    if (-not $Manifest.Entries.ContainsKey($Key)) {
+        throw "tool manifest $($Manifest.Path) does not define $Key"
+    }
+    return $Manifest.Entries[$Key]
+}
+
+# Returns a tool's release and the name and checksum of its artifact for a
+# platform.
+function Get-ToolArtifact {
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][string]$Tool,
+        [Parameter(Mandatory = $true)][string]$Platform
+    )
+    $version = Get-ToolManifestValue $Manifest "$Tool.version"
+    $name = Get-ToolManifestValue $Manifest "$Tool.artifacts.$Platform.name"
+    $sha256 = Get-ToolManifestValue $Manifest "$Tool.artifacts.$Platform.sha256"
+    return [pscustomobject]@{
+        Version = $version
+        Name    = $name.Replace("{version}", $version)
+        Sha256  = $sha256
+    }
+}
+
+function Get-ExpectedRunnerLabels {
+    param(
+        [string]$AdditionalLabels,
+        [switch]$BenchmarkRunner
+    )
+
+    $labels = @("windows", "whp", "virtual-machine")
+    if ($BenchmarkRunner) {
+        $labels += "benchmark"
+    }
+    else {
+        $labels += "general"
+    }
+    if (-not [string]::IsNullOrEmpty($AdditionalLabels)) {
+        foreach ($label in $AdditionalLabels.Split(',')) {
+            if ($label -in @("general", "benchmark")) {
+                throw "runner role label must be selected with -BenchmarkRunner: $label"
+            }
+            if ($label -cnotmatch '^[A-Za-z0-9_.-]+$' -or
+                $labels -contains $label) {
+                throw "invalid or duplicate runner label: $label"
+            }
+            $labels += $label
+        }
+    }
+    return $labels -join ','
+}
+
+# The versions, artifacts, and checksums of the tools that this script
+# installs; stage the manifest next to the script.
+$ToolPlatform = "windows-x86_64"
+$ToolManifest = Read-ToolManifest (Join-Path $PSScriptRoot "tool-versions.conf")
+$RustToolchain = Get-ToolManifestValue $ToolManifest "rust.toolchain"
+$CargoNextestVersion = Get-ToolManifestValue $ToolManifest "cargo_nextest.version"
+$rustupRelease = Get-ToolArtifact $ToolManifest "rustup" $ToolPlatform
+$RustupVersion = $rustupRelease.Version
+$RustupArtifact = $rustupRelease.Name
+$RustupSha256 = $rustupRelease.Sha256
+$sccacheRelease = Get-ToolArtifact $ToolManifest "sccache" $ToolPlatform
+$SccacheVersion = $sccacheRelease.Version
+$SccacheArtifact = $sccacheRelease.Name
+$SccacheSha256 = $sccacheRelease.Sha256
+$runnerRelease = Get-ToolArtifact $ToolManifest "actions_runner" $ToolPlatform
+$RunnerVersion = $runnerRelease.Version
+$RunnerArtifact = $runnerRelease.Name
+$RunnerSha256 = $runnerRelease.Sha256
+
+$ExpectedRunnerLabels = Get-ExpectedRunnerLabels `
+    -AdditionalLabels $ExtraRunnerLabels -BenchmarkRunner:$BenchmarkRunner
 
 if (-not $RunnerOnly) {
     if ([string]::IsNullOrWhiteSpace($Workspace)) {
@@ -42,16 +188,6 @@ if (-not $RunnerOnly) {
     }
     $Workspace = (Resolve-Path -LiteralPath $Workspace).Path
 }
-
-$RustToolchain = "stable"
-$MinimumRustVersion = [version]"1.95.0"
-$RustupVersion = "1.29.1"
-$RustupSha256 = "6f4bef66261261fcb43131be8720bab817d403a09edec7455c371974b90bdb7e"
-$CargoNextestVersion = "0.9.133"
-$SccacheVersion = "0.18.0"
-$SccacheSha256 = "1a63c1be2beab3f04d27e4cc145443e092e02d3dd83a51030989829d7023091b"
-$RunnerVersion = "2.337.0"
-$RunnerSha256 = "1150692afa94e71f872017e254ea55b6eece1eece3fe7e3a6d4c93d0a1b85cfc"
 $ToolRoot = Join-Path $env:ProgramData "nvx"
 $TrustedCargoHome = Join-Path $ToolRoot "cargo"
 $CargoHome = Join-Path $RunnerDirectory "_work\_temp\cargo-home"
@@ -62,12 +198,15 @@ $RustupHome = Join-Path $ToolRoot "rustup"
 $RequiredGuestArtifacts = @(
     "vmlinux",
     "vmlinux.config",
+    "vmlinux.provenance.json",
     "initramfs.cpio.gz",
     "initramfs.cpio.gz.packages.json",
+    "initramfs.provenance.json",
     "initramfs-ubuntu.cpio.gz",
     "initramfs-ubuntu.cpio.gz.packages.json",
     "ubuntu-distro.erofs",
     "ubuntu-distro.erofs.manifest.json",
+    "ubuntu-smoke-scratch.ext4",
     "initramfs-azurelinux.cpio.gz",
     "initramfs-azurelinux.cpio.gz.packages.json"
 )
@@ -317,6 +456,23 @@ function Assert-ActionsRunnerWritablePaths {
         if (-not $item.PSIsContainer) {
             throw "runner writable path is not a directory: $path"
         }
+    }
+}
+
+function Assert-FreshRunnerDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $root = Get-Item -LiteralPath $Path -Force
+    $unexpected = @(Get-ChildItem -LiteralPath $Path -Force |
+        Where-Object {
+            $_.Name -ne "_work" -or
+            -not $_.PSIsContainer -or
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        })
+    if (-not $root.PSIsContainer -or
+        $root.Attributes -band [IO.FileAttributes]::ReparsePoint -or
+        $unexpected.Count -ne 0) {
+        throw "refusing to install into partial runner directory: $Path"
     }
 }
 
@@ -697,7 +853,7 @@ function Install-Toolchain {
         try {
             Invoke-WebRequest `
                 -UseBasicParsing `
-                -Uri "https://static.rust-lang.org/rustup/archive/$RustupVersion/x86_64-pc-windows-msvc/rustup-init.exe" `
+                -Uri "https://static.rust-lang.org/rustup/archive/$RustupVersion/$RustupArtifact" `
                 -OutFile $rustupInstaller
             $actualHash = (Get-FileHash `
                     -LiteralPath $rustupInstaller `
@@ -719,8 +875,11 @@ function Install-Toolchain {
         }
     }
     Update-ProcessPath
+    # Keep the pinned rustup. Its self-update replaces rustup.exe from a
+    # detached process after rustup exits, racing the next rustup command.
     Invoke-Native $rustupPath @(
-        "toolchain", "install", $RustToolchain, "--profile", "minimal"
+        "toolchain", "install", $RustToolchain, "--profile", "minimal",
+        "--no-self-update"
     )
     Invoke-Native $rustupPath @(
         "target", "add",
@@ -754,14 +913,16 @@ function Install-Toolchain {
             "sccache $([regex]::Escape($SccacheVersion))"
     }
     if ($installSccache) {
+        # The archive holds a directory named after it.
+        $sccachePackage = $SccacheArtifact -replace '\.tar\.gz$', ''
         $archive = Join-Path $ToolRoot `
-            "sccache-v$SccacheVersion-x86_64-pc-windows-msvc-$([guid]::NewGuid().ToString('N')).tar.gz"
+            "$sccachePackage-$([guid]::NewGuid().ToString('N')).tar.gz"
         $extractDirectory = Join-Path $ToolRoot `
             "sccache-v$SccacheVersion-$([guid]::NewGuid().ToString('N'))"
         try {
             Invoke-WebRequest `
                 -UseBasicParsing `
-                -Uri "https://github.com/mozilla/sccache/releases/download/v$SccacheVersion/sccache-v$SccacheVersion-x86_64-pc-windows-msvc.tar.gz" `
+                -Uri "https://github.com/mozilla/sccache/releases/download/v$SccacheVersion/$SccacheArtifact" `
                 -OutFile $archive
             $actualHash = (Get-FileHash `
                     -LiteralPath $archive `
@@ -779,7 +940,7 @@ function Install-Toolchain {
             )
             $extracted = Join-Path `
                 $extractDirectory `
-                "sccache-v$SccacheVersion-x86_64-pc-windows-msvc\sccache.exe"
+                "$sccachePackage\sccache.exe"
             if (-not (Test-Path -LiteralPath $extracted -PathType Leaf)) {
                 throw "sccache executable was not found after extraction"
             }
@@ -1000,7 +1161,7 @@ function Assert-RunnerPackage {
 
 function Install-ActionsRunner {
     param([Parameter()][string]$Token)
-    $archiveName = "actions-runner-win-x64-$RunnerVersion.zip"
+    $archiveName = $RunnerArtifact
     $downloadUrl = "https://github.com/actions/runner/releases/download/v$RunnerVersion/$archiveName"
 
     New-Item -ItemType Directory -Path $RunnerDirectory -Force | Out-Null
@@ -1019,9 +1180,7 @@ function Install-ActionsRunner {
 
         $listener = Join-Path $RunnerDirectory "bin\Runner.Listener.exe"
         if (-not (Test-Path -LiteralPath $listener -PathType Leaf)) {
-            if (@(Get-ChildItem -LiteralPath $RunnerDirectory -Force).Count -ne 0) {
-                throw "refusing to install into partial runner directory: $RunnerDirectory"
-            }
+            Assert-FreshRunnerDirectory -Path $RunnerDirectory
             Copy-Item `
                 -Path (Join-Path $packageRoot "*") `
                 -Destination $RunnerDirectory `
@@ -1045,7 +1204,7 @@ function Install-ActionsRunner {
     $runnerConfiguration = Join-Path $RunnerDirectory ".runner"
     $serviceFile = Join-Path $RunnerDirectory ".service"
     $labelsFile = Join-Path $RunnerDirectory ".nvx-labels"
-    $labels = "windows,whp,virtual-machine"
+    $labels = $ExpectedRunnerLabels
     $runnerNameValidated = $false
     if (Test-Path -LiteralPath $runnerConfiguration -PathType Leaf) {
         $configuration = Get-Content -LiteralPath $runnerConfiguration -Raw |
@@ -1230,7 +1389,7 @@ function Assert-ActionsRunner {
     }
     if (-not [string]::IsNullOrWhiteSpace($RunnerName)) {
         $labelsFile = Join-Path $RunnerDirectory ".nvx-labels"
-        $expectedLabels = "windows,whp,virtual-machine"
+        $expectedLabels = $ExpectedRunnerLabels
         if (-not (Test-Path -LiteralPath $labelsFile -PathType Leaf) -or
             (Get-Content -LiteralPath $labelsFile -Raw).Trim() -ne
             $expectedLabels) {
@@ -1438,11 +1597,11 @@ function Assert-Environment {
 
     $rustVersion = & (Get-RequiredCommand "rustup.exe") `
         run $RustToolchain rustc --version
-    Assert-LastExitCode "stable Rust"
+    Assert-LastExitCode "Rust $RustToolchain"
     $rustVersionText = $rustVersion -join "`n"
     if ($rustVersionText -notmatch "rustc ([0-9]+\.[0-9]+\.[0-9]+)" -or
-        [version]$Matches[1] -lt $MinimumRustVersion) {
-        throw "Rust $MinimumRustVersion or newer is required"
+        $Matches[1] -ne $RustToolchain) {
+        throw "Rust $RustToolchain is required, found $rustVersionText"
     }
     $nextestVersion = & (Get-RequiredCommand "cargo-nextest.exe") --version
     Assert-LastExitCode "cargo-nextest --version"
@@ -1515,8 +1674,29 @@ function Assert-Environment {
                         -PathType Leaf)) {
                 throw "missing OpenVMM release binary"
             }
-            Invoke-Native $python @(
-                "scripts\nvx.py", "run",
+            # nvx-rs runs NVX's microVMs; a current build changes nothing.
+            Invoke-Native (Get-RequiredCommand "cargo.exe") @(
+                "+$RustToolchain", "build", "--release", "--locked",
+                "--features", "cli",
+                "--manifest-path", "nvx-rs\Cargo.toml",
+                "--target-dir", "nvx-rs\target"
+            )
+            $nvxRs = "$Workspace\nvx-rs\target\release\nvx-rs.exe"
+            # Packaging and the adversarial executor take only an nvx-rs whose
+            # provenance binds it to the checkout's sources.
+            $previousNvxRs = $env:NVX_RS
+            $previousToolchain = $env:RUSTUP_TOOLCHAIN
+            $env:NVX_RS = $nvxRs
+            $env:RUSTUP_TOOLCHAIN = $RustToolchain
+            try {
+                Invoke-Native $python @("scripts\nvx.py", "record-nvx-rs-provenance")
+            }
+            finally {
+                $env:NVX_RS = $previousNvxRs
+                $env:RUSTUP_TOOLCHAIN = $previousToolchain
+            }
+            Invoke-Native $nvxRs @(
+                "run",
                 "--hypervisor", "whp",
                 "--dry-run"
             )
@@ -1533,6 +1713,10 @@ if (-not $RunnerOnly -and -not [string]::IsNullOrWhiteSpace($RunnerName)) {
 if ($RunnerTokenStdin -and
     (-not $RunnerOnly -or [string]::IsNullOrWhiteSpace($RunnerName))) {
     throw "-RunnerTokenStdin requires -RunnerOnly and -RunnerName"
+}
+if ($BenchmarkRunner -and
+    (-not $RunnerOnly -or [string]::IsNullOrWhiteSpace($RunnerName))) {
+    throw "-BenchmarkRunner requires -RunnerOnly and -RunnerName"
 }
 
 Assert-SupportedHost -SkipWorkspace:$RunnerOnly

@@ -54,6 +54,7 @@ members = [
   "petri/make_imc_hive",
   "petri/petri-tool",
   "vm/devices/get/test_igvm_agent_rpc_server",
+  "vm/devices/storage/openvmm-img",
   "vm/devices/tpm/tpm_guest_tests",
   "vm/loader/igvmfilegen",
   "vm/loader/snp_bootshim",
@@ -75,7 +76,7 @@ rust-version = "1.95"
 edition = "2024"
 # The canonical OpenVMM version. It remains at the most recently released
 # version until a reviewed pull request selects the next release.
-version = "0.2.0"
+version = "0.3.0"
 
 [workspace.dependencies]
 xtask_fuzz = { path = "xtask/xtask_fuzz" }
@@ -284,7 +285,8 @@ hyperv_ic_resources = { path = "vm/devices/hyperv_ic_resources" }
 hyperv_ic_guest = { path = "vm/devices/hyperv_ic_guest" }
 input_core = { path = "vm/devices/input_core" }
 hyperv_keyboard_protocol = { path = "vm/devices/input/hyperv_keyboard_protocol" }
-cxl_spec = { path = "vm/devices/cxl" }
+cxl = { path = "vm/devices/cxl" }
+cxl_spec = { path = "vm/devices/cxl/cxl_spec" }
 underhill_config = { path = "vm/devices/get/underhill_config" }
 missing_dev = { path = "vm/devices/missing_dev" }
 missing_dev_resources = { path = "vm/devices/missing_dev_resources" }
@@ -345,6 +347,7 @@ disk_striped = { path = "vm/devices/storage/disk_striped" }
 disk_vhd1 = { path = "vm/devices/storage/disk_vhd1" }
 disklayer_vhdx = { path = "vm/devices/storage/disklayer_vhdx" }
 disk_vhdmp = { path = "vm/devices/storage/disk_vhdmp" }
+disk_zerofill = { path = "vm/devices/storage/disk_zerofill" }
 disklayer_ram = { path = "vm/devices/storage/disklayer_ram" }
 disklayer_sqlite = { path = "vm/devices/storage/disklayer_sqlite" }
 floppy = { path = "vm/devices/storage/floppy" }
@@ -376,6 +379,7 @@ serial_debugcon_resources = { path = "vm/devices/serial/serial_debugcon_resource
 serial_core = { path = "vm/devices/serial/serial_core" }
 serial_pl011 = { path = "vm/devices/serial/serial_pl011" }
 serial_pl011_resources = { path = "vm/devices/serial/serial_pl011_resources" }
+serial_uart_resources = { path = "vm/devices/serial/serial_uart_resources" }
 serial_socket = { path = "vm/devices/serial/serial_socket" }
 tpm_device = { path = "vm/devices/tpm/tpm_device" }
 tpm_lib = { path = "vm/devices/tpm/tpm_lib" }
@@ -656,7 +660,7 @@ igvm_defs = { git = "https://github.com/microsoft/igvm", rev = "b7e717d40653f8c2
 kvm-bindings = "0.14.0"
 mshv-bindings = "0.6.8"
 mshv-ioctls = "0.6.8"
-uefi = "0.35.0"
+uefi = "0.41.0"
 vfio-bindings = "0.4.0"
 x86_64 = { version = "0.15.2", default-features = false }
 

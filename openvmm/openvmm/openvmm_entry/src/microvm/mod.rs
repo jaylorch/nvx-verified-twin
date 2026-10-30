@@ -57,7 +57,34 @@ use chipset_resources::microvm::MicrovmSnapshotBoundaryRequest;
 use net_backend_resources::egress::EgressPolicy;
 use openvmm_helpers::snapshot::microvm::SnapshotAttachment;
 use output::MicrovmOutputDrain;
+use std::path::Path;
 use std::path::PathBuf;
+
+/// The live host side of the microVM filesystem.
+#[derive(Clone, Debug)]
+pub(crate) struct MicrovmFilesystemHost {
+    /// Snapshot identity of the filesystem's attachment.
+    pub(crate) attachment: SnapshotAttachment,
+    /// Canonical host root of a single directory; empty for an aggregate.
+    pub(crate) root_path: PathBuf,
+    /// Canonical host roots and live root attachments of an aggregate's
+    /// children, in child order.
+    pub(crate) children: Vec<(PathBuf, SnapshotAttachment)>,
+}
+
+impl MicrovmFilesystemHost {
+    /// Returns every live host root of the filesystem.
+    pub(crate) fn root_paths(&self) -> Vec<&Path> {
+        if self.children.is_empty() {
+            vec![self.root_path.as_path()]
+        } else {
+            self.children
+                .iter()
+                .map(|(root_path, _)| root_path.as_path())
+                .collect()
+        }
+    }
+}
 
 /// Host-side microVM resources produced while building the VM configuration
 /// and consumed by the snapshot, restore, and teardown paths.
@@ -79,14 +106,13 @@ pub(crate) struct MicrovmResources {
     pub(crate) control_console_socket_cleanup: Option<MicrovmConsoleSocketCleanup>,
     /// Snapshot identity of the portable network attachment.
     pub(crate) network_attachment: Option<SnapshotAttachment>,
-    /// The bound run-scoped egress policy.
+    /// The egress policy that the snapshot contract records: the bound
+    /// run-scoped policy, except at a restore with `--restore-network-policy`,
+    /// where it is the complete deny-all of the template whose policy the
+    /// restore replaces.
     pub(crate) egress_policy: Option<EgressPolicy>,
-    /// Snapshot identities of the live filesystem roots, in virtio-fs slot
-    /// order.
-    pub(crate) filesystem_attachments: Vec<SnapshotAttachment>,
-    /// Canonical host paths of the live filesystem roots, in virtio-fs slot
-    /// order.
-    pub(crate) filesystem_root_paths: Vec<PathBuf>,
+    /// The live host side of the attached filesystem.
+    pub(crate) filesystem: Option<MicrovmFilesystemHost>,
     /// Under the time ABI, seals the time fields of the restore packet; the
     /// restoring worker takes it.
     pub(crate) restore_time_record:
