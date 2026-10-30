@@ -80,7 +80,7 @@ steps:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
-      DEFAULT_BRANCH: dev
+      DEFAULT_BRANCH: main
       WORKFLOW_ID: ${{ github.aw.import-inputs.workflow-id }}
     run: |
       set -euo pipefail
@@ -407,7 +407,7 @@ steps:
           "validated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
           "run_id": os.environ.get("GITHUB_RUN_ID", ""),
           "head_sha": os.environ.get("GITHUB_SHA", ""),
-          "default_branch": os.environ.get("DEFAULT_BRANCH", "dev"),
+          "default_branch": os.environ["DEFAULT_BRANCH"],
           "baseline": results,
           "baseline_passed": all(item["status"] == "passed" for item in results),
           "not_run": [
@@ -482,6 +482,7 @@ steps:
         jq --slurp 'add | unique_by(.number) | sort_by(.updated_at) | reverse' \
           > /tmp/gh-aw/agent/pull-request-history.json
 safe-outputs:
+  report-incomplete: {}
   mentions: false
   steps:
     - name: Enforce pull request line limit
@@ -536,7 +537,7 @@ safe-outputs:
     draft: true
     max: 1
     expires: 14d
-    base-branch: dev
+    base-branch: main
     allowed-files:
       - "doc/*.md"
       - "doc/**/*.md"
@@ -585,6 +586,14 @@ safe-outputs:
 ---
 
 # NVX Code Improvement
+
+This verified twin uses `main`, not the integration repository's `dev` branch.
+Use the configured base branch for the pull request; do not override it.
+If a required operation fails after the permitted recovery attempts, use the
+available `report_incomplete` safe-output tool, not `missing_tool`. The compiler
+also supplies `report_incomplete` by default; absence from a Markdown declaration
+does not mean it is unavailable. Inspect the actual tool schema before reporting
+a missing tool.
 
 This run belongs to the `${{ github.aw.import-inputs.workflow-id }}` workflow,
 one of four single-category NVX code-improvement workflows: `code-quality`,

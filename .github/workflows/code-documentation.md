@@ -8,7 +8,7 @@ on:
   skip-if-match:
     query: 'is:pr is:open "gh-aw-workflow-id: code-documentation" in:body'
     max: 1
-if: github.event_name != 'workflow_dispatch' || github.ref_name == 'dev'
+if: github.event_name != 'workflow_dispatch' || github.ref_name == 'main'
 permissions:
   contents: read
   issues: read

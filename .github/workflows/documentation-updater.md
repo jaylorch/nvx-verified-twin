@@ -1,7 +1,7 @@
 ---
 name: documentation-updater
 description: Keep docs accurate and up-to-date
-intent: Keep NVX MicroVM design documentation aligned with the exact OpenVMM implementation pinned by the repository while avoiding speculative or duplicate updates.
+intent: Keep NVX MicroVM design documentation aligned with the exact OpenVMM implementation vendored in the verified twin while avoiding speculative or duplicate updates.
 on:
   schedule: weekly
   workflow_dispatch:
@@ -54,12 +54,14 @@ steps:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: main
     run: |
       set -euo pipefail
       mkdir -p /tmp/gh-aw/agent
       cat > /tmp/gh-aw/agent/validate_design_docs.py <<'PY'
       import argparse
       import json
+      import os
       import re
       import subprocess
       from pathlib import Path
@@ -72,7 +74,7 @@ steps:
       index = root / "doc" / "design.md"
       design_dir = root / "doc" / "design"
       openvmm_dir = (root / "openvmm").resolve()
-      openvmm_materialized = (openvmm_dir / ".git").exists()
+      openvmm_materialized = (openvmm_dir / "Cargo.toml").is_file()
       errors: list[str] = []
 
       if not index.is_file():
@@ -135,20 +137,42 @@ steps:
       if errors:
           raise SystemExit("\n".join(errors))
 
-      openvmm_sha = subprocess.run(
-          ["git", "rev-parse", ":openvmm"],
+      openvmm_tree = subprocess.run(
+          ["git", "rev-parse", "HEAD:openvmm"],
           check=True,
           capture_output=True,
           text=True,
       ).stdout.strip()
+      subprocess.run(
+          ["git", "diff", "--exit-code", "HEAD", "--", "openvmm"],
+          check=True,
+      )
+      untracked_openvmm = subprocess.run(
+          ["git", "ls-files", "--others", "--exclude-standard", "--", "openvmm"],
+          check=True,
+          stdout=subprocess.PIPE,
+          text=True,
+      ).stdout
+      if untracked_openvmm:
+          raise SystemExit(
+              "Untracked OpenVMM files are not part of HEAD:\n" + untracked_openvmm
+          )
       context = {
-          "default_branch": "dev",
-          "openvmm_sha": openvmm_sha,
+          "default_branch": os.environ["DEFAULT_BRANCH"],
+          "openvmm_tree": openvmm_tree,
+          "repository_sha": subprocess.run(
+              ["git", "rev-parse", "HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip(),
           "design_index": str(index.relative_to(root)),
           "design_chapters": [str(path.relative_to(root)) for path in chapters],
           "post_edit_validation": [
               "python3 /tmp/gh-aw/agent/validate_design_docs.py",
-              "python3 scripts/nvx.py verify",
+              "git diff --exit-code HEAD -- openvmm",
+              "untracked=$(git ls-files --others --exclude-standard -- openvmm) "
+              "&& test -z \"$untracked\"",
               "git diff --check",
           ],
       }
@@ -158,7 +182,7 @@ steps:
       )
       print(
           f"validated {len(documents)} design documents against "
-          f"OpenVMM gitlink {openvmm_sha}"
+          f"vendored OpenVMM tree {openvmm_tree}"
       )
       PY
       python3 /tmp/gh-aw/agent/validate_design_docs.py --allow-unmaterialized-openvmm
@@ -169,88 +193,9 @@ steps:
         --limit 10 \
         --json number,title,state,isDraft,createdAt,updatedAt,closedAt,mergedAt,url \
         > /tmp/gh-aw/agent/documentation-updater-pr-history.json
-mcp-scripts:
-  prepare-openvmm:
-    description: Materialize and verify the exact private OpenVMM revision recorded by the NVX gitlink. Call this once before inspecting MicroVM implementation files.
-    env:
-      OPENVMM_DEPLOY_KEY: ${{ secrets.OPENVMM_DEPLOY_KEY }}
-    timeout: 300
-    run: |
-      set -euo pipefail
-
-      if [ -z "${OPENVMM_DEPLOY_KEY:-}" ]; then
-        echo "OPENVMM_DEPLOY_KEY is unavailable" >&2
-        exit 1
-      fi
-
-      target="$PWD/openvmm"
-      expected="$(git rev-parse :openvmm)"
-
-      if [ -e "$target/.git" ]; then
-        actual="$(git -C "$target" rev-parse HEAD)"
-        if [ "$actual" != "$expected" ]; then
-          echo "OpenVMM is at $actual, expected $expected" >&2
-          exit 1
-        fi
-        python3 scripts/nvx.py verify
-        printf '{"path":"openvmm","sha":"%s"}\n' "$actual"
-        exit 0
-      fi
-
-      if [ -e "$target" ] && [ -n "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-        echo "Refusing to replace non-empty openvmm path" >&2
-        exit 1
-      fi
-
-      checkout_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/openvmm-checkout.XXXXXX")"
-      key_file="$(mktemp "${RUNNER_TEMP:-/tmp}/openvmm-key.XXXXXX")"
-      known_hosts="$(mktemp "${RUNNER_TEMP:-/tmp}/openvmm-known-hosts.XXXXXX")"
-      cleanup() {
-        rm -f "$key_file" "$known_hosts"
-        if [ -n "${checkout_dir:-}" ] && [ -d "$checkout_dir" ]; then
-          rm -rf "$checkout_dir"
-        fi
-      }
-      trap cleanup EXIT
-
-      chmod 600 "$key_file"
-      printf '%s\n' "$OPENVMM_DEPLOY_KEY" > "$key_file"
-      python3 - <<'PY' > "$known_hosts"
-      import json
-      import urllib.request
-
-      request = urllib.request.Request(
-          "https://api.github.com/meta",
-          headers={"User-Agent": "nvx-documentation-updater"},
-      )
-      with urllib.request.urlopen(request, timeout=30) as response:
-          metadata = json.load(response)
-      for key in metadata["ssh_keys"]:
-          print(f"github.com {key}")
-      PY
-
-      git -C "$checkout_dir" init -q
-      git -C "$checkout_dir" remote add origin git@github.com:nanvix/openvmm.git
-      GIT_SSH_COMMAND="ssh -i $key_file -o IdentitiesOnly=yes -o UserKnownHostsFile=$known_hosts -o StrictHostKeyChecking=yes" \
-        git -C "$checkout_dir" fetch --depth=1 origin "$expected"
-      git -C "$checkout_dir" checkout -q --detach FETCH_HEAD
-
-      actual="$(git -C "$checkout_dir" rev-parse HEAD)"
-      if [ "$actual" != "$expected" ]; then
-        echo "Fetched OpenVMM $actual, expected $expected" >&2
-        exit 1
-      fi
-
-      if [ -d "$target" ]; then
-        rmdir "$target"
-      fi
-      mv "$checkout_dir" "$target"
-      checkout_dir=""
-
-      python3 scripts/nvx.py verify
-      printf '{"path":"openvmm","sha":"%s"}\n' "$actual"
 safe-outputs:
   mentions: false
+  report-incomplete: {}
   create-pull-request:
     title-prefix: "[documentation-updater] "
     branch-prefix: "documentation-updater/"
@@ -258,7 +203,7 @@ safe-outputs:
     draft: true
     max: 1
     expires: 14
-    base-branch: dev
+    base-branch: main
     allowed-files:
       - "doc/design/**"
     protected-files: fallback-to-issue
@@ -271,7 +216,7 @@ evals:
     - id: operational_value
       question: Does the agent output demonstrate that a draft pull request corrected at least one specific mismatch between doc/design and the pinned OpenVMM MicroVM implementation?
     - id: pinned_revision
-      question: Does the agent output identify the exact pinned OpenVMM commit that was examined?
+      question: Does the agent output identify the repository commit and exact vendored OpenVMM tree that were examined?
     - id: implementation_evidence
       question: Does the agent output cite specific OpenVMM source or test paths as evidence for the documentation changes?
     - id: scoped_changes
@@ -286,7 +231,7 @@ evals:
 ## Operational value
 
 A successful run opens one draft pull request that corrects at least one
-demonstrable mismatch in `doc/design/**` against the pinned OpenVMM MicroVM
+demonstrable mismatch in `doc/design/**` against the vendored OpenVMM MicroVM
 implementation, cites the supporting code or tests, and passes documentation
 validation.
 
@@ -297,18 +242,24 @@ validation.
    `doc/project-structure.md`.
 2. Read `/tmp/gh-aw/agent/repository-context.json` and
    `/tmp/gh-aw/agent/documentation-updater-pr-history.json`.
-3. Call the `prepare-openvmm` tool exactly once. It must materialize the
-   gitlink's exact commit under `openvmm/` and make
-   `python3 scripts/nvx.py verify` pass. If the tool or credential is
-   unavailable, call `report_incomplete`; do not create a pull request.
+3. Confirm `openvmm/Cargo.toml` exists and run
+   `python3 /tmp/gh-aw/agent/validate_design_docs.py`, which rejects both
+   tracked changes and non-ignored untracked files under `openvmm/`.
+   The verified twin vendors OpenVMM
+   as a tracked source tree, not a private submodule. Do not fetch, initialize,
+   replace, or edit it, and do not request a deploy key. If the source tree is
+   unavailable or differs from HEAD, call `report_incomplete`; do not create a
+   pull request. Record both `repository_sha` and `openvmm_tree` from context.
 4. Read `openvmm/.github/copilot-instructions.md` before inspecting OpenVMM.
 
 ## Task
 
-Compare the current design chapters with the pinned OpenVMM implementation and
+Compare the current design chapters with the vendored OpenVMM implementation and
 tests. Treat implementation and executable tests as the source of truth. Use
 `doc/design/code-ownership-map.md` to start from the relevant implementation
-surface, then verify claims directly in code.
+surface, then verify claims directly in code. Inspect only tracked implementation
+and test paths in the recorded tree; ignored or generated content is not
+implementation evidence.
 
 Use the configured GPT-5.6 SOL Fast model, 1M-token long-context tier, and
 maximum reasoning effort to inspect all relevant evidence before editing.
@@ -339,12 +290,15 @@ Purely cosmetic rewriting does not qualify.
 Before requesting the safe output:
 
 1. Run `python3 /tmp/gh-aw/agent/validate_design_docs.py`.
-2. Run `python3 scripts/nvx.py verify`.
-3. Run `git diff --check`.
-4. Review `git diff -- doc/design` and confirm every changed statement is
-   supported by the pinned OpenVMM source or tests.
+2. Run `git diff --exit-code HEAD -- openvmm`.
+3. Run `git ls-files --others --exclude-standard -- openvmm` and confirm its
+   output is empty and its exit status is zero. Do not inspect untracked files
+   as implementation evidence; the validator rejects them before writing context.
+4. Run `git diff --check`.
+5. Review `git diff -- doc/design` and confirm every changed statement is
+   supported by the vendored OpenVMM source or tests.
 
-The pull request body must state the pinned OpenVMM SHA, the mismatches
+The pull request body must state the repository SHA and OpenVMM tree SHA, the mismatches
 corrected, the exact evidence paths inspected, and the validation results.
 
 Reserve one model invocation after the final commit for `create-pull-request`.
@@ -354,7 +308,7 @@ searches or rereading passing validation logs.
 ## Boundaries
 
 - **DO NOT** edit files outside `doc/design/**`.
-- **DO NOT** modify OpenVMM source, the `openvmm` gitlink, manifests, CI
+- **DO NOT** modify OpenVMM source, manifests, CI
   configuration, workflow files, generated files, agent instructions, scripts,
   kernel inputs, Alpine files, or performance data.
 - **DO NOT** delete design chapters, sections, rationale, diagrams, tables, or

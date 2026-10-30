@@ -256,7 +256,33 @@ instructions, CI, and build configuration. At minimum:
 Report unavailable tools, platforms, credentials, or host capabilities as
 blocked. Never report an unrun gate as passed.
 
-## 8. Publish Durable Checkpoints
+## 8. Frequently Merge Validated Work Into Main
+
+For jaylorch/nvx-verified-twin, merge each completed, validated, independently
+reviewed bounded objective into main and push the result. Do this before
+starting the next objective, rather than waiting until the campaign ends.
+
+At least once per hour, check for merge-ready work and integrate it.
+Incomplete long-term proofs and pending external handoffs are not reasons
+to defer merging validated partial progress.
+
+Normal merges and non-force pushes to the twin's main are authorized
+without asking permission. Fetch current main first, preserve concurrent
+changes and dirty work, and merge only completed work. Do not bypass
+required validation, review, or branch protections.
+
+If protections require a PR, follow the repository's required PR process.
+If integration is blocked, record the exact blocker in the campaign issue,
+create or update a human-needed issue when appropriate, and continue
+independent work.
+
+A bounded objective is not integrated merely because its topic branch
+was pushed. Its checkpoint must identify the resulting main commit,
+or explicitly state why the merge remains blocked.
+
+This authorization applies only to the twin repository.
+
+## 9. Publish Durable Checkpoints
 
 After each bounded objective, update the campaign issue with:
 
