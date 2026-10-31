@@ -60,7 +60,7 @@ pub struct DiskIoTestState {
 }
 
 fn build_firmware(resolver: &petri::ArtifactResolver<'_>) -> petri::Firmware {
-    petri::Firmware::linux_direct(resolver, MachineArch::host())
+    petri::Firmware::linux_direct(resolver, MachineArch::host(), None)
 }
 
 fn require_petritools_erofs(
@@ -186,6 +186,7 @@ impl crate::harness::WarmPerfTest for DiskIoTest {
                                     virtio_resources::blk::VirtioBlkHandle {
                                         disk: FileDiskHandle(erofs_file.into()).into_resource(),
                                         read_only: true,
+                                        serial: None,
                                     }
                                     .into_resource(),
                                 )
@@ -198,6 +199,7 @@ impl crate::harness::WarmPerfTest for DiskIoTest {
                                     virtio_resources::blk::VirtioBlkHandle {
                                         disk,
                                         read_only: false,
+                                        serial: None,
                                     }
                                     .into_resource(),
                                 )
@@ -226,6 +228,7 @@ impl crate::harness::WarmPerfTest for DiskIoTest {
                                         virtio_resources::blk::VirtioBlkHandle {
                                             disk: FileDiskHandle(erofs_file.into()).into_resource(),
                                             read_only: true,
+                                            serial: None,
                                         }
                                         .into_resource(),
                                     )

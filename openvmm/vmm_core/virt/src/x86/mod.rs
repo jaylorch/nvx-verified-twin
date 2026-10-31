@@ -75,7 +75,8 @@ pub struct X86PartitionCapabilities {
     pub sgx: bool,
     /// TSC_AUX is supported
     pub tsc_aux: bool,
-    /// IA32_TSC_DEADLINE is supported.
+    /// Architectural TSC-deadline state is available. Backends without access
+    /// to this MSR must clear this even if guest CPUID advertises the feature.
     pub tsc_deadline: bool,
     /// The address of the virtual top of memory, for encrypted VMs.
     ///

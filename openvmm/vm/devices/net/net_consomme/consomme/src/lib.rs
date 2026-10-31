@@ -22,10 +22,12 @@ mod dhcpv6;
 mod dns;
 mod dns_resolver;
 mod icmp;
+mod inbound;
 pub mod limits;
 mod local_addr_map;
 mod ndp;
 pub mod static_ipv4;
+pub mod static_ipv6;
 mod tcp;
 mod udp;
 
@@ -44,6 +46,8 @@ const DEFAULT_TCP_BUFFER_BOUNDS: TcpBufferBounds = TcpBufferBounds {
 
 pub use dns_resolver::StaticDnsRecord;
 pub use dns_resolver::StaticDnsRecordError;
+pub use inbound::InboundAdmission;
+pub use inbound::is_private_network_address;
 use inspect::Inspect;
 use inspect::InspectMut;
 use pal_async::driver::Driver;
@@ -89,11 +93,18 @@ impl core::fmt::Display for FourTuple {
 struct PortForwardKey {
     family: IpVersion,
     guest_port: u16,
+    /// Whether the listener publishes the guest port to the host's private
+    /// networks, which it may do beside an explicit forward to that port.
+    published: bool,
 }
 
 impl PortForwardKey {
     fn new(family: IpVersion, guest_port: u16) -> Self {
-        Self { family, guest_port }
+        Self {
+            family,
+            guest_port,
+            published: false,
+        }
     }
 
     fn from_socket_addr(addr: SocketAddr, guest_port: u16) -> Self {
@@ -103,11 +114,37 @@ impl PortForwardKey {
         };
         Self::new(family, guest_port)
     }
+
+    /// Returns the key of the listener that publishes the same guest port.
+    fn publication(self) -> Self {
+        Self {
+            published: true,
+            ..self
+        }
+    }
+
+    /// Returns the key of a listener that admits the peers that `admission`
+    /// admits.
+    fn with_admission(self, admission: InboundAdmission) -> Self {
+        Self {
+            published: admission.publishes_guest_port(),
+            ..self
+        }
+    }
+
+    /// Returns whether both keys name the same guest port of one family.
+    fn same_guest_port(self, other: Self) -> bool {
+        self.family == other.family && self.guest_port == other.guest_port
+    }
 }
 
 impl core::fmt::Display for PortForwardKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}:{}", self.family, self.guest_port)
+        write!(f, "{}:{}", self.family, self.guest_port)?;
+        if self.published {
+            f.write_str(":published")?;
+        }
+        Ok(())
     }
 }
 
@@ -130,6 +167,8 @@ struct ConsommeState {
     #[inspect(skip)]
     buffer: Box<[u8]>,
     local_addr_map: local_addr_map::LocalAddrMap,
+    #[inspect(skip)]
+    host_addresses: inbound::HostAddresses,
 }
 
 /// Dynamic networking properties of a consomme endpoint.
@@ -179,6 +218,12 @@ pub struct ConsommeParams {
     /// This field is learned from incoming IPv6 traffic from the guest.
     #[inspect(with = "|x| x.map(inspect::AsDisplay)")]
     pub client_ip_ipv6_routable: Option<Ipv6Address>,
+    /// Routable IPv6 address of the gateway on a link with a static IPv6
+    /// identity (see [`ConsommeParams::set_static_ipv6`]). The gateway answers
+    /// Neighbor Discovery, echo requests, and DNS at this address as at its
+    /// link-local address.
+    #[inspect(with = "|x| x.map(inspect::AsDisplay)")]
+    pub gateway_ipv6: Option<Ipv6Address>,
     /// Idle timeout for UDP connections.
     pub udp_timeout: Duration,
     /// Inactivity timeout for TCP connections waiting for a close handshake
@@ -258,6 +303,7 @@ impl ConsommeParams {
             gateway_link_local_ipv6: Self::compute_link_local_address(gateway_mac_ipv6),
             client_ip_ipv6: None,
             client_ip_ipv6_routable: None,
+            gateway_ipv6: None,
             // Per RFC 4787, UDP NAT bindings, by default, should timeout after 5 minutes, but can be configured.
             udp_timeout: Duration::from_secs(300),
             // Defaults to 2*MSL per RFC 9293 for the `TimeWait` case.
@@ -399,6 +445,28 @@ impl ConsommeParams {
             }
         }
     }
+
+    /// Returns whether `address` is one of the gateway's IPv6 addresses: its
+    /// link-local address, or its routable address on a link with a static
+    /// IPv6 identity.
+    fn is_gateway_ipv6(&self, address: Ipv6Address) -> bool {
+        address == self.gateway_link_local_ipv6 || self.gateway_ipv6 == Some(address)
+    }
+
+    /// Returns whether `address` lies in the guest's IPv4 subnet or in the
+    /// subnet of its static IPv6 identity, where the guest takes it for its
+    /// gateway, itself, or a neighbor that the gateway answers for.
+    fn is_guest_network_address(&self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => {
+                let mask = u32::from(self.net_mask);
+                u32::from(address) & mask == u32::from(self.gateway_ip) & mask
+            }
+            IpAddr::V6(address) => self
+                .gateway_ipv6
+                .is_some_and(|gateway| is_same_ipv6_subnet(address, gateway, self.prefix_len_ipv6)),
+        }
+    }
 }
 
 impl ConsommeState {
@@ -474,18 +542,32 @@ impl ConsommeState {
                 }
             }
             SocketAddr::V6(v6) if params.is_local_address(remote_addr) && !is_loopback_adapter => {
-                let virtual_ip = local_addr_map.get_or_allocate_v6(
-                    *v6.ip(),
-                    params.gateway_link_local_ipv6,
-                    params.client_ip_ipv6,
-                    params.client_ip_ipv6_routable,
-                );
+                // A static IPv6 identity's subnet is on link, as the IPv4
+                // subnet is, so a host peer presented there is answered from
+                // the guest's address in it, which a link-local peer would
+                // not be.
+                let virtual_ip = match (params.gateway_ipv6, params.client_ip_ipv6_routable) {
+                    (Some(gateway), Some(client)) => local_addr_map.get_or_allocate_v6_in_subnet(
+                        *v6.ip(),
+                        gateway,
+                        params.prefix_len_ipv6,
+                        client,
+                    ),
+                    _ => local_addr_map.get_or_allocate_v6(
+                        *v6.ip(),
+                        params.gateway_link_local_ipv6,
+                        params.client_ip_ipv6,
+                        params.client_ip_ipv6_routable,
+                    ),
+                };
                 match virtual_ip {
                     Some(ip) => SocketAddr::V6(SocketAddrV6::new(ip, v6.port(), 0, 0)),
                     None => {
-                        // Pool exhausted, fall back to gateway link-local.
+                        // Pool exhausted, fall back to the gateway.
                         SocketAddr::V6(SocketAddrV6::new(
-                            params.gateway_link_local_ipv6,
+                            params
+                                .gateway_ipv6
+                                .unwrap_or(params.gateway_link_local_ipv6),
                             v6.port(),
                             0,
                             0,
@@ -859,6 +941,7 @@ impl Consomme {
                 params,
                 buffer: Box::new([0; 65536]),
                 local_addr_map: local_addr_map::LocalAddrMap::new(),
+                host_addresses: inbound::HostAddresses::new(),
             },
             tcp: tcp::Tcp::new(tcp_rx_buffer, tcp_tx_buffer),
             udp: udp::Udp::new(udp_timeout),
@@ -897,7 +980,9 @@ impl Consomme {
     }
 
     /// Allocates a virtual address within this endpoint's subnet and routes
-    /// guest traffic sent to it to `destination` on the host.
+    /// guest traffic sent to it to `destination` on the host. An IPv6 address
+    /// lies in the static IPv6 subnet when the endpoint has one, and is
+    /// link-local otherwise.
     /// Returns `None` if the subnet's virtual address pool is exhausted.
     pub fn create_virtual_address(&mut self, destination: IpAddr) -> Option<IpAddr> {
         match destination {
@@ -912,15 +997,40 @@ impl Consomme {
                     .map(IpAddr::V4)
             }
             IpAddr::V6(destination) => {
-                let gateway_ll = self.state.params.gateway_link_local_ipv6;
-                let client_ll = self.state.params.client_ip_ipv6;
-                let client_routable = self.state.params.client_ip_ipv6_routable;
-                self.state
-                    .local_addr_map
-                    .get_or_allocate_v6(destination, gateway_ll, client_ll, client_routable)
-                    .map(IpAddr::V6)
+                let params = &self.state.params;
+                match (params.gateway_ipv6, params.client_ip_ipv6_routable) {
+                    (Some(gateway), Some(client)) => {
+                        let prefix_len = params.prefix_len_ipv6;
+                        self.state.local_addr_map.get_or_allocate_v6_in_subnet(
+                            destination,
+                            gateway,
+                            prefix_len,
+                            client,
+                        )
+                    }
+                    _ => {
+                        let gateway_ll = params.gateway_link_local_ipv6;
+                        let client_ll = params.client_ip_ipv6;
+                        let client_routable = params.client_ip_ipv6_routable;
+                        self.state.local_addr_map.get_or_allocate_v6(
+                            destination,
+                            gateway_ll,
+                            client_ll,
+                            client_routable,
+                        )
+                    }
+                }
+                .map(IpAddr::V6)
             }
         }
+    }
+
+    /// Returns the host address to which guest traffic sent to `address` is
+    /// routed, when `address` is a virtual address: one that
+    /// [`Self::create_virtual_address`] allocated, or one at which Consomme
+    /// presents a host-local peer, such as host loopback, to the guest.
+    pub fn virtual_address_destination(&self, address: IpAddr) -> Option<IpAddr> {
+        self.state.local_addr_map.resolve_virtual(&address)
     }
 
     /// Pairs the client with this instance to operate on the consomme instance.
@@ -929,6 +1039,20 @@ impl Consomme {
             inner: self,
             client,
         }
+    }
+
+    /// Returns whether a TCP connection between the guest's `guest` address
+    /// and `peer`, as the guest addresses it, exists.
+    pub fn carries_tcp_flow(&self, guest: SocketAddr, peer: SocketAddr) -> bool {
+        self.tcp.carries_flow(guest, peer)
+    }
+
+    /// Returns whether `peer`, as the guest addresses it, recently exchanged
+    /// datagrams with the guest port of `guest` that a listener publishes to
+    /// the host's private networks.
+    pub fn carries_udp_flow(&self, guest: SocketAddr, peer: SocketAddr) -> bool {
+        self.udp
+            .carries_flow(guest, self.state.resolve_destination(&peer))
     }
 }
 
@@ -1085,12 +1209,15 @@ impl<T: Client> Access<'_, T> {
         // may not reflect the actual buffer size. Skip the length validation
         // and use the full buffer.
         let segmentation_offload = checksum.tso.is_some() || checksum.gso.is_some();
-        if !segmentation_offload {
+        let payload_end = if segmentation_offload {
+            payload.len()
+        } else {
             let required_len = smoltcp::wire::IPV6_HEADER_LEN + ipv6.payload_len() as usize;
             if payload.len() < required_len {
                 return Err(DropReason::MalformedPacket);
             }
-        }
+            required_len
+        };
 
         // Reject guest traffic to host-local-only destinations.
         if !self.inner.state.params.allow_host_local_access
@@ -1099,9 +1226,16 @@ impl<T: Client> Access<'_, T> {
             return Err(DropReason::DestinationNotAllowed);
         }
 
+        // An IPv4-mapped destination is not an IPv6 destination on the wire:
+        // a dual-stack host socket would reach the IPv4 host it embeds,
+        // outside the IPv4 host-local checks.
+        if ipv6.dst_addr().to_ipv4_mapped().is_some() {
+            return Err(DropReason::DestinationNotAllowed);
+        }
+
         let next_header = ipv6.next_header();
         let src_addr = ipv6.src_addr();
-        let inner = &payload[smoltcp::wire::IPV6_HEADER_LEN..];
+        let inner = &payload[smoltcp::wire::IPV6_HEADER_LEN..payload_end];
         let addresses = Ipv6Addresses {
             src_addr,
             dst_addr: ipv6.dst_addr(),
@@ -1145,11 +1279,15 @@ impl<T: Client> Access<'_, T> {
             IpProtocol::Tcp => self.handle_tcp(&IpAddresses::V6(addresses), inner, checksum)?,
             IpProtocol::Icmpv6 => {
                 // Check if this is an NDP packet
-                let icmpv6_packet = Icmpv6Packet::new_unchecked(inner);
+                let icmpv6_packet = Icmpv6Packet::new_checked(inner)?;
                 let msg_type = icmpv6_packet.msg_type();
 
                 if msg_type.is_ndisc() {
                     self.handle_ndp(frame, inner, ipv6.src_addr())?;
+                } else if msg_type == Icmpv6Message::EchoRequest
+                    && self.inner.state.params.gateway_ipv6 == Some(addresses.dst_addr)
+                {
+                    self.handle_icmpv6_gateway_echo(frame, &addresses, inner)?;
                 } else {
                     tracing::trace!(
                         icmpv6_type = %msg_type,

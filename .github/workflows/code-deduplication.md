@@ -1,7 +1,7 @@
 ---
 name: code-deduplication
-description: Remove one small instance of repeated NVX tooling or aci_edge_sandboxes logic
-intent: Reduce NVX maintenance cost by removing one novel, validated instance of repeated internal logic in the tooling or the aci_edge_sandboxes crate, without new public abstractions or repeated rejected work.
+description: Remove one small instance of repeated NVX tooling or nvx-rs logic
+intent: Reduce NVX maintenance cost by removing one novel, validated instance of repeated internal logic in the tooling or the nvx-rs crate, without new public abstractions or repeated rejected work.
 on:
   schedule: hourly
   workflow_dispatch:
@@ -57,7 +57,7 @@ public abstraction.
 
 A qualifying candidate has at least two inline copies of the same non-trivial
 logic in `scripts/nvx.py`, `scripts/nvx_tools/`, one allowlisted shell
-script, or the sources of `aci_edge_sandboxes/src/`: the same computation,
+script, or the sources of `nvx-rs/src/`: the same computation,
 validation, parsing, or command sequence with the same inputs, results, and
 errors, not merely code with a similar shape. Consolidate every copy into one
 helper:

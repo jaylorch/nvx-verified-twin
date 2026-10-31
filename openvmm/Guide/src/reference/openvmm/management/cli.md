@@ -45,11 +45,16 @@ describes the source definitions.
   anchored to UTC,
   the microVM portb console, lifecycle ports, and the optional fixed virtio
   devices described below. User arguments cannot override `earlycon=`,
-  `console=`, `virtio_mmio.device=`, `virtnet_*=`, or `virtfs_*=`.
+  `console=`, `virtio_mmio.device=`, `virtnet_*=`, or `virtfs_*=`. The
+  effective command line, including the tokens that the profile appends after
+  the user arguments, must fit in the x86 guest kernel's 2048-byte command-line
+  buffer with its terminating NUL, so it holds at most 2047 bytes. OpenVMM
+  rejects a longer command line, or one with an embedded NUL, rather than let
+  the guest truncate it.
 
   One virtio-fs slot is exposed at MMIO `0xd0001000`, IRQ 6 and remains
-  dormant when `--mount` is omitted; `--mount` binds HostFs to it, and a
-  second `--mount` adds a second slot at MMIO `0xd0008000`, IRQ 13;
+  dormant when neither `--mount` nor `--mount-aggregate` is given; either one
+  binds HostFs to it;
   one optional `--virtio-console <BACKEND>` is exposed at MMIO `0xd0002000`,
   IRQ 7 as the boot/log console (`hvc1`); and `--microvm-sandbox-block`
   exposes fixed distro, runtime, custom, and scratch slots starting at MMIO
@@ -74,7 +79,16 @@ describes the source definitions.
   `microvm` uses one socket and one die,
   with one core per vCPU, no SMT, xAPIC mode, and contiguous APIC IDs from 0.
   Guest-requested snapshot capture and new-process restore are available for
-  blockless and fixed-block machines on Linux/KVM, Linux/MSHV, and Windows/WHP.
+  blockless and fixed-block machines on Linux/KVM, Linux/MSHV, and Windows/WHP,
+  except for the RAM-backed overlay layout.
+
+  A non-empty `--microvm-sandbox-block` topology must end with the writable
+  `scratch` block unless the command line carries exactly one
+  `nvx_overlay_upper=ramfs` token. That RAM-backed overlay layout, for a guest
+  that keeps its overlay upper in RAM, requires exactly one read-only `distro`
+  block and no other block, and it rejects `--snapshot-destination` and
+  `--restore-snapshot`. Any other `nvx_overlay_upper` token, including a bare
+  or repeated one, is rejected.
 
   ```admonish warning title="microVM migration"
   The canonical `microvm` spelling now selects the contract formerly exposed
@@ -90,6 +104,15 @@ describes the source definitions.
   requires the only supported capability profile, `--network-profile portable`;
   omitting it rejects the command before OpenVMM opens host resources.
 
+  The NIC is dual-stack. Its IPv6 identity embeds the IPv4 identity in the
+  unique local prefix `fd00::/96`: `10.0.0.2/24` gives the guest
+  `fd00::a00:2/120` and the gateway `fd00::a00:1`. The guest receives it as
+  `virtnet_ip6=` and `virtnet_gw6=` beside the IPv4 `virtnet_*` tokens, and
+  configures it statically without router discovery. The guest names the IPv4
+  gateway as its DNS server through `virtnet_dns=` when the egress policy
+  permits DNS to it over TCP or UDP, and otherwise the IPv6 gateway when the
+  policy permits DNS to that one.
+
   ```bash
   openvmm --machine microvm --hypervisor whp \
     --kernel vmlinux --initrd initramfs.cpio.gz \
@@ -100,9 +123,13 @@ describes the source definitions.
   and Windows/WHP. It needs no TAP, root access, driver, or host network
   configuration. `--net-tap` is incompatible and is rejected before any
   endpoint or host resource is created. The gateway provides DNS over UDP and
-  TCP, ICMP echo, and outbound TCP/UDP through ordinary host sockets. Consomme
-  rejects IPv4 fragments deterministically; policy filtering remains before
-  host socket creation. Its per-connection TCP buffers start at 16 KiB and
+  TCP, ICMP echo, and outbound TCP/UDP through ordinary host sockets, over IPv4
+  and IPv6. The IPv6 gateway answers Neighbor Discovery and echo requests
+  itself; ICMPv6 to other destinations is not relayed, and IPv6 destinations
+  other than the gateway need IPv6 connectivity on the host. Consomme rejects
+  IPv4 fragments deterministically and never relays IPv4-mapped IPv6
+  destinations; policy filtering remains before host socket creation. Its
+  per-connection TCP buffers start at 16 KiB and
   are bounded at 4 MiB; UDP bindings expire after five minutes; and at most
   256 DNS requests are pending at once. At most 128 TCP, 256 UDP, and 16 ICMP
   guest flows are active at once; excess flows are deterministically rejected
@@ -111,7 +138,8 @@ describes the source definitions.
   `--allow-host <IPv4[/PREFIX]>`, `--block-host <IPv4[/PREFIX]>`, and
   `--allow-endpoint <IPv4:TCP-PORT>` are repeatable, mutually exclusive
   egress modes. Filtering runs before host socket creation. Active policy
-  fails closed for malformed packets, non-IPv4 traffic, and IPv4 options.
+  fails closed for malformed packets, non-IPv4 traffic, including all IPv6,
+  and IPv4 options.
   Exact endpoint mode also rejects UDP, ICMP, VLAN, fragments, and every TCP
   destination not listed. Endpoint addresses must be usable unicast identities;
   unspecified, current-network, loopback, link-local, multicast, reserved,
@@ -126,79 +154,118 @@ describes the source definitions.
   directional network default actions onto the portable profile. Egress defaults
   to `allow`; ingress defaults to `deny`, preserving the profile's existing
   behavior when neither option is present. Egress `deny` without allow rules
-  blocks every guest-originated frame before Consomme opens a host socket.
-  Responses belonging to a guest-initiated flow remain permitted when ingress
-  is denied; unsolicited connections toward the guest remain unavailable.
+  blocks every guest-originated IPv4 and IPv6 frame before Consomme opens a
+  host socket. Responses belonging to a guest-initiated flow remain permitted
+  when ingress is denied; unsolicited connections toward the guest remain
+  unavailable.
 
-  The portable profile cannot truthfully provide unrestricted inbound
-  connectivity, so `--network-ingress allow` is rejected before VM resources
-  are opened. Egress `allow` may accompany `--block-host`; egress `deny` may
-  accompany `--allow-host` or `--allow-endpoint`. Contradictory default and
-  rule combinations are rejected at the same validation boundary.
+  `--network-ingress allow` publishes every TCP and UDP port on which the guest
+  listens to the host's private networks, without a port list. OpenVMM
+  appends `virtnet_ingress=allow` to the command line, the guest announces its
+  listeners to the IPv4 gateway, and Consomme listens on every host address at
+  each announced port, relaying only peers whose addresses are not globally
+  reachable. Globally reachable peers are refused, and so is the host itself
+  unless `--host-loopback allow` admits it. Replies to admitted peers pass
+  regardless of the egress policy. Snapshot capture rejects ingress `allow`,
+  because its listeners are live host attachments, and so does a restore,
+  unless it installs a new policy with `--restore-network-policy`.
+
+  Egress `allow` may accompany `--block-host`; egress `deny` may accompany
+  `--allow-host` or `--allow-endpoint`. Contradictory default and rule
+  combinations are rejected at the same validation boundary.
 
   `--network-egress-allow <RULE>` and `--network-egress-deny <RULE>` provide
-  the generic L3/L4 policy form. A rule is either `IPv4[/PREFIX]` or
-  `IPv4[/PREFIX]:tcp:PORT` / `IPv4[/PREFIX]:udp:PORT`. These flags require an
-  explicit `--network-egress` default, accept at most 256 rules in each list,
+  the generic L3/L4 policy form. A rule names a `CIDR`, an IPv4 or IPv6
+  address with an optional `/PREFIX`, such as `192.0.2.0/24`,
+  `2001:db8:1::/64`, or the wildcards `0.0.0.0/0` and `::/0`. A rule is
+  `CIDR`, which matches every protocol; `CIDR:tcp` or `CIDR:udp`, which match
+  every destination port of one protocol; `CIDR:icmp`, which matches every
+  ICMP message, or for an IPv6 network every ICMPv6 message;
+  `CIDR:tcp:PORT` / `CIDR:udp:PORT`, which match one TCP or UDP destination
+  port, as in `2001:db8:1::/64:tcp:443`; or `CIDR:tcp:FIRST-LAST` /
+  `CIDR:udp:FIRST-LAST`, which match the inclusive range of TCP or UDP
+  destination ports from `FIRST` through `LAST`. Ports are `1` through
+  `65535`, and a range whose `LAST` is below its `FIRST` is rejected. ICMP
+  rules take no port. Each rule matches only packets of its own address
+  family, while the `--network-egress` default applies to both. These flags
+  require an explicit `--network-egress` default, accept at most 256 rules in
+  each list,
   and cannot be mixed with the legacy `--allow-host`, `--block-host`, or
   `--allow-endpoint` forms. Deny rules are evaluated before allow rules.
-  Address-only rules apply to every IPv4 protocol; port-specific policies
+  Address-only rules apply to every protocol, and IPv4 protocol rules apply to
+  every fragment of their protocol; policies with a port-specific IPv4 rule
   reject fragmented IPv4 traffic because later fragments do not carry a
-  verifiable transport header. Parsing, canonicalization, and contradictory
-  option checks complete before VM resources are opened.
+  verifiable transport header. IPv6 packets with extension headers, including
+  fragments, and IPv6 packets to IPv4-mapped destinations are rejected. The
+  guest may resolve the IPv6 gateway with Neighbor Discovery when the policy
+  may permit IPv6, and other on-link neighbors as the rules permit them, as for
+  ARP. Parsing, canonicalization, and contradictory option checks
+  complete before VM resources are opened.
 
-  `--host-loopback <allow|deny>` controls host-local access. The portable
-  profile cannot provide generic bidirectional host-loopback connectivity:
-  explicit `allow` without `--host-loopback-forward` is rejected before VM
-  resources are opened. With deliberate forwards, `allow` preserves
-  guest-to-host access subject to egress policy and publishes only the named
-  host-to-guest ports. Omitting the option preserves the existing
-  guest-gateway-to-host-loopback mapping without publishing guest ports.
-  `deny` blocks general gateway and host-local destinations and rejects every
+  `--host-loopback <allow|deny>` controls host-local access. Explicit `allow`
+  provides generic bidirectional host-loopback connectivity without a port
+  list: the guest reaches host loopback through its gateway subject to the
+  egress policy, which applies the gateway's rules also at the addresses at
+  which Consomme presents host-loopback peers, and every TCP and UDP port on
+  which the guest listens is published on host loopback for the host alone.
+  Without `--network-ingress allow`, OpenVMM appends
+  `virtnet_ingress=host-loopback` to the command line, the guest announces its
+  listeners to the IPv4 gateway, and Consomme listens on host IPv4 or IPv6
+  loopback at each announced port, never displacing a host listener that
+  already holds the port. Replies to the host pass regardless of the egress
+  policy. With `--network-ingress allow`, the listeners published to the
+  host's private networks admit the host instead. Explicit `allow` requires an
+  IPv4 network of `/29` or larger: Consomme presents host peers to the guest
+  at addresses of the guest's subnet, which a `/30`, holding only the gateway
+  and the guest, cannot spare. OpenVMM rejects explicit `allow` on a `/30`
+  before it opens host resources, and at a restore with
+  `--restore-network-policy` of a NIC captured on one, before any vCPU runs.
+  Snapshot capture rejects explicit `allow`, because its listeners are live
+  host attachments, and so does a restore, unless it installs a new policy
+  with `--restore-network-policy`.
+  Omitting the option preserves the existing guest-gateway-to-host-loopback
+  mapping, from the IPv4 gateway to host IPv4 loopback and from the IPv6
+  gateway to host IPv6 loopback, without publishing guest ports. `deny` blocks
+  general gateway and host-local destinations and rejects every
   `--host-loopback-forward`.
 
   `--network-proxy <IPv4:TCP-PORT>` preserves one exact proxy endpoint when
   host loopback is denied. The guest-visible address must equal the derived
-  gateway, and only that TCP port is translated to host loopback. UDP on the
-  same port is not exempt, even with ordinary egress allowed. The exception is
-  included in the snapshot policy digest.
+  IPv4 gateway, and only that TCP port is translated to host loopback. UDP on
+  the same port and the IPv6 gateway are not exempt, even with ordinary egress
+  allowed. The exception is included in the snapshot policy digest.
 
   `--host-loopback-forward <tcp|udp:HOST-PORT:GUEST-PORT>` binds one localhost
-  port and forwards it into the guest. It requires explicit
-  `--host-loopback allow`; duplicate bindings and more than 64 forwards are
-  rejected before resources are opened. Live forwards are process-local
-  attachments and are rejected for snapshot capture or restore.
-  Explicit forwarding is port publishing, not support for a generic
-  bidirectional host-loopback allow policy.
+  port and forwards it into the guest, possibly to another guest port. It
+  requires explicit `--host-loopback allow`; duplicate bindings and more than
+  64 forwards are rejected before resources are opened. Live forwards are
+  process-local attachments: snapshot capture rejects them, and so does a
+  restore, unless it installs a new policy with `--restore-network-policy`.
 
   Networked snapshots record the `portable` profile, drain accepted TX and
   endpoint-ready RX at the capture boundary, rewind unused guest RX
   descriptors, and recreate a fresh Consomme endpoint generation on restore.
-  Restore of a networked snapshot requires `--network-profile portable` and
-  the same active egress policy rules. The policy digest binds the saved static
-  identity and its derived ARP next hops, which are reconstructed before vCPUs
-  start. Native sockets and NAT flow tables are not serialized. The capture
+  Restore of a networked snapshot requires `--network-profile portable` and,
+  unless `--restore-network-policy` replaces a platform snapshot's complete
+  deny-all, the same active egress policy rules. The policy digest binds the
+  saved static identity, including the IPv6 identity, and its derived ARP
+  next hops, which are reconstructed before vCPUs start. A snapshot whose
+  network predates IPv6 restores IPv4-only, with its original digest. Native
+  sockets and NAT flow tables are not serialized. The capture
   protocol does not retain pre-capture endpoint completions; restored guest
   software must establish new host-side flows.
 * `--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>`: With `--machine microvm`, attach
   one no-DAX HostFs device at MMIO `0xd0001000`, IRQ 6, with tag `microvm`.
-  Repeat it once to attach a second device at MMIO `0xd0008000`, IRQ 13, with
-  tag `microvm1`; each share has its own guest target, access mode, and
-  denied paths. The default mode is read-only; `rw` must be explicit. The
-  guest target must be an absolute, non-root Linux path without dot, parent,
-  empty, whitespace, backslash, or `=` components. Guest targets and host
-  directories of different shares must not equal or contain one another; on
-  Linux, a bind mount or nested mount that reaches the files of another share
-  counts as containing it.
+  `--mount` may appear once. The default mode is read-only; `rw` must be
+  explicit. The guest target ends at the first comma, and the mode follows
+  the last comma, so a host path may contain commas when the mode is given.
+  The guest target must be an absolute, non-root Linux path without
+  dot, parent, empty, whitespace, backslash, or `=` components.
 
   ```bash
   openvmm --machine microvm --hypervisor kvm \
     --kernel path/to/vmlinux --initrd path/to/initramfs.cpio.gz \
     --mount /mnt/share,path/to/share,ro
-  openvmm --machine microvm --hypervisor kvm \
-    --kernel path/to/vmlinux --initrd path/to/initramfs.cpio.gz \
-    --mount /workspace,path/to/workspace,rw \
-    --mount /opt/hostedtoolcache,path/to/toolcache,ro
   ```
 
   The device has one high-priority queue, one request queue, direct-I/O file
@@ -210,16 +277,64 @@ describes the source definitions.
   host; a read-only attachment rejects them with `EROFS`. On Windows, the
   links are WSL-style reparse points.
 
+  `--mount-aggregate <GUEST_TARGET>` attaches several host directories or
+  files to the same device instead, and each repeatable
+  `--mount-child <NAME,HOST_PATH[,ro|rw][,file]>` adds one, with its own
+  access mode and policy, as the entry `NAME` of the aggregate's read-only
+  root: a directory, or, with `file`, a regular host file alone, without
+  anything else of its host directory. The host path must be of the kind
+  that the flag requests. Only the guest's root user may enter that root.
+  A name is 1 to 64 ASCII letters, digits, `.`, `_`, or `-`; the mode and
+  the flag follow the last commas, so a host path may contain commas when
+  the mode is given.
+  Host paths must not equal or contain one another, so a file must not lie
+  inside a directory child; on Linux, a bind mount or nested mount that
+  reaches the files of another child counts as containing it. A file child
+  has no policy paths, and the guest cannot remove or rename it. A rename
+  between children fails with `EXDEV`, and so does a hard link, unless its
+  destination is read-only, which fails with `EROFS` first. The bootstrap
+  tokens add `virtfs_aggregate=1`, and `virtfs_mode` is `rw` when any child
+  is. `--mount-aggregate` conflicts with `--mount`, which shares only a
+  directory.
+
+  ```bash
+  openvmm --machine microvm --hypervisor kvm \
+    --kernel path/to/vmlinux --initrd path/to/initramfs.cpio.gz \
+    --mount-aggregate /run/shares \
+    --mount-child workspace,path/to/workspace,rw \
+    --mount-child toolcache,path/to/toolcache,ro \
+    --mount-child settings,path/to/settings.json,ro,file
+  ```
+
   `--mount-deny <HOST_PATH>` is repeatable and hides an existing file or
   directory inside an exported root. Paths are canonicalized to
-  host-relative policy entries before resources are opened. With two shares,
-  each path must be absolute and applies to the share whose root contains it.
-  The complete root,
+  host-relative policy entries before resources are opened. A relative path
+  is relative to the `--mount` root; with `--mount-aggregate`, each path must
+  be absolute and applies to the child whose root contains it.
+  A root may be denied only when `--mount-allow` paths expose parts of it,
+  which leaves the root traverse-only. Other roots,
   paths outside the roots, duplicates, overlaps, symlink/reparse components,
   and nested-mount crossings are rejected. The virtio-fs server blocks the
   denied subtree and its root object identity, so `..`, a second mount of the
   same device, hard-link aliases, symlinks, junctions, and bind-mount aliases
   cannot re-expose it.
+
+  `--mount-allow <HOST_PATH>` is repeatable and exposes an existing file or
+  directory inside a `--mount-deny` path again. The hidden directories on the
+  way to it become traverse-only: the guest can look them up and list the
+  entries that lead to allowed paths, but sees nothing else in them and cannot
+  modify them. The nearest denied or allowed path that contains an allowed
+  path must be a denied path; a denied path may nest inside an allowed path.
+
+  `--mount-write <HOST_PATH>` is repeatable and limits the guest's writes in a
+  read-write share to existing files or directories and everything below
+  them. The rest of the share is read-only, and the guest's modifications
+  there fail with `EROFS`; a hard link to a read-only file from a writable
+  path fails with `EXDEV`. Writable paths must not overlap or be hidden by a
+  denied path, and a read-only share rejects them. `--mount-allow` and
+  `--mount-write` paths follow the same canonicalization and share
+  attribution rules as `--mount-deny`.
+  See [virtio-fs](../../devices/virtio/virtio-fs.md#access-policy).
 
   `--mount-owner <vmm|caller>` selects the host identity of the guest's
   operations. `vmm`, the default, runs them all as OpenVMM. `caller` runs
@@ -229,18 +344,27 @@ describes the source definitions.
   requires `CAP_SETUID` and `CAP_SETGID` unless every caller has OpenVMM's
   own UID and GID and OpenVMM has no other supplementary groups; an
   operation that cannot run as its caller fails with `EPERM`. The mode applies
-  to every `--mount`.
+  to every `--mount-child`, whose roots, directories or files, must then have
+  the same owner.
   See [virtio-fs](../../devices/virtio/virtio-fs.md#host-identity-of-guest-operations).
 
   Filesystem snapshots contain guest-visible FUSE and queue state, not host
-  directory contents or native handles. An active snapshot requires
-  `--mount` again for every captured share, in capture order, with the exact
-  canonical host path, guest target, access mode, denied-path set, and
-  `--mount-owner` mode; the live roots and every saved object identity are
-  also revalidated before vCPUs start. A snapshot captured without `--mount`
-  may remain dormant or bind one new attachment to the first slot. The resumed
-  guest must then explicitly run `mount -t virtiofs microvm <GUEST_TARGET>`
-  because its cold-boot mount hook has already completed.
+  directory contents or native handles. An active snapshot requires the
+  captured `--mount` again, with the exact canonical host path, guest target,
+  access mode, denied, allowed, and writable paths, and `--mount-owner` mode;
+  the live root and every saved object identity are also revalidated before
+  vCPUs start. A snapshot of `--mount-aggregate` requires it again, with the
+  same guest target and the same `--mount-child` options, in the same order,
+  with the same canonical host paths, kinds, modes, and policy paths.
+  A snapshot captured without a filesystem may remain dormant or bind one new
+  `--mount` to the slot; a platform snapshot may instead bind a new
+  `--mount-aggregate` with its `--mount-child`, `--mount-deny`,
+  `--mount-allow`, `--mount-write`, and `--mount-owner` options, which
+  OpenVMM validates as it would at a cold boot. Either keeps the slot's device
+  and the captured command line, which has no `virtfs_*` token, so the resumed
+  guest must learn the guest target from its host and explicitly run
+  `mount -t virtiofs microvm <GUEST_TARGET>`, because its cold-boot mount hook
+  has already completed.
   See [virtio-fs](../../devices/virtio/virtio-fs.md).
 * `--snapshot-destination <DIR>`: Publish a microVM snapshot when the guest
   writes to PMIO port `0x605`. The destination must not exist and its parent
@@ -283,7 +407,8 @@ describes the source definitions.
   mounted, it freezes the workload cgroup with a bounded wait, syncs, freezes
   the scratch filesystem, and asks OpenVMM to drain queues and atomically
   publish `scratch.img`. `/sbin/nvx-snapshot --fresh-scratch` is for a
-  pre-mount boundary and records that restore must supply a fresh scratch.
+  pre-mount boundary and records that restore must supply a fresh scratch,
+  or declare it absent with `--restore-absent-scratch`.
 * `--microvm-workload-identity <UID:GID>`: Add a fixed non-root numeric
   workload identity to the host-owned microVM command line. UID and GID zero
   are rejected. The guest workload supervisor must resolve both values in the
@@ -327,23 +452,31 @@ describes the source definitions.
   A listener peer may connect after restore; guest transmit descriptors remain
   pending while no peer is connected.
 
-  When the snapshot contains active virtio-fs attachments, restore requires
-  a fresh `--mount` for each, in capture order. Each argument must reproduce
-  the manifest's exact canonical host path, guest target, and `ro`/`rw` mode
-  while also supplying a live root with the same saved identity. A snapshot
-  advertising the dormant slot may instead accept one new attachment;
-  snapshots without that capability reject additive attachment.
+  When the snapshot contains an active virtio-fs attachment, restore requires
+  a fresh `--mount`, or `--mount-aggregate` with the same `--mount-child`
+  options in the same order. It must reproduce the manifest's exact canonical
+  host paths, guest target, and `ro`/`rw` modes while also supplying live
+  roots with the same saved identities. A snapshot advertising the dormant
+  slot may instead accept one new `--mount`, and a platform snapshot also a
+  new `--mount-aggregate`; snapshots without that capability reject additive
+  attachment.
 
   When the snapshot contains virtio-net, restore also requires
   `--network-profile portable`; the snapshot's profile and canonical egress
-  policy must match the supplied portable configuration.
+  policy must match the supplied portable configuration, unless
+  `--restore-network-policy` installs a new policy on a platform snapshot.
 
   For sandbox-block snapshots, restore repeats each read-only
   `--microvm-sandbox-block` argument. Its role, access, geometry, and SHA-256
-  must match the manifest. A paired snapshot supplies scratch internally from
+  must match the manifest, with two exceptions for a platform snapshot: its
+  read-only layers are unbound, and its `distro` block keeps the captured
+  capacity over an image that may be shorter. Such an image must have the
+  captured logical and physical block sizes, reads past its end return zeros,
+  and OpenVMM never resizes, pads, or writes it; a longer image is rejected.
+  A paired snapshot supplies scratch internally from
   a verified process-private copy of `scratch.img`; passing another scratch is
   rejected. A fresh-scratch snapshot instead requires a writable scratch
-  argument with matching geometry.
+  argument with matching geometry, or `--restore-absent-scratch`.
 
   `--restore-memory <SIZE>` selects the total RAM for this launch. It requires
   an expansion-capable snapshot and a 128-MiB-aligned value from the exact
@@ -387,21 +520,59 @@ describes the source definitions.
   `--processors`. The target must be 1, 2, 4, or 8 and satisfy
   `boot-online <= target <= capacity`. This option sets the restore packet's
   online-VP target and implies the post-restore gate. Snapshots without
-  activation metadata reject it. An
+  activation metadata reject it; platform snapshots opt in as untiered
+  snapshots do, with a canonical `maxcpus=` at capture. An
   explicit MSHV restore instantiates and binds only the requested prefix while
   validating the full saved VP inventory; that reduced-prefix process cannot
   be saved again. MSHV restores without this option, and KVM and WHP restores,
   instantiate the full VP capacity.
+* `--restore-absent-scratch`: Restore a platform snapshot's fresh scratch
+  without a file. OpenVMM attaches the scratch device at the length and block
+  sizes that the manifest records. The device stays writable, as the guest
+  negotiated it and as the restore contract requires, but has nowhere to keep
+  data: reads return zeros, and every write fails with an I/O error, so no
+  write is dropped or kept in host memory. Only a platform snapshot's fresh
+  scratch may be absent. OpenVMM rejects the option before any vCPU starts
+  for a cold boot, for a paired snapshot or one without sandbox blocks, and
+  together with a scratch `--microvm-sandbox-block`. A scratch file, when given
+  instead, keeps the exact captured length.
+* `--restore-network-policy`: Restore a platform snapshot's NIC with the
+  network policy of this restore's options rather than the captured one. The
+  snapshot must be a NIC template: a platform snapshot whose NIC was captured
+  with a complete deny-all policy, `--network-egress deny` and
+  `--host-loopback deny` without egress rules, `--network-proxy`, or
+  ingress. Its guest learned no DNS server and announces no listeners, and its
+  endpoint held no flows, listeners, or forwards, so its clones may each
+  install their own policy, including `--network-ingress allow`, explicit
+  `--host-loopback allow`, and `--host-loopback-forward`. OpenVMM validates the
+  policy as at a cold boot, binds it to the captured identity, which the NIC
+  keeps, and installs it, with its forwards bound, before any vCPU runs; a
+  policy that fails validation, or a forward that cannot bind its port, fails
+  the restore. A restore that wants no connectivity passes the template's own
+  deny-all. The restore cannot readdress the NIC, and a policy may name IPv6
+  destinations only when the captured identity has IPv6. OpenVMM rejects the
+  option before any vCPU starts for a cold boot, for a snapshot of another
+  tier, for a snapshot without a NIC, and for a NIC captured with any other
+  policy, including one whose digest encoding predates version 3. The guest
+  keeps its captured command line, so it learns its DNS server and whether
+  to announce its listeners from its host, after the restore.
 * `--restore-gate-timeout-ms <MILLISECONDS>`: Bound microVM guest repair and
   gate acknowledgement after restore. The default is 60000 milliseconds.
 * `--cpu-profile <ID>`: Select the microVM's pinned CPU profile, `auto`
   (the default) for the profile of the host's CPU generation, or `host` to
-  derive a development profile from this host's backend fingerprint for a
-  host that no pinned profile serves. `auto` never selects a host profile. A
-  host without a profile, or a profile of another generation, fails before the
-  partition is created. On an Intel or AMD host, `auto`'s errors name
-  `--cpu-profile host` when no pinned profile serves the host and when the
-  backend does not support the pinned profile (`E_PROFILE_UNSUPPORTED`). A
+  derive a development profile from this host's backend fingerprint. Where no
+  pinned profile serves an Intel or AMD host's CPU, `auto` falls back to that
+  host profile and logs a warning at the default log level at every such cold
+  boot. The warning starts with `NVX-CPU-PROFILE-FALLBACK:`, names the CPU and
+  the host profile with its digest, says what that cold boot's fingerprint
+  took, and asks for the CPU's fingerprint
+  (`--cpu-fingerprint`) so that a pinned profile can serve it. A CPU of
+  another vendor that no pinned profile serves (`E_PROFILE_HOST_UNKNOWN`), or
+  a profile of another generation (`E_CPU_GENERATION`), fails before the
+  partition is created. On an Intel or AMD host, `auto`'s error names
+  `--cpu-profile host` when the backend does not support the pinned profile
+  of the host's generation (`E_PROFILE_UNSUPPORTED`), and says that `auto`
+  fell back when the host cannot boot the host profile instead. A
   restore uses the snapshot's profile and rejects any
   other; `host` also names a host profile that the snapshot recorded. See
   [Time and CPU compatibility](../../../user_guide/openvmm/snapshots.md#time-and-cpu-compatibility).
@@ -413,14 +584,28 @@ describes the source definitions.
 * `--snapshot-tier <TIER>`: Required for snapshot capture with sandbox blocks. Choose
   `platform`, `workload-start`, or `instance-checkpoint`. The first two are
   reusable clone policies; instance checkpoints use single-use resume policy.
+* `--snapshot-block-identity <MODE>`: Select `sha256` (the default) or
+  `generation`. SHA-256 computes and verifies every bound block. Generation
+  mode requires `--snapshot-generation-id <32-HEX-DIGITS>` and records that
+  caller-authenticated immutable storage generation instead of scanning block
+  bytes. The caller must keep the generation bound to the exact immutable
+  artifacts supplied at restore.
+* `--snapshot-scratch-restore-mode <MODE>`: Record `private-copy`,
+  `copy-on-write`, or `direct-claimed` for paired scratch. Private copy is the
+  default and may fall back to sparse copying. Copy-on-write is available only
+  on Linux, is valid only for workload-start clones, and fails if the
+  destination filesystem cannot reflink. Direct-claimed is valid only for
+  single-use instance checkpoints and requires the snapshot filesystem to
+  support exact-file hard links; it does not fall back to copying.
 
 A committed snapshot contains `manifest.bin`, `state.bin`, `memory.bin`, and
 optionally the manifest-declared `scratch.img`. Restore rejects unknown files,
-symlinks, malformed or oversized data, length or scratch-digest mismatches, and
-incompatible machine contracts before starting a vCPU. `memory.bin` uses a
-private writable copy-on-write mapping and paired scratch is privately copied,
-so clone-policy snapshots can be restored repeatedly without modifying
-artifacts. Instance-checkpoint snapshots permit one restore attempt.
+symlinks, malformed or oversized data, length or applicable scratch-digest
+mismatches, and incompatible machine contracts before starting a vCPU.
+`memory.bin` uses a private writable copy-on-write mapping. Paired scratch uses
+the materialization policy recorded at capture; clone-policy snapshots never
+attach the source artifact writable, while direct attachment requires an
+atomic single-use resume claim.
 
 Versions 3 through 6 do not embed or validate checksums for `state.bin` or `memory.bin`;
 legacy version 2 checksum fields are accepted without re-hashing their
@@ -519,8 +704,9 @@ guest state and protect the directory with host access controls.
   `digest` covers the whole document.
 
   OpenVMM then checks the fingerprint against the pinned CPU profile of the
-  host's generation (the profile that `--cpu-profile auto` would select) and
-  prints one line to standard error, for example:
+  host's generation (the pinned profile that `--cpu-profile auto` selects;
+  the check never falls back to a host profile) and prints one line to
+  standard error, for example:
 
   ```text
   NVX-CPU-PROFILE: status=pass backend=kvm generation=icelake-sp profile=intel.icelake-sp.v1 profile_digest=sha256:… surface_digest=sha256:… host_invariant_tsc=yes
@@ -534,14 +720,16 @@ guest state and protect the directory with host access controls.
   the profile does not list, a partition that reads non-zero at such an entry
   fails with `E_CPU_UNLISTED`, so that no such entry carries host data; the
   identity range `0x40000000` to `0x4fffffff` and the topology leaves `0xb`
-  and `0x1f` are exempt. WHP reads VP 0 of a second probe partition
+  and `0x1f` are exempt. Both read VP 0 of a second probe partition
   configured from the profile, as a cold boot configures its partition, at
-  the host's CPUID entries outside the profile; MSHV reads the fingerprint's
-  probe partition, which enables every feature the backend offers. KVM
+  the host's CPUID entries outside the profile, rather than the
+  fingerprint's probe partition, which enables every feature the backend
+  offers, such as the XSAVE components of CET, which no profile enables. KVM
   installs the profile as the guest's whole CPUID table and answers every
   other entry from it (zero, or the architecture's out-of-range and topology
   results), so the check does not apply. The fingerprint is still written, so
-  hosts of new generations can be fingerprinted to derive their profiles.
+  hosts of new generations can be fingerprinted to derive their profiles: the
+  warning of `--cpu-profile auto`'s fallback asks for it.
 
   ```bash
   openvmm --hypervisor kvm --cpu-fingerprint host.json
@@ -553,10 +741,14 @@ guest state and protect the directory with host access controls.
 
   SNP support is currently limited to Linux direct boot and is intended for
   bring-up. It supports either loader-based kernel/initrd boot or an SNP IGVM
-  selected with `--igvm-personality linux-direct`. MSHV SNP can expose Hyper-V
+  selected with `--igvm firmware=<FILE>,personality=linux-direct`.
+  MSHV SNP can expose Hyper-V
   enlightenments with `--hv --no-vmbus`; VMBus devices remain unsupported.
   KVM SNP does not support Hyper-V enlightenments.
   The IGVM must use VTL0, no shared GPA boundary, and no relocation metadata.
+
+  For SNP Linux-direct IGVM images, see
+  [SEV-SNP IGVM Boot](../../devices/firmware/linux_direct.md#sev-snp-igvm-boot).
 
   SNP does not support UEFI, VTL2, or hugetlb-backed memory. In addition to
   the minimal emulated chipset and serial console, optional devices are
@@ -566,8 +758,8 @@ guest state and protect the directory with host access controls.
 
   ```bash
   openvmm --hypervisor mshv --isolation snp \
-    --igvm path/to/snp-linux-direct.bin \
-    --igvm-personality linux-direct --com1 console \
+    --igvm firmware=path/to/snp-linux-direct.bin,personality=linux-direct \
+    --com1 console \
     --hv --no-vmbus -m 160MB -p 1
   ```
 * `--snp-restricted-injection`: Enable restricted interrupt injection in the
@@ -597,20 +789,28 @@ guest state and protect the directory with host access controls.
   * `diagnostics=<default|info|full>`: Select the EFI diagnostics log level.
   * `default_boot_always_attempt`: Attempt the default boot path even if configured boot entries exist and fail.
 
-  With `--igvm --vtl2`, `--uefi` configures the UEFI firmware that OpenHCL
-  loads into VTL0. All options except `firmware` and
+  With IGVM `personality=openhcl`, `--uefi` configures the UEFI firmware
+  that OpenHCL loads into VTL0. All options except `firmware` and
   `force_firmware_version` are supported in this mode. Those options apply
   only when OpenVMM loads an external firmware image and are rejected with
   `--igvm`. Explicit non-VTL2 IGVM personalities do not accept `--uefi`.
 
   The previous standalone UEFI options remain accepted but are deprecated.
 * `--pcat`: Boot using the Microsoft Hyper-V PCAT BIOS
-* `--igvm <FILE>`: Boot from an IGVM file.
-* `--igvm-personality <uefi|linux-direct>`: Select the chipset and
-  device shape for an IGVM boot without VTL2. This option is required with
-  `--igvm` unless `--vtl2` is present; there is no default for non-VTL2
-  boots. The personality does not select the isolation platform. Use
-  `--isolation` separately when required by the IGVM.
+* `--igvm <OPTIONS>`: Boot from an IGVM file. Options are comma-separated:
+  * `firmware=<FILE>`: Path to the IGVM file.
+  * `personality=<openhcl|uefi|linux-direct>`: Select the chipset and device
+    shape for the IGVM boot.
+
+  Both options are required; neither has a default. For example:
+
+  ```bash
+  openvmm --hv --vtl2 \
+    --igvm firmware=path/to/openhcl.igvm,personality=openhcl
+  ```
+
+  The personality does not select the isolation platform. Use `--isolation`
+  separately when required by the IGVM.
 
   The `uefi` personality uses the Gen2 device shape, but firmware is loaded
   from the IGVM. It does not select the normal external-UEFI load path. The
@@ -619,8 +819,13 @@ guest state and protect the directory with host access controls.
   fails explicitly on backend and isolation combinations that cannot provide
   them.
 
-  With `--igvm --vtl2`, omit `--igvm-personality`. OpenVMM retains the
-  existing HCL-host device shape and VBS-compatible IGVM behavior.
+  The `openhcl` personality hosts the OpenHCL paravisor in VTL2 and requires
+  explicit `--hv --vtl2`. OpenHCL loads the VTL0 firmware; OpenVMM does not
+  add a host UEFI device. You can pass `--uefi` settings for the firmware
+  loaded by OpenHCL.
+
+  On x86, the IGVM device tree describes only some COM ports. See
+  [Device Tree](../../architecture/openvmm/device-tree.md).
 * `--tpm [VERSION]`: Add a vTPM device. Supported versions are `138` and
   `185`; a bare `--tpm` uses version `185`. The dotted forms `1.38` and `1.85`
   are also accepted.
@@ -825,6 +1030,9 @@ Serial devices can be configured to appear as different devices inside the guest
   logs, snapshots, or attachment identities. The first host record must prove
   that capability. Peer identity is checked first. Authentication must complete
   within `--microvm-control-auth-timeout-ms` (default 5000, range 1 to 60000).
+  The timeout counts only while OpenVMM reads host input: while a snapshot
+  boundary or a gated microVM restore holds host input, it is suspended, and
+  it starts over when the input is released.
   A stalled or failed authentication attempt closes the connection without a
   protocol Error record and without changing the broker epoch.
 
@@ -857,7 +1065,10 @@ Serial devices can be configured to appear as different devices inside the guest
 
 The `BACKEND` argument is the same for all serial devices:
 
-  * `none`: Serial output is dropped.
+  * `none`: No serial backend is configured. Depending on the chipset, the
+      serial device is either omitted or present with a disconnected backend.
+  * `null`: A connected serial backend accepts and discards all output and
+      never provides input.
   * `console`: Serial input is read and output is written to the console.
   * `stderr`: Serial output is written to stderr.
   * `listen=PATH`: A named pipe (on Windows) or Unix socket (on Linux) is set
@@ -1043,9 +1254,12 @@ PCIe root port. The syntax varies slightly between device types:
 **Disks** (comma-separated option): `--nvme-pci` + `--disk`, `--virtio-blk`
 
 ```sh
---virtio-blk file:/path/to/disk.raw,pcie_port=rp0
+--virtio-blk file:/path/to/disk.raw,pcie_port=rp0,serial=DATA-DISK
 --nvme-pci id=nvme0,pcie_port=rp0 --disk file:/path/to/disk.raw,on=nvme0
 ```
+
+The optional `serial` value accepts 1-20 printable ASCII bytes except commas
+and brackets. If omitted, OpenVMM uses the disk ID or `openvmm-virtio-blk`.
 
 **CXL test endpoint** (comma-separated option): `--cxl-test`
 
@@ -1169,7 +1383,7 @@ named root complex. The flag is repeatable — use one `--intel-vtd` per
 root complex that should have an IOMMU. The guest discovers VT-d units
 via the ACPI DMAR table (not PCI config space).
 
-```sh
+```bash
 # Enable Intel VT-d on root complex rc0
 --intel-vtd rc0
 
@@ -1179,3 +1393,45 @@ via the ACPI DMAR table (not PCI config space).
 
 Mutually exclusive with `--amd-iommu` within the same VM (only one x86
 IOMMU type can be active).
+
+VT-d advertises legacy and scalable second-stage translation by default;
+there is no separate scalable-mode or accessed/dirty CLI flag. Both modes
+support 39-bit (3-level) and 48-bit (4-level) addresses, 4KB/2MB/1GB pages,
+pass-through, and interrupt remapping for MSI and IOAPIC routes. Legacy mode
+accepts 128-bit or 256-bit queued invalidations; scalable mode requires
+256-bit descriptors.
+
+The scalable profile advertises SMTS, SSTS, SMPWCS, SSADS, and RPS. Requests
+without a PASID use the context entry's implied `RID_PASID`, including
+nonzero values. Explicitly PASID-tagged requests, first-stage and nested
+translation, ATS, PRI, and supervisor requests are not supported. The
+implementation version remains 1.0; use CAP/ECAP, not VER, for discovery.
+
+Accessed/dirty tracking is optional and controlled by each PASID table
+entry's `SSADE` bit. With tracking enabled, translation atomically sets
+accessed (bit 8) on visited second-stage entries and dirty (bit 9) on an
+accepted write's leaf, before performing DMA. A later DMA operation failure
+does not undo those flags. Legacy translation and pass-through never set
+them. Updates require coherent page-table access (`PWSNP=1`); a required
+non-snooping update faults with reason `0x7c`, and an atomic-update failure
+faults with `0x7d`.
+
+Flags are sticky until guest software clears them. Quiesce relevant DMA,
+clear the flags, perform the required translation-cache invalidations, and
+wait for completion before resuming DMA. The emulator does not cache page
+walks, but software must still follow the architectural invalidation
+protocol. Unsynchronized clearing or reading does not provide a race-free
+dirty snapshot, and no migration bitmap API is provided.
+
+Linux 6.18 and Ubuntu 24.04's 6.8 kernel document `intel_iommu=on,sm_on`
+to request scalable mode and `intel_iommu=on,sm_off` to force legacy mode.
+These are guest kernel options, not OpenVMM options. For UEFI boots, configure
+them in the guest bootloader; a direct-boot kernel command line does not
+configure the disk's kernel. Scalable mode alone does not enable `SSADE`.
+OpenVMM inspection exposes the SRTP-latched `translation_table_mode` (0 for
+legacy, 1 for scalable), rather than just the pending RTADDR value.
+
+See the [`intel_vtd` crate documentation][intel-vtd-rustdoc] for implementation
+details.
+
+[intel-vtd-rustdoc]: https://openvmm.dev/rustdoc/linux/intel_vtd/index.html

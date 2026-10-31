@@ -1,7 +1,7 @@
 ---
 name: code-quality
-description: Make one concrete code-quality fix in NVX internal tooling or the aci_edge_sandboxes crate
-intent: Reduce maintainer effort with one novel, validated, low-risk correctness, maintainability, typing, or robustness improvement to NVX internal tooling or the aci_edge_sandboxes Rust crate without repeating rejected work.
+description: Make one concrete code-quality fix in NVX internal tooling or the nvx-rs crate
+intent: Reduce maintainer effort with one novel, validated, low-risk correctness, maintainability, typing, or robustness improvement to NVX internal tooling or the nvx-rs Rust crate without repeating rejected work.
 on:
   schedule: hourly
   workflow_dispatch:
@@ -54,7 +54,7 @@ evals:
 
 Make one concrete correctness, maintainability, typing, or robustness
 improvement in the internal Python or allowlisted shell tooling, or in the
-`aci_edge_sandboxes` Rust crate.
+`nvx-rs` Rust crate.
 
 A qualifying candidate fixes one demonstrable problem at its source:
 
@@ -74,11 +74,11 @@ A qualifying candidate fixes one demonstrable problem at its source:
 
 Look in `scripts/nvx.py`, `scripts/nvx_tools/`, and the allowlisted
 `scripts/setup/` and `guest/` scripts, or in the Rust sources and tests of
-`aci_edge_sandboxes/`. Establish the problem from the exact code path. For a
+`nvx-rs/`. Establish the problem from the exact code path. For a
 Python behavior fix, reproduce it with a focused regression test in the
 matching `scripts/test_*.py` module that fails before the fix and passes after
 it. For a crate behavior fix, use a focused unit test beside the code, or an
-integration test under `aci_edge_sandboxes/tests/`, that fails before the fix
+integration test under `nvx-rs/tests/`, that fails before the fix
 and passes after it without a hypervisor. For a typing fix, show the strict
 Pyright diagnostic, or the Clippy or rustc diagnostic, that the hiding
 annotation, `cast`, `#[allow(...)]`, or suppression masks; for unused code,

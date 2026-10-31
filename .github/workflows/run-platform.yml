@@ -27,6 +27,10 @@ on:
         description: Base name of the compatible OpenVMM artifacts
         required: true
         type: string
+      nvx-rs-artifact:
+        description: Base name of the nvx-rs artifacts for the runner's OS
+        required: true
+        type: string
       teardown-mode:
         description: Guest teardown mode used by the benchmark
         required: true
@@ -44,7 +48,9 @@ on:
         required: true
         type: number
       package-release:
-        description: Whether the platform produces a development release package
+        description: >-
+          Whether the platform packages a release, which dev pushes upload for
+          the development release
         required: true
         type: boolean
     secrets:
@@ -61,6 +67,15 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 60
     steps:
+      # A failed benchmark keeps the storage events of the job's window, which
+      # starts here (doc/benchmarks.md).
+      - name: Record Windows job start
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          "NVX_JOB_STARTED_AT=$([DateTime]::UtcNow.ToString('o'))" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Checkout
         uses: actions/checkout@v5
         with:
@@ -70,10 +85,6 @@ jobs:
         uses: ./.github/actions/checkout-openvmm
         with:
           ssh-key: ${{ secrets.OPENVMM_DEPLOY_KEY }}
-
-      # After the OpenVMM checkout: the CLI tests read the pinned revision.
-      - name: Validate NVX CLI
-        uses: ./.github/actions/validate-nvx
 
       - name: Verify source pins on Linux
         if: runner.os != 'Windows'
@@ -85,10 +96,40 @@ jobs:
         shell: powershell
         run: python scripts\nvx.py verify
 
-      - name: Download guest artifacts
+      # The runner qualification and the benchmarks boot the kernel and the
+      # Alpine initramfs; the release package also ships the Ubuntu and Azure
+      # Linux images.
+      - name: Download guest kernel
         uses: actions/download-artifact@v8
         with:
-          name: guest-artifacts
+          name: guest-kernel
+          path: build
+
+      - name: Download Alpine initramfs
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-alpine
+          path: build
+
+      - name: Download Ubuntu initramfs
+        if: inputs.package-release
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu
+          path: build
+
+      - name: Download Ubuntu distro layer
+        if: inputs.package-release
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu-distro
+          path: build
+
+      - name: Download Azure Linux initramfs
+        if: inputs.package-release
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-azurelinux
           path: build
 
       - name: Download OpenVMM executable
@@ -108,12 +149,15 @@ jobs:
         shell: bash
         run: chmod +x openvmm/target/release/openvmm
 
-      # Qualification verifies the downloaded OpenVMM's time ABI preflight.
+      # Qualification verifies the downloaded OpenVMM's time ABI preflight and,
+      # because the benchmarks boot guests without the microVM scenarios' warp
+      # probes, runs the guest warp probe.
       - name: Validate runner
         uses: ./.github/actions/validate-runner
         with:
           backend: ${{ inputs.backend }}
           verify-openvmm: "true"
+          warp-probe: "true"
 
       - name: Run benchmark
         uses: ./.github/actions/run-benchmark
@@ -127,11 +171,12 @@ jobs:
           host-cpu-reserve: ${{ inputs.host-cpu-reserve }}
           marker-timeout: ${{ inputs.marker-timeout }}
 
+      # Pull requests package and archive the release too, so that they prove
+      # that it builds, but only dev pushes upload it for publication.
       - name: Package release
-        if: >-
-          github.event_name == 'push' &&
-          github.ref == 'refs/heads/dev' &&
-          inputs.package-release
+        if: inputs.package-release
         uses: ./.github/actions/package-release
         with:
           platform: ${{ inputs.release-platform }}
+          nvx-rs-artifact: ${{ inputs.nvx-rs-artifact }}
+          upload: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}

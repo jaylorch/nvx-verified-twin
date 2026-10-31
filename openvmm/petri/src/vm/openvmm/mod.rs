@@ -20,6 +20,7 @@ mod start;
 pub use hugetlb::HUGETLB_2MB_PAGE_SIZE;
 #[cfg(target_os = "linux")]
 pub use hugetlb::ensure_2mb_hugetlb_pages;
+pub use microvm::auto_cpu_profile_needs_host_fallback;
 pub use runtime::OpenVmmFramebufferAccess;
 pub use runtime::OpenVmmInspector;
 pub use runtime::PetriVmOpenVmm;
@@ -125,7 +126,10 @@ impl PetriVmmBackend for OpenVmmPetriBackend {
         Ok(None) // TODO #2403
     }
 
-    fn build_custom_init_script(_pipette_path: &str) -> Option<String> {
+    fn build_custom_init_script(
+        _pipette_path: &str,
+        _mount_shares: Vec<(String, String)>,
+    ) -> Option<String> {
         None
     }
 
@@ -144,7 +148,7 @@ impl PetriVmmBackend for OpenVmmPetriBackend {
         config: PetriVmConfig,
         modify_vmm_config: Option<ModifyFn<Self::VmmConfig>>,
         resources: &PetriVmResources,
-        properties: PetriVmProperties,
+        properties: &PetriVmProperties,
     ) -> anyhow::Result<(Self::VmRuntime, PetriVmRuntimeConfig)> {
         let mut config =
             PetriVmConfigOpenVmm::new(&self.openvmm_path, config, resources, properties).await?;

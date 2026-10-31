@@ -200,12 +200,14 @@ impl virt::Hypervisor for LinuxMshv {
                     mshv_bindings::hv_unimplemented_msr_action_HV_UNIMPLEMENTED_MSR_ACTION_IGNORE_WRITE_READ_ZERO
                         as u64,
                 ),
-                (HvPartitionPropertyCode::TimeFreeze, 1),
             ] {
                 vmfd.set_partition_property(code.0, value)
                     .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
             }
         }
+
+        vmfd.set_partition_property(HvPartitionPropertyCode::TimeFreeze.0, 1)
+            .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
 
         // Tell the hypervisor how many VPs are in each socket.
         vmfd.set_partition_property(
@@ -612,7 +614,6 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                 config,
             )),
         };
-        let time_frozen = isolation.is_isolated();
         let inner = Arc::new(MshvPartitionInner {
             vmfd: self.vmfd,
             finalized: Default::default(),
@@ -628,8 +629,8 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             config: finalize::CreationConfig::new(cpuid, &self.config),
             software_devices: ApicSoftwareDevices::new(apic_id_map),
             isolation,
-            // SNP partition creation set TimeFreeze=1 before this object was built.
-            time_frozen: Mutex::new(time_frozen),
+            time_frozen: Mutex::new(true),
+            reset_with_scrub: false.into(),
             time_abi,
         });
         inner.add_snp_vmsa_mapping()?;
@@ -658,6 +659,10 @@ impl ProtoPartition for MshvProtoPartition<'_> {
 impl virt::Partition for MshvPartition {
     fn initial_vp_state_source(&self) -> virt::InitialVpStateSource {
         self.inner.isolation.initial_vp_state_source()
+    }
+
+    fn supports_time_control(&self) -> Option<&dyn virt::PartitionTimeControl> {
+        Some(self)
     }
 
     fn finalize_memory(&self) -> Result<(), Self::Error> {
@@ -724,22 +729,20 @@ impl virt::X86Partition for MshvPartition {
     }
 }
 
-impl virt::ResetPartition for MshvPartition {
-    type Error = Error;
-
-    fn reset(&self) -> Result<(), Error> {
+impl MshvPartition {
+    pub(super) fn reset_arch_state(&self, scrubbed: bool) -> Result<(), Error> {
         use virt::x86::vm::AccessVmState;
 
-        for irq in 0..virt::irqcon::IRQ_LINES as u8 {
-            self.inner.irq_routes.set_irq_route(irq, None);
-        }
-
-        self.inner.freeze_time()?;
-
         let bsp_vp_info = &self.inner.vps[0].vp_info;
-        self.access_state(Vtl::Vtl0)
-            .reset_all(bsp_vp_info)
-            .map_err(|e| ErrorInner::ResetState(Box::new(e)))?;
+        if scrubbed {
+            if cfg!(debug_assertions) {
+                self.access_state(Vtl::Vtl0).check_reset_all(bsp_vp_info);
+            }
+        } else {
+            self.access_state(Vtl::Vtl0)
+                .reset_all(bsp_vp_info)
+                .map_err(|e| ErrorInner::ResetState(Box::new(e)))?;
+        }
 
         Ok(())
     }
@@ -919,27 +922,7 @@ impl virt::BindProcessor for MshvProcessorBinder {
         };
 
         if this.partition.isolation.snp().is_none() {
-            // Set the APIC state.
-            let apic_base =
-                virt::vp::Apic::at_reset(&finalized.caps, &this.inner.vp_info).apic_base;
-
-            let regs = &[
-                HvRegisterAssoc::from((
-                    HvX64RegisterName::InitialApicId,
-                    u64::from(inner.vp_info.apic_id),
-                )),
-                HvRegisterAssoc::from((HvX64RegisterName::ApicBase, apic_base)),
-                HvRegisterAssoc::from((
-                    HvX64RegisterName::ApicId,
-                    u64::from(inner.vp_info.apic_id),
-                )),
-            ];
-
-            let reg_count = if finalized.caps.x2apic { 2 } else { 3 };
-
-            vcpufd
-                .set_hvdef_regs(&regs[..reg_count])
-                .map_err(ErrorInner::Register)?;
+            this.finish_reset()?;
         }
 
         Ok(this)
@@ -947,6 +930,46 @@ impl virt::BindProcessor for MshvProcessorBinder {
 }
 
 impl MshvProcessor<'_> {
+    fn reset_apic(&self) -> Result<(), Error> {
+        let caps = self.partition.caps();
+        let apic_base = virt::vp::Apic::at_reset(caps, &self.inner.vp_info).apic_base;
+        let regs = &[
+            HvRegisterAssoc::from((
+                HvX64RegisterName::InitialApicId,
+                u64::from(self.inner.vp_info.apic_id),
+            )),
+            HvRegisterAssoc::from((HvX64RegisterName::ApicBase, apic_base)),
+            HvRegisterAssoc::from((
+                HvX64RegisterName::ApicId,
+                u64::from(self.inner.vp_info.apic_id),
+            )),
+        ];
+        let reg_count = if caps.x2apic { 2 } else { 3 };
+        self.runner
+            .vcpufd
+            .set_hvdef_regs(&regs[..reg_count])
+            .map_err(ErrorInner::Register)?;
+        Ok(())
+    }
+
+    pub(super) fn finish_reset(&self) -> Result<(), Error> {
+        // Like WHP, fix up architectural CS and TSC at creation and after scrub.
+        let caps = self.partition.caps();
+        let registers = virt::vp::Registers::at_reset(caps, &self.inner.vp_info);
+        let tsc = virt::vp::Tsc::at_reset(caps, &self.inner.vp_info);
+        self.runner
+            .vcpufd
+            .set_hvdef_regs(&[
+                HvRegisterAssoc::from((
+                    HvX64RegisterName::Cs,
+                    hvdef::HvX64SegmentRegister::from(registers.cs),
+                )),
+                HvRegisterAssoc::from((HvX64RegisterName::Tsc, tsc.value)),
+            ])
+            .map_err(ErrorInner::Register)?;
+        self.reset_apic()
+    }
+
     async fn emulate(
         &mut self,
         message: &HvMessage,

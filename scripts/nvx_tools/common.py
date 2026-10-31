@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -18,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http.client import HTTPMessage
 from pathlib import Path, PurePosixPath
-from typing import IO
+from typing import IO, cast
 
 from .build_constants import (
     BuildConstants,
@@ -28,6 +30,29 @@ from .build_constants import (
 
 class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
+
+
+UPSTREAM_REVISIONS_PATH = BuildConstants.REPO_ROOT / "UPSTREAM-REVISIONS.json"
+_UPSTREAM_REPOSITORIES = {
+    "nvx": "jaylorch/nvx-verified-twin",
+    "openvmm": "microsoft/openvmm",
+}
+
+
+def is_link_or_junction(path: Path) -> bool:
+    """Return whether ``path`` is a symbolic link or, on Windows, a junction.
+
+    ``Path.is_symlink()`` misses junctions, which redirect a path the same way.
+    """
+    try:
+        metadata = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    if sys.platform == "win32":
+        return metadata.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    return False
 
 
 def strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -56,6 +81,10 @@ def bytes_to_mib(value: int | float) -> float:
 
 def artifact_path(name: str) -> Path:
     return BuildConstants.BUILD_DIR / name
+
+
+def path_exists(path: Path) -> bool:
+    return os.path.lexists(path)
 
 
 def cache_root() -> Path:
@@ -113,6 +142,10 @@ def require_success(result: CommandResult, label: str) -> None:
     raise ScriptError(f"{label} exited {result.returncode}{suffix}")
 
 
+def _command_start_error(command: Sequence[str], error: OSError) -> ScriptError:
+    return ScriptError(f"failed to run command {' '.join(command)}: {error}")
+
+
 def run_capture(
     args: Sequence[str | os.PathLike[str]],
     *,
@@ -120,12 +153,15 @@ def run_capture(
     env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     command = tuple(os.fspath(arg) for arg in args)
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+        )
+    except OSError as error:
+        raise _command_start_error(command, error) from error
     return CommandResult(command, result.returncode, result.stdout, result.stderr)
 
 
@@ -150,13 +186,22 @@ def repository_metadata() -> dict[str, object]:
 
     directory = str(OpenVMMBuildConstants.DIRECTORY)
     nvx_status = status()
-    openvmm_status = status("-C", directory)
+    _openvmm_source_revision, openvmm_clean = openvmm_git_state(
+        OpenVMMBuildConstants.DIRECTORY
+    )
+    openvmm_commit = resolve_openvmm_revision(OpenVMMBuildConstants.DIRECTORY)
+    if _openvmm_index_layout() == "gitlink":
+        openvmm_status = status("-C", directory)
+    else:
+        openvmm_status = git_output(
+            "status", "--porcelain", "--untracked-files=normal", "--", "openvmm"
+        ).splitlines()
     return {
         "nvx_commit": git_output("rev-parse", "HEAD"),
         "nvx_dirty": bool(nvx_status),
         "nvx_status": nvx_status,
-        "openvmm_commit": git_output("-C", directory, "rev-parse", "HEAD"),
-        "openvmm_dirty": bool(openvmm_status),
+        "openvmm_commit": openvmm_commit,
+        "openvmm_dirty": not openvmm_clean,
         "openvmm_status": openvmm_status,
         "os": platform.system(),
         "os_release": platform.release(),
@@ -165,21 +210,182 @@ def repository_metadata() -> dict[str, object]:
     }
 
 
-def openvmm_git_state(directory: Path) -> tuple[str, bool]:
-    head = run_capture(["git", "-C", directory, "rev-parse", "HEAD"])
-    require_success(head, "OpenVMM revision query")
+# The GitHub Actions variables that identify the job that wrote a duration
+# report, under the names that the report gives them.
+GITHUB_VARIABLES = (
+    ("repository", "GITHUB_REPOSITORY"),
+    ("workflow", "GITHUB_WORKFLOW"),
+    ("run_id", "GITHUB_RUN_ID"),
+    ("run_attempt", "GITHUB_RUN_ATTEMPT"),
+    ("job", "GITHUB_JOB"),
+    ("event_name", "GITHUB_EVENT_NAME"),
+    ("ref", "GITHUB_REF"),
+    ("sha", "GITHUB_SHA"),
+    ("runner_name", "RUNNER_NAME"),
+    ("runner_os", "RUNNER_OS"),
+)
+
+
+def github_job(environment: Mapping[str, str]) -> dict[str, str | None] | None:
+    """Return the GitHub Actions job that an environment describes, or None
+    outside GitHub Actions."""
+    if environment.get("GITHUB_ACTIONS") != "true":
+        return None
+    return {name: environment.get(variable) for name, variable in GITHUB_VARIABLES}
+
+
+def workflow_path(workflow_ref: str, repository: str) -> str:
+    """Return the path of the workflow that `workflow_ref`, the
+    GITHUB_WORKFLOW_REF of a run of `repository`, names."""
+    reference, separator, _ = workflow_ref.partition("@")
+    path = reference.removeprefix(f"{repository}/")
+    if (
+        not separator
+        or path == reference
+        or PurePosixPath(path).parent != PurePosixPath(".github/workflows")
+    ):
+        raise ScriptError(f"{workflow_ref!r} names no workflow of {repository}")
+    return path
+
+
+def _openvmm_index_layout() -> str:
+    indexed = run_capture(
+        [
+            "git",
+            "-C",
+            BuildConstants.REPO_ROOT,
+            "ls-files",
+            "--stage",
+            "--",
+            "openvmm",
+        ]
+    )
+    require_success(indexed, "OpenVMM index query")
+    entries: list[tuple[str, str, str]] = []
+    for line in indexed.stdout.decode("utf-8", errors="strict").splitlines():
+        metadata, separator, path = line.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise ScriptError("malformed OpenVMM index entry")
+        mode, _object_id, stage = fields
+        if stage != "0":
+            raise ScriptError("OpenVMM index contains an unmerged entry")
+        entries.append((mode, stage, path))
+
+    if len(entries) == 1 and entries[0][0] == "160000":
+        if entries[0][2] != "openvmm":
+            raise ScriptError("malformed OpenVMM gitlink entry")
+        return "gitlink"
+    if not entries or any(
+        path == "openvmm" or not path.startswith("openvmm/")
+        for _mode, _stage, path in entries
+    ):
+        raise ScriptError("OpenVMM is neither a gitlink nor a tracked directory")
+    if any(mode == "160000" for mode, _stage, _path in entries):
+        raise ScriptError("nested OpenVMM gitlinks are not supported")
+    return "vendored"
+
+
+def _upstream_openvmm_revision() -> str:
+    try:
+        metadata: object = json.loads(
+            UPSTREAM_REVISIONS_PATH.read_text(encoding="utf-8"),
+            object_pairs_hook=strict_json_object,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ScriptError(f"invalid upstream revisions metadata: {error}") from error
+    if not isinstance(metadata, dict):
+        raise ScriptError("invalid upstream revisions metadata: expected an object")
+    document = cast(dict[str, object], metadata)
+    if set(document) != {"format", "nvx", "openvmm"}:
+        raise ScriptError("invalid upstream revisions metadata: unexpected shape")
+    if type(document["format"]) is not int or document["format"] != 1:
+        raise ScriptError("invalid upstream revisions metadata: unsupported format")
+
+    revisions: dict[str, str] = {}
+    for name, repository in _UPSTREAM_REPOSITORIES.items():
+        source_value = document[name]
+        if not isinstance(source_value, dict):
+            raise ScriptError(
+                f"invalid upstream revisions metadata: malformed {name} origin"
+            )
+        source = cast(dict[str, object], source_value)
+        revision = source.get("revision")
+        if (
+            set(source) != {"repository", "revision"}
+            or source.get("repository") != repository
+            or not isinstance(revision, str)
+            or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+        ):
+            raise ScriptError(
+                f"invalid upstream revisions metadata: malformed {name} origin"
+            )
+        revisions[name] = revision
+    return revisions["openvmm"]
+
+
+def _resolve_openvmm_revision(directory: Path, layout: str) -> str:
+    if layout == "vendored":
+        return _upstream_openvmm_revision()
+
     gitlink = run_capture(
         ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", ":openvmm"]
     )
     require_success(gitlink, "OpenVMM gitlink query")
-    status = run_capture(["git", "-C", directory, "status", "--porcelain"])
-    require_success(status, "OpenVMM status query")
-    revision = head.stdout.decode("ascii").strip()
     expected_revision = gitlink.stdout.decode("ascii").strip()
+    if re.fullmatch(r"[0-9a-f]{40}", expected_revision) is None:
+        raise ScriptError("OpenVMM gitlink does not contain a full commit SHA")
+    head = run_capture(["git", "-C", directory, "rev-parse", "HEAD"])
+    require_success(head, "OpenVMM revision query")
+    revision = head.stdout.decode("ascii").strip()
     if revision != expected_revision:
         raise ScriptError(
             f"OpenVMM submodule is at {revision}, expected {expected_revision}"
         )
+    return expected_revision
+
+
+def resolve_openvmm_revision(
+    directory: Path = OpenVMMBuildConstants.DIRECTORY,
+) -> str:
+    """Resolve OpenVMM's pinned revision in either supported checkout layout."""
+    return _resolve_openvmm_revision(directory, _openvmm_index_layout())
+
+
+def openvmm_git_state(directory: Path) -> tuple[str, bool]:
+    """Return OpenVMM's build-source identity and whether its source is clean.
+
+    A gitlink identifies a commit; a vendored tree identifies the committed
+    ``openvmm`` tree object, independently of the surrounding repository HEAD.
+    """
+    layout = _openvmm_index_layout()
+    if layout == "gitlink":
+        revision = _resolve_openvmm_revision(directory, layout)
+        status = run_capture(["git", "-C", directory, "status", "--porcelain"])
+        require_success(status, "OpenVMM status query")
+        return revision, not status.stdout.strip()
+
+    _upstream_openvmm_revision()
+    tree = run_capture(
+        ["git", "-C", BuildConstants.REPO_ROOT, "rev-parse", "HEAD:openvmm"]
+    )
+    require_success(tree, "OpenVMM source-tree revision query")
+    revision = tree.stdout.decode("ascii").strip()
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise ScriptError("OpenVMM source tree does not have a full tree SHA")
+    status = run_capture(
+        [
+            "git",
+            "-C",
+            BuildConstants.REPO_ROOT,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "openvmm",
+        ]
+    )
+    require_success(status, "OpenVMM status query")
     return revision, not status.stdout.strip()
 
 
@@ -220,6 +426,13 @@ def _checksummed_tree_files(directory: Path) -> list[Path]:
         if relative != "SHA256SUMS":
             files.append(path)
     return files
+
+
+def normalized_sha256_file(path: Path) -> str:
+    contents = path.read_bytes().replace(b"\r\n", b"\n")
+    if b"\r" in contents:
+        raise ScriptError(f"{path} contains unsupported carriage returns")
+    return hashlib.sha256(contents).hexdigest()
 
 
 def write_sha256_sums(directory: Path) -> None:
@@ -309,6 +522,8 @@ def run_checked(
         raise ScriptError(
             f"command failed with exit {error.returncode}: {' '.join(command)}"
         ) from error
+    except OSError as error:
+        raise _command_start_error(command, error) from error
 
 
 class _CrossOriginRedirectHandler(urllib.request.HTTPRedirectHandler):

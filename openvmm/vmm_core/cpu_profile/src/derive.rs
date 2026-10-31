@@ -22,7 +22,9 @@
 //!    PPIN, CPPC, and the like). AMD's speculation controls and immunities
 //!    stay, those of `0x80000021` included, but for what KVM cannot present:
 //!    `BTC_NO` goes, and PSFD stays only beside a `SPEC_CTRL` control
-//!    ([`has_spec_ctrl_control`]).
+//!    ([`has_spec_ctrl_control`]). Intel's enumerations of its speculation
+//!    controls and `IA32_ARCH_CAPABILITIES`, which KVM adds on AMD hosts
+//!    ([`INTEL_SPECULATION_ENUMERATIONS`]), go too.
 //! 3. The XSAVE features are the intersection, within [`ALLOWED_XCR0`], and
 //!    the XSAVE leaf is rebuilt from them; every host must agree on the
 //!    layout. A feature whose XSAVE state is not enabled is cleared.
@@ -141,6 +143,14 @@ pub const AMD_PSFD: u32 = 1 << 28;
 /// type confusion.
 pub const AMD_BTC_NO: u32 = 1 << 29;
 
+/// The bits of `CPUID.(7,0):EDX` that enumerate Intel's speculation controls
+/// and `IA32_ARCH_CAPABILITIES`: IBRS and IBPB (26), STIBP (27),
+/// `IA32_ARCH_CAPABILITIES` (29), and SSBD (31). KVM sets them on AMD hosts
+/// too, and emulates the MSR, but AMD CPUs enumerate their speculation
+/// controls in `0x80000008` EBX and have no `IA32_ARCH_CAPABILITIES`, so AMD
+/// profiles clear them.
+pub const INTEL_SPECULATION_ENUMERATIONS: u32 = 1 << 26 | 1 << 27 | 1 << 29 | 1 << 31;
+
 /// Returns whether a CPUID whose `CPUID.(7,0):EDX` is `leaf7_edx` and whose
 /// `CPUID.0x80000008:EBX` is `ext8_ebx` enumerates a `SPEC_CTRL` control, as
 /// KVM's `guest_has_spec_ctrl_msr()` decides whether a guest may access
@@ -187,7 +197,7 @@ impl KnownGeneration {
 }
 
 /// The generations profiles exist for.
-pub const KNOWN_GENERATIONS: [KnownGeneration; 5] = [
+pub const KNOWN_GENERATIONS: [KnownGeneration; 7] = [
     KnownGeneration {
         vendor: CpuVendor::Intel,
         name: "skylake-sp",
@@ -226,6 +236,25 @@ pub const KNOWN_GENERATIONS: [KnownGeneration; 5] = [
         cpus: &[(25, 1, [0, 15])],
         description: "AMD EPYC, third generation (Milan)",
         brand: "AMD EPYC Processor (Milan)",
+    },
+    KnownGeneration {
+        vendor: CpuVendor::Amd,
+        name: "genoa",
+        // Every stepping of the Genoa die, Genoa-X's included: no other
+        // generation uses family 25 model 17. Bergamo and Siena (Zen 4c),
+        // Storm Peak, and the Zen 4 client CPUs are other models.
+        cpus: &[(25, 17, [0, 15])],
+        description: "AMD EPYC, fourth generation (Genoa)",
+        brand: "AMD EPYC Processor (Genoa)",
+    },
+    KnownGeneration {
+        vendor: CpuVendor::Amd,
+        name: "turin",
+        // Every stepping of the Turin die (Zen 5): family 26 model 2. Turin
+        // Dense (Zen 5c) and the Zen 5 client CPUs are other models.
+        cpus: &[(26, 2, [0, 15])],
+        description: "AMD EPYC, fifth generation (Turin)",
+        brand: "AMD EPYC Processor (Turin)",
     },
 ];
 
@@ -323,14 +352,16 @@ pub fn derive_profile(
 }
 
 /// Returns whether host profiles serve the CPU `host`, so that
-/// `--cpu-profile host` can boot on it: [`derive_host_profile`] derives them
-/// for the CPUs of every vendor that profiles serve, Intel's and AMD's.
+/// `--cpu-profile host`, and `auto` on a CPU that no pinned profile serves,
+/// can boot on it: [`derive_host_profile`] derives them for the CPUs of every
+/// vendor that profiles serve, Intel's and AMD's.
 pub fn supports_host_profiles(host: &HostCpuSignature) -> bool {
     CpuVendor::from_cpuid_vendor(&host.vendor()).is_some()
 }
 
 /// Derives the host profile of the host and backend that `fingerprint`
-/// describes, for `--cpu-profile host`: the profile that the derivation
+/// describes, for `--cpu-profile host` and for `auto`'s fallback on a CPU
+/// that no pinned profile serves: the profile that the derivation
 /// policy gives for this one fingerprint, with the ID
 /// `<vendor>.host.v1`, the generation [`HOST_GENERATION`] limited to the
 /// host's family, model, and stepping, and a generic brand string of the
@@ -843,6 +874,24 @@ fn apply_policy(vendor: CpuVendor, combined: &Table) -> Result<Table, DeriveErro
             0,
             1 << 1 | 1 << 3 | 1 << 4 | 1 << 6 | 1 << 21 | 1 << 23 | 1 << 27 | AMD_BTC_NO | 1 << 31,
         );
+        // CPUID.(7,0) EDX: none of Intel's speculation controls or
+        // IA32_ARCH_CAPABILITIES, which KVM enumerates on AMD hosts beside
+        // AMD's own controls in 0x80000008 EBX, and emulates. No AMD CPU has
+        // them: AMD enumerates its controls and immunities in 0x80000008 and
+        // 0x80000021, which the Hyper-V banks map, and the Milan host's WHP
+        // presents none of the bits, so a profile derived from KVM alone
+        // would otherwise fail the Hyper-V hosts of its generation. A guest
+        // loses nothing: it uses AMD's controls, and Linux takes no AMD CPU
+        // to be affected by the vulnerabilities whose immunities the MSR
+        // reports. With the bit clear, the profile pins no
+        // IA32_ARCH_CAPABILITIES value.
+        edit(
+            &mut leaves,
+            (0x7, Some(0)),
+            3,
+            0,
+            INTEL_SPECULATION_ENUMERATIONS,
+        );
         // PSFD is a bit of SPEC_CTRL, so it means nothing to a guest that
         // cannot access SPEC_CTRL, and KVM lets a guest access it only if the
         // guest's CPUID has a SPEC_CTRL control. The rule reads the derived
@@ -944,10 +993,14 @@ mod tests {
     use crate::cpuid::CpuidEntry;
     use crate::test_support::fingerprint;
     use crate::test_support::fingerprint_with;
+    use crate::test_support::genoa_kvm_entries;
+    use crate::test_support::genoa_mshv_fingerprint;
+    use crate::test_support::genoa_whp_fingerprint;
     use crate::test_support::host_fingerprint;
     use crate::test_support::milan_whp_entries;
     use crate::test_support::profile;
     use crate::test_support::profile_entries;
+    use crate::test_support::turin_kvm_entries;
     use test_with_tracing::test;
 
     const ICELAKE: &str = "intel.icelake-sp.v1";
@@ -989,9 +1042,14 @@ mod tests {
     fn rederiving_a_pinned_profile_reproduces_it() {
         for pinned in crate::pinned_profiles() {
             let known = generation(&pinned.generation().name);
+            let revision = pinned
+                .id()
+                .rsplit_once(".v")
+                .and_then(|(_, revision)| revision.parse().ok())
+                .unwrap();
             let derived = derive_profile(
                 known,
-                1,
+                revision,
                 &[fingerprint(pinned, "kvm"), fingerprint(pinned, "whp")],
             )
             .unwrap();
@@ -1323,6 +1381,198 @@ mod tests {
         );
     }
 
+    /// The pinned Genoa and Turin profiles are the policy's profiles of the
+    /// one host each was derived from: an AMD EPYC 9V74 and an AMD EPYC 9V45
+    /// that KVM serves in Azure VMs of GitHub-hosted Actions runners, whose
+    /// CPUID `test_support::GENOA_KVM_CPUID` and `TURIN_KVM_CPUID` record. Each
+    /// host supports its profile.
+    #[test]
+    fn the_genoa_and_turin_profiles_are_their_hosts_derivations() {
+        for (id, name, entries, brand_string, xcr0) in [
+            (
+                "amd.genoa.v1",
+                "genoa",
+                genoa_kvm_entries(),
+                "AMD EPYC Processor (Genoa)",
+                0x7,
+            ),
+            (
+                "amd.turin.v1",
+                "turin",
+                turin_kvm_entries(),
+                "AMD EPYC Processor (Turin)",
+                0xe7,
+            ),
+        ] {
+            let pinned = profile(id);
+            let host = host_fingerprint("kvm", entries);
+            let derived = derive_profile(generation(name), 1, std::slice::from_ref(&host)).unwrap();
+            assert_eq!(derived.id(), pinned.id());
+            assert_eq!(derived.description(), pinned.description());
+            assert_eq!(derived.generation(), pinned.generation());
+            assert_eq!(derived.cpuid(), pinned.cpuid(), "{id}");
+            assert_eq!(derived.xcr0(), pinned.xcr0(), "{id}");
+            assert_eq!(derived.xss(), pinned.xss(), "{id}");
+            assert_eq!(derived.xsave_components(), pinned.xsave_components());
+            assert_eq!(derived.msrs(), pinned.msrs(), "{id}");
+            assert_eq!(pinned.xcr0(), xcr0, "{id}");
+            assert_eq!(brand(pinned), brand_string);
+            let surface = crate::HostCpuSurface::from_fingerprint(&host.backend);
+            assert_eq!(
+                crate::support_violations(pinned, &surface),
+                Vec::<String>::new(),
+                "{id}"
+            );
+        }
+    }
+
+    /// `amd.genoa.v2` is the policy's profile of the KVM host that
+    /// `amd.genoa.v1` derives from and of an Azure VM with the same CPU whose
+    /// MSHV enumerates the basic leaves only up to 0xD and presents nothing
+    /// in `0x80000021` (`test_support::GENOA_MSHV_CPUID`): v1 without
+    /// `LFENCE` serialization, the TSA immunities, and the zero basic leaves
+    /// above 0xD. Both hosts support it, and the MSHV host does not support
+    /// v1.
+    #[test]
+    fn the_second_genoa_profile_serves_the_kvm_and_mshv_hosts() {
+        let pinned = profile("amd.genoa.v2");
+        let first = profile("amd.genoa.v1");
+        let kvm = host_fingerprint("kvm", genoa_kvm_entries());
+        let mshv = genoa_mshv_fingerprint();
+        let derived = derive_profile(generation("genoa"), 2, &[kvm.clone(), mshv.clone()]).unwrap();
+        assert_eq!(derived.id(), pinned.id());
+        assert_eq!(derived.description(), pinned.description());
+        assert_eq!(derived.generation(), pinned.generation());
+        assert_eq!(derived.cpuid(), pinned.cpuid());
+        assert_eq!(derived.xcr0(), pinned.xcr0());
+        assert_eq!(derived.xss(), pinned.xss());
+        assert_eq!(derived.xsave_components(), pinned.xsave_components());
+        assert_eq!(
+            derived.physical_address_width(),
+            pinned.physical_address_width()
+        );
+        assert_eq!(derived.msrs(), pinned.msrs());
+
+        // v1 but for the maximum basic leaf and 0x80000021.
+        assert_eq!((first.lookup(0, 0)[0], pinned.lookup(0, 0)[0]), (0x1c, 0xd));
+        assert_eq!(first.lookup(0x8000_0021, 0), [0x204, 0, 0x6, 0]);
+        assert_eq!(pinned.lookup(0x8000_0021, 0), [0; 4]);
+        for entry in first.cpuid() {
+            let (leaf, subleaf) = entry.key();
+            match pinned
+                .cpuid()
+                .iter()
+                .find(|pinned| pinned.key() == (leaf, subleaf))
+            {
+                Some(_) if leaf == 0 || leaf == 0x8000_0021 => {}
+                Some(pinned) => assert_eq!(pinned, entry),
+                None => {
+                    assert!((0xe..=0x1c).contains(&leaf), "{leaf:#x}");
+                    assert_eq!(entry.values(), [0; 4], "{leaf:#x}");
+                }
+            }
+        }
+
+        // The hosts disagree on AMD's INVLPGB and RDPRU limits, which take
+        // their minimum, as other limits do, rather than tie.
+        let limits = |fingerprint: &CpuFingerprint| {
+            cpuid::lookup(&fingerprint.backend.cpuid, 0x8000_0008, 0).unwrap()[3]
+        };
+        assert_eq!((limits(&kvm), limits(&mshv)), (0, 0x1_0000));
+        assert_eq!(pinned.lookup(0x8000_0008, 0)[3], 0);
+
+        for host in [&kvm, &mshv] {
+            let surface = crate::HostCpuSurface::from_fingerprint(&host.backend);
+            assert_eq!(
+                crate::support_violations(pinned, &surface),
+                Vec::<String>::new(),
+                "{}",
+                host.backend.name
+            );
+        }
+        let surface = crate::HostCpuSurface::from_fingerprint(&mshv.backend);
+        assert_eq!(
+            crate::support_violations(first, &surface),
+            [
+                "CPUID 0x0 EAX[31:0] is 0x1c, above the supported 0xd",
+                "CPUID 0x80000021 EAX bits 2, 9 are not supported",
+                "CPUID 0x80000021 ECX bits 1, 2 are not supported",
+            ]
+        );
+    }
+
+    /// The WHP host of `test_support::GENOA_WHP_CPUID` supports
+    /// `amd.genoa.v2`, and adding it to the KVM and MSHV hosts that v2
+    /// derives from derives v2's CPUID, XSAVE state, and MSRs again: it lacks
+    /// nothing that v2 takes from them.
+    #[test]
+    fn the_whp_host_adds_nothing_to_the_second_genoa_profile() {
+        let pinned = profile("amd.genoa.v2");
+        let whp = genoa_whp_fingerprint();
+        let surface = crate::HostCpuSurface::from_fingerprint(&whp.backend);
+        assert_eq!(
+            crate::support_violations(pinned, &surface),
+            Vec::<String>::new()
+        );
+
+        let hosts = [
+            host_fingerprint("kvm", genoa_kvm_entries()),
+            genoa_mshv_fingerprint(),
+            whp,
+        ];
+        let derived = derive_profile(generation("genoa"), 2, &hosts).unwrap();
+        assert_eq!(derived.id(), pinned.id());
+        assert_eq!(derived.cpuid(), pinned.cpuid());
+        assert_eq!(derived.xcr0(), pinned.xcr0());
+        assert_eq!(derived.xss(), pinned.xss());
+        assert_eq!(derived.xsave_components(), pinned.xsave_components());
+        assert_eq!(
+            derived.physical_address_width(),
+            pinned.physical_address_width()
+        );
+        assert_eq!(derived.msrs(), pinned.msrs());
+    }
+
+    /// KVM enumerates Intel's speculation controls and
+    /// `IA32_ARCH_CAPABILITIES` on AMD hosts too, as the Genoa and Turin
+    /// hosts' KVM does, and emulates the MSR. An AMD profile has none of
+    /// them and pins no `IA32_ARCH_CAPABILITIES` value, so a profile derived
+    /// from KVM alone stays one that the Hyper-V backends can serve; AMD's
+    /// own controls stay.
+    #[test]
+    fn an_amd_profile_has_none_of_intels_speculation_enumerations() {
+        let amd_controls = 1 << 12 | 1 << 14 | 1 << 15 | 1 << 24;
+        let mut entries = milan_whp_entries();
+        set(&mut entries, 0x7, Some(0), 3, |edx| {
+            edx | INTEL_SPECULATION_ENUMERATIONS
+        });
+        set(&mut entries, 0x8000_0008, None, 1, |ebx| ebx | amd_controls);
+        let mut kvm = host_fingerprint("kvm", entries);
+        kvm.backend.msrs.arch_capabilities = Some(Hex64(0x4000_0000_0c00_0069));
+        let derived = derive_milan(&[kvm]).unwrap();
+        assert_eq!(
+            derived.lookup(0x7, 0)[3] & INTEL_SPECULATION_ENUMERATIONS,
+            0
+        );
+        assert_eq!(derived.msr(IA32_ARCH_CAPABILITIES), None);
+        assert_eq!(
+            derived.lookup(0x8000_0008, 0)[1] & amd_controls,
+            amd_controls
+        );
+        for pinned in crate::pinned_profiles()
+            .iter()
+            .filter(|pinned| pinned.cpu_vendor() == CpuVendor::Amd)
+        {
+            assert_eq!(
+                pinned.lookup(0x7, 0)[3] & INTEL_SPECULATION_ENUMERATIONS,
+                0,
+                "{}",
+                pinned.id()
+            );
+            assert_eq!(pinned.msr(IA32_ARCH_CAPABILITIES), None, "{}", pinned.id());
+        }
+    }
+
     /// The CPUID entry of `profile` at `leaf` and `subleaf`.
     fn entry(profile: &CpuProfile, leaf: u32, subleaf: Option<u32>) -> &CpuidLeafValue {
         profile
@@ -1482,7 +1732,8 @@ mod tests {
     /// PSFD is a bit of `SPEC_CTRL`, so an AMD profile keeps it only beside a
     /// `SPEC_CTRL` control, as KVM's `guest_has_spec_ctrl_msr()` requires of
     /// a guest's CPUID and OpenVMM's KVM backend of KVM's supported CPUID:
-    /// Intel's IBRS, or AMD's IBRS, STIBP, or SSBD. IBPB controls another
+    /// AMD's IBRS, STIBP, or SSBD. Intel's IBRS, which KVM enumerates on AMD
+    /// hosts too, is no control of an AMD profile, and IBPB controls another
     /// MSR. The rule reads the derived profile, so controls that the
     /// backends do not share do not keep PSFD. `BTC_NO`, which KVM never
     /// offers, always goes.
@@ -1499,13 +1750,17 @@ mod tests {
         // The Milan WHP host offers PSFD and BTC_NO, and no SPEC_CTRL control.
         let whp = derive_milan(&[host_fingerprint("whp", milan_whp_entries())]).unwrap();
         assert_eq!(spec(&whp), 0);
-        let ibpb = derive_milan(&[host_fingerprint("kvm", with(0x8000_0008, 1, 1 << 12))]).unwrap();
-        assert_eq!(spec(&ibpb), 0);
+        for (leaf, register, bit, name) in
+            [(0x8000_0008, 1, 12, "AMD IBPB"), (0x7, 3, 26, "Intel IBRS")]
+        {
+            let derived =
+                derive_milan(&[host_fingerprint("kvm", with(leaf, register, 1 << bit))]).unwrap();
+            assert_eq!(spec(&derived), 0, "{name}");
+        }
         for (leaf, register, bit, name) in [
             (0x8000_0008, 1, 14, "AMD IBRS"),
             (0x8000_0008, 1, 15, "AMD STIBP"),
             (0x8000_0008, 1, 24, "AMD SSBD"),
-            (0x7, 3, 26, "Intel IBRS"),
         ] {
             let derived =
                 derive_milan(&[host_fingerprint("kvm", with(leaf, register, 1 << bit))]).unwrap();

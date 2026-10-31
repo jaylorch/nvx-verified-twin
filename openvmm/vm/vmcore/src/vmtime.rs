@@ -211,14 +211,24 @@ impl TimerState {
 
     /// Returns the timestamp corresponding to the given VM time.
     ///
-    /// If the VM time is before the last start time, then the timestamp is at
-    /// the host time when the VM last started.
+    /// If the VM time is in the past and before the last start time, then the
+    /// timestamp is at the host time when the VM last started. If the VM time
+    /// is in the future, beyond what the host clock can represent, then the
+    /// timestamp is at the host clock's latest time.
     fn timestamp(&self, time: VmTime) -> Option<Timestamp> {
         let start_time = self.time.start_time()?;
-        let since = time
-            .checked_sub(start_time.vmtime)
-            .unwrap_or(Duration::ZERO);
-        Some(Timestamp::new(time, start_time.os_time() + since))
+        let os_time = if let Some(since) = time.checked_sub(start_time.vmtime) {
+            start_time.os_time().saturating_add(since)
+        } else if time.is_after(self.now(Instant::now()).vmtime) {
+            // Once VM time has run since the start, a time nearly half the ring
+            // after now is more than half the ring after the start, which VM
+            // time's circular order puts before it. Such a time is still in
+            // the future, far beyond the host clock.
+            Instant::from_nanos(u64::MAX)
+        } else {
+            start_time.os_time()
+        };
+        Some(Timestamp::new(time, os_time))
     }
 
     /// Returns the current guest time given a host time.
@@ -346,6 +356,8 @@ pub struct VmTimeKeeper {
     builder: VmTimeSourceBuilder,
     #[inspect(skip)]
     time: TimeState,
+    #[inspect(skip)]
+    stop_host_time: Option<u64>,
 }
 
 // UNSAFETY: Needed to derive SavedStateRoot in the same crate it is declared
@@ -359,14 +371,33 @@ mod saved_state {
     pub struct SavedState {
         #[mesh(1)]
         pub(super) vmtime: VmTime,
+        #[mesh(2)]
+        pub(super) stop_host_time: Option<u64>,
     }
 
     impl SavedState {
         /// Create a new instance of `SavedState` from an existing `VmTime`.
         pub fn from_vmtime(vmtime: VmTime) -> Self {
-            SavedState { vmtime }
+            SavedState {
+                vmtime,
+                stop_host_time: None,
+            }
+        }
+
+        /// Returns the reading of the keeper's stop clock at the instant VM
+        /// time stopped, if the keeper has a stop clock.
+        pub fn stop_host_time(&self) -> Option<u64> {
+            self.stop_host_time
         }
     }
+}
+
+/// The time at which the keepers stopped.
+#[derive(Debug, MeshPayload, Copy, Clone)]
+struct StoppedTime {
+    vmtime: VmTime,
+    /// The primary keeper's stop clock reading at the stop.
+    host_time: Option<u64>,
 }
 
 #[derive(Debug, MeshPayload, Copy, Clone)]
@@ -447,6 +478,26 @@ impl TimeState {
 impl VmTimeKeeper {
     /// Creates a new time keeper with the specified current guest time.
     pub fn new(driver: &impl SpawnDriver, uptime: VmTime) -> Self {
+        Self::new_inner(driver, uptime, None)
+    }
+
+    /// Creates a new time keeper with the specified current guest time whose
+    /// stops read `stop_clock`, a host clock that returns `None` when it
+    /// cannot be read, at the instant VM time stops, so that saved state
+    /// records when VM time stopped on that clock.
+    pub fn with_stop_clock(
+        driver: &impl SpawnDriver,
+        uptime: VmTime,
+        stop_clock: fn() -> Option<u64>,
+    ) -> Self {
+        Self::new_inner(driver, uptime, Some(stop_clock))
+    }
+
+    fn new_inner(
+        driver: &impl SpawnDriver,
+        uptime: VmTime,
+        stop_clock: Option<fn() -> Option<u64>>,
+    ) -> Self {
         let (new_send, new_recv) = mesh::mpsc_channel();
         let (req_send, req_recv) = mesh::channel();
         let time = TimeState::Stopped(uptime);
@@ -457,11 +508,13 @@ impl VmTimeKeeper {
                 keepers: Vec::new(),
                 next_id: 0,
                 time,
+                stop_clock,
             };
             primary.run().await;
         });
         Self {
             time,
+            stop_host_time: None,
             req_send,
             builder: VmTimeSourceBuilder { new_send },
             _task: task,
@@ -472,12 +525,16 @@ impl VmTimeKeeper {
     pub fn save(&self) -> SavedState {
         SavedState {
             vmtime: self.time.stop_time().expect("should be stopped"),
+            stop_host_time: self.stop_host_time,
         }
     }
 
     /// Restores the time state.
     pub async fn restore(&mut self, state: SavedState) {
-        let SavedState { vmtime } = state;
+        let SavedState {
+            vmtime,
+            stop_host_time: _,
+        } = state;
         self.reset_to(vmtime).await
     }
 
@@ -493,6 +550,7 @@ impl VmTimeKeeper {
 
     async fn reset_to(&mut self, vmtime: VmTime) {
         assert!(!self.time.is_started(), "should be stopped");
+        self.stop_host_time = None;
         self.time = TimeState::Stopped(vmtime);
         self.req_send
             .call(KeeperRequest::Reset, vmtime)
@@ -508,6 +566,7 @@ impl VmTimeKeeper {
     /// Starts the timer, so that the current time will increase.
     pub async fn start(&mut self) {
         let vmtime = self.time.stop_time().expect("should be stopped");
+        self.stop_host_time = None;
         let timestamp = Timestamp::new(vmtime, Instant::now());
         self.time = TimeState::Started(timestamp);
         self.req_send
@@ -520,7 +579,8 @@ impl VmTimeKeeper {
     pub async fn stop(&mut self) {
         assert!(self.time.is_started(), "should be running");
         let stop_time = self.req_send.call(KeeperRequest::Stop, ()).await.unwrap();
-        self.time = TimeState::Stopped(stop_time);
+        self.time = TimeState::Stopped(stop_time.vmtime);
+        self.stop_host_time = stop_time.host_time;
     }
 
     /// Returns a time source builder, which can be used to spawn tasks that
@@ -602,12 +662,14 @@ struct PrimaryKeeper {
     #[inspect(skip)]
     next_id: u64,
     time: TimeState,
+    #[inspect(skip)]
+    stop_clock: Option<fn() -> Option<u64>>,
 }
 
 #[derive(MeshPayload)]
 enum KeeperRequest {
     Start(Rpc<Timestamp, ()>),
-    Stop(Rpc<(), VmTime>),
+    Stop(Rpc<(), StoppedTime>),
     Reset(Rpc<VmTime, ()>),
     Inspect(inspect::Deferred),
 }
@@ -665,6 +727,10 @@ impl PrimaryKeeper {
                                 .await;
 
                                 let start_time = self.time.start_time().expect("should be running");
+                                // Read the stop clock beside the instant that
+                                // stops VM time, so that both describe the
+                                // same cut.
+                                let host_time = self.stop_clock.and_then(|clock| clock());
                                 let now = start_time
                                     .vmtime
                                     .wrapping_add(Instant::now() - start_time.os_time());
@@ -675,6 +741,7 @@ impl PrimaryKeeper {
                                 let stop_time = results
                                     .into_iter()
                                     .filter_map(|r| r.ok())
+                                    .map(|stopped| stopped.vmtime)
                                     .fold(now, |a, b| a.max(b));
 
                                 self.time = TimeState::Stopped(stop_time);
@@ -686,7 +753,10 @@ impl PrimaryKeeper {
                                 }))
                                 .await;
 
-                                stop_time
+                                StoppedTime {
+                                    vmtime: stop_time,
+                                    host_time,
+                                }
                             })
                             .await
                         }
@@ -750,7 +820,10 @@ impl SecondaryKeeper {
                     }),
                     KeeperRequest::Stop(rpc) => rpc.handle_sync(|()| {
                         let mut state = self.state.write();
-                        state.stop(Instant::now())
+                        StoppedTime {
+                            vmtime: state.stop(Instant::now()),
+                            host_time: None,
+                        }
                     }),
                     KeeperRequest::Inspect(deferred) => deferred.inspect(&mut *self),
                 },
@@ -820,8 +893,10 @@ impl VmTimeAccess {
 
     /// Returns the host time corresponding to a guest time.
     ///
-    /// If the guest time is before the VM last resumed, then returns the time
-    /// the VM last resumed.
+    /// If the guest time is in the past and before the VM last resumed, then
+    /// returns the time the VM last resumed. If the guest time is in the
+    /// future, beyond what the host clock can represent, then returns the host
+    /// clock's latest time.
     ///
     /// If the VM is not running, returns `None`.
     pub fn host_time(&self, time: VmTime) -> Option<Instant> {
@@ -975,11 +1050,14 @@ impl VmTimerPeriodic {
 
 #[cfg(test)]
 mod tests {
+    use super::SavedState;
     use super::VmTime;
+    use super::VmTimeAccess;
     use super::VmTimeKeeper;
     use futures::FutureExt;
     use pal_async::DefaultDriver;
     use pal_async::async_test;
+    use pal_async::timer::Instant;
     use pal_async::timer::PolledTimer;
     use std::future::poll_fn;
     use std::time::Duration;
@@ -1041,7 +1119,7 @@ mod tests {
 
     #[async_test]
     async fn test_multi_vmtime(driver: DefaultDriver) {
-        let mut keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
+        let mut keeper = VmTimeKeeper::with_stop_clock(&driver, VmTime::from_100ns(0), || Some(7));
         let src1 = keeper.builder().build(&driver).await.unwrap();
         keeper.start().await;
         let src2 = src1.builder().build(&driver).await.unwrap();
@@ -1060,11 +1138,124 @@ mod tests {
         let t2 = acc2.now();
         assert!(!t1.is_before(now));
         assert_eq!(t1, t2);
+        assert_eq!(keeper.save().stop_host_time(), Some(7));
         let zero = VmTime::from_100ns(0);
         // Even on very fast machines, at least _some_ time will have advanced.
         assert_ne!(t1, zero);
         keeper.reset().await;
+        assert_eq!(keeper.save().stop_host_time(), None);
         assert_eq!(acc1.now(), zero);
         assert_eq!(acc2.now(), zero);
+    }
+
+    /// Checks that `access`, waiting for a timeout that the host clock cannot
+    /// represent, keeps waiting, and that an earlier timeout still fires.
+    async fn check_unrepresentable_timeout(driver: &DefaultDriver, access: &mut VmTimeAccess) {
+        let mut timer = PolledTimer::new(driver);
+        futures::select! {
+            _ = timer.sleep(Duration::from_millis(50)).fuse() => {}
+            _ = poll_fn(|cx| access.poll_timeout(cx)).fuse() => panic!("unexpected wait completion"),
+        }
+
+        let deadline = access.now().wrapping_add(Duration::from_millis(10));
+        access.set_timeout(deadline);
+        futures::select! {
+            _ = timer.sleep(Duration::from_millis(1000)).fuse() => panic!("unexpected timeout"),
+            now = poll_fn(|cx| access.poll_timeout(cx)).fuse() => {
+                assert!(now.is_after(deadline));
+            }
+        }
+    }
+
+    #[async_test]
+    async fn test_timeout_beyond_host_clock(driver: DefaultDriver) {
+        let mut keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
+        let mut access = keeper
+            .builder()
+            .build(&driver)
+            .await
+            .unwrap()
+            .access("test");
+        keeper.start().await;
+
+        // The host clock counts nanoseconds in 64 bits, about 584 years, so it
+        // cannot represent a time 1000 years ahead.
+        let timeout = access
+            .now()
+            .wrapping_add(Duration::from_secs(1000 * 365 * 24 * 60 * 60));
+        assert_eq!(
+            access.host_time(timeout),
+            Some(Instant::from_nanos(u64::MAX))
+        );
+        access.set_timeout(timeout);
+        check_unrepresentable_timeout(&driver, &mut access).await;
+        keeper.stop().await;
+    }
+
+    #[async_test]
+    async fn test_timeout_beyond_host_clock_after_restore(driver: DefaultDriver) {
+        let mut keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
+        let mut access = keeper
+            .builder()
+            .build(&driver)
+            .await
+            .unwrap()
+            .access("test");
+
+        // Arm a timeout while VM time is stopped, and poll once to register
+        // it.
+        let timeout = VmTime::from_100ns(18_000_000_000_000_000);
+        access.set_timeout(timeout);
+        assert!(
+            poll_fn(|cx| access.poll_timeout(cx))
+                .now_or_never()
+                .is_none()
+        );
+
+        // Restore VM time to a time that the timeout follows, in VM time's
+        // circular order, by more nanoseconds than the host clock can count.
+        // The timeout stays armed, so starting VM time arms the host timer for
+        // it.
+        let restored = VmTime::from_100ns(15_800_000_000_000_000_000);
+        assert!(timeout.checked_sub(restored).unwrap().as_nanos() > u64::MAX.into());
+        keeper.restore(SavedState::from_vmtime(restored)).await;
+        keeper.start().await;
+        check_unrepresentable_timeout(&driver, &mut access).await;
+        keeper.stop().await;
+    }
+
+    #[async_test]
+    async fn test_timeout_nearly_half_the_ring_ahead(driver: DefaultDriver) {
+        let start = VmTime::from_100ns(0);
+        let mut keeper = VmTimeKeeper::new(&driver, start);
+        let mut access = keeper
+            .builder()
+            .build(&driver)
+            .await
+            .unwrap()
+            .access("test");
+        keeper.start().await;
+        PolledTimer::new(&driver)
+            .sleep(Duration::from_millis(10))
+            .await;
+
+        // The latest time that follows now in VM time's circular order. As VM
+        // time has run since the start, that order puts it before the start.
+        let now = access.now();
+        let timeout = VmTime::from_100ns(now.as_100ns().wrapping_add(i64::MAX as u64));
+        assert!(timeout.is_after(now));
+        assert!(timeout.is_before(start));
+        assert_eq!(
+            access.host_time(timeout),
+            Some(Instant::from_nanos(u64::MAX))
+        );
+        // A time in the past before the start still maps to the start.
+        assert_eq!(
+            access.host_time(VmTime::from_100ns(u64::MAX)),
+            access.host_time(start)
+        );
+        access.set_timeout(timeout);
+        check_unrepresentable_timeout(&driver, &mut access).await;
+        keeper.stop().await;
     }
 }

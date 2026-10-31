@@ -71,18 +71,18 @@ steps:
       args = parser.parse_args()
 
       root = Path.cwd().resolve()
-      index = root / "doc" / "design.md"
+      index = root / "doc" / "design" / "README.md"
       design_dir = root / "doc" / "design"
       openvmm_dir = (root / "openvmm").resolve()
       openvmm_materialized = (openvmm_dir / "Cargo.toml").is_file()
       errors: list[str] = []
 
       if not index.is_file():
-          errors.append("missing doc/design.md")
+          errors.append("missing doc/design/README.md")
       if not design_dir.is_dir():
           errors.append("missing doc/design/")
 
-      chapters = sorted(design_dir.glob("*.md")) if design_dir.is_dir() else []
+      chapters = sorted(path for path in design_dir.glob("*.md") if path != index) if design_dir.is_dir() else []
       documents = ([index] if index.is_file() else []) + chapters
       indexed_chapters: set[Path] = set()
       link_pattern = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
@@ -127,12 +127,12 @@ steps:
               )
               if not resolved.exists() and not missing_unmaterialized_openvmm:
                   errors.append(f"{relative}: broken relative link: {target}")
-              if document == index and resolved.parent == design_dir:
+              if resolved.parent == design_dir:
                   indexed_chapters.add(resolved)
 
       missing_from_index = [path for path in chapters if path not in indexed_chapters]
       for path in missing_from_index:
-          errors.append(f"doc/design.md: missing chapter link for {path.name}")
+          errors.append(f"doc/design/README.md: missing chapter link for {path.name}")
 
       if errors:
           raise SystemExit("\n".join(errors))
@@ -237,7 +237,7 @@ validation.
 
 ## Required preparation
 
-1. Read `README.md`, `.github/copilot-instructions.md`, `doc/design.md`,
+1. Read `README.md`, `.github/copilot-instructions.md`, `doc/design/README.md`,
    `doc/contribute.md`, `doc/build.md`, `doc/ci.md`, and
    `doc/project-structure.md`.
 2. Read `/tmp/gh-aw/agent/repository-context.json` and
@@ -256,7 +256,7 @@ validation.
 
 Compare the current design chapters with the vendored OpenVMM implementation and
 tests. Treat implementation and executable tests as the source of truth. Use
-`doc/design/code-ownership-map.md` to start from the relevant implementation
+`doc/openvmm-upstream-roadmap.md` to start from the relevant implementation
 surface, then verify claims directly in code. Inspect only tracked implementation
 and test paths in the recorded tree; ignored or generated content is not
 implementation evidence.

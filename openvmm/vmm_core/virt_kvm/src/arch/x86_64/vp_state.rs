@@ -275,6 +275,10 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
         };
         let events = self.kvm().get_vcpu_events()?;
 
+        // N.B. KVM has no way to get back an extint queued with KVM_INTERRUPT.
+        //      PIC interrupts are normally placed in the injected-interrupt
+        //      slot instead, which is reported below as a pending
+        //      interruption.
         let event = if events.exception.pending != 0 {
             Some(vp::PendingEvent::Exception {
                 vector: events.exception.nr,
@@ -287,10 +291,7 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
                 },
             })
         } else {
-            self.vp
-                .runner
-                .pending_extint()
-                .map(|vector| vp::PendingEvent::ExtInt { vector })
+            None
         };
 
         let interruption = if events.exception.injected != 0 {
@@ -328,6 +329,19 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
             pending_event,
             pending_interruption,
         } = *value;
+
+        // KVM can neither report nor withdraw an extint queued with
+        // KVM_INTERRUPT, so a restored one would be missing from the next save,
+        // and a reset could not discard it. Reject it before changing any
+        // activity state. KVM's own saved state never has one: injected PIC
+        // interrupts are saved as pending interruptions, and queued ones are
+        // not saved. Like any other restore error, this does not undo what
+        // restore_all restored before the activity, such as the registers.
+        if let Some(vp::PendingEvent::ExtInt { .. }) = pending_event {
+            return Err(KvmError::InvalidState(
+                "restoring a pending ExtINT is not supported",
+            ));
+        }
 
         let state = match mp_state {
             vp::MpState::Running => kvm::KVM_MP_STATE_RUNNABLE,
@@ -387,10 +401,8 @@ impl AccessVpState for KvmVpStateAccess<'_, '_> {
                 // TODO
                 let _ = parameter;
             }
-            Some(vp::PendingEvent::ExtInt { vector }) => {
-                self.vp.runner.restore_pending_extint(vector)?;
-            }
-            None => {}
+            // Rejected above.
+            Some(vp::PendingEvent::ExtInt { .. }) | None => {}
         }
 
         match pending_interruption {

@@ -1,7 +1,7 @@
 ---
 name: code-documentation
 description: Correct one verifiable statement in NVX documentation
-intent: Keep NVX documentation trustworthy by correcting one novel inaccurate, ambiguous, or missing statement that current NVX code, including the aci_edge_sandboxes crate, or commands verify, without repeating rejected work.
+intent: Keep NVX documentation trustworthy by correcting one novel inaccurate, ambiguous, or missing statement that current NVX code, including the nvx-rs crate, or commands verify, without repeating rejected work.
 on:
   schedule: hourly
   workflow_dispatch:
@@ -57,13 +57,13 @@ verified against current NVX code or commands.
 
 Target Markdown documentation in `doc/`, a comment or docstring in allowlisted
 tooling that misstates the code it describes, or a Rust documentation comment
-(`//!` or `///`) in `aci_edge_sandboxes/` that misstates the crate code it
+(`//!` or `///`) in `nvx-rs/` that misstates the crate code it
 describes. A qualifying candidate is one statement, table row, or short passage
 that contradicts, is ambiguous about, or omits a fact established by current
 NVX sources, such as a CLI option, subcommand, default, path, or prerequisite
 defined in `scripts/nvx.py` or `scripts/nvx_tools/`, a CI step defined under
 `.github/`, or, for the crate, a public item, default, error code, or
-environment variable defined in `aci_edge_sandboxes/src/` or a Cargo feature
+environment variable defined in `nvx-rs/src/` or a Cargo feature
 defined in its `Cargo.toml`. Leave every `README.md` alone, including the
 crate's: gh-aw protects that file name, so the pull request allowlist excludes
 it.
@@ -75,7 +75,7 @@ change executable code, CLI help text, or behavior to match the documentation;
 in code files, edit only comments and docstrings, which in Rust means `//`,
 `///`, and `//!` comments.
 
-Skip `doc/design.md` and `doc/design/**` unless NVX files outside `openvmm/`
+Skip `doc/design/**` unless NVX files outside `openvmm/`
 verify the statement entirely; the `documentation-updater` workflow owns design
 content derived from the pinned OpenVMM implementation. Reject stylistic
 rewording, typo or grammar sweeps, statements about future plans, and

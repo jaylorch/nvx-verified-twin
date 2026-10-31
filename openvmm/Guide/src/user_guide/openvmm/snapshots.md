@@ -25,9 +25,10 @@ These are stored as three required files and one optional paired file:
 
 MicroVM manifests also record the NVX time ABI contract: the declared TSC and
 LAPIC rates, the capture anchor (VP 0's TSC paired with host UTC and host
-monotonic time), the capture host's identity, and the CPU profile with the
-effective CPUID that the guest observes. Every snapshot, microVM or standard
-machine, is manifest version 6, and restore accepts only version 6
+monotonic time), the interval from the saved VM-time cut to that anchor, the
+capture host's identity, and the CPU profile with the effective CPUID that the
+guest observes. Every snapshot, microVM or standard machine, is manifest
+version 6, and restore accepts only version 6
 (`E_SNAPSHOT_VERSION`); recapture snapshots taken by earlier versions. See
 [Time and CPU compatibility](#time-and-cpu-compatibility).
 
@@ -41,6 +42,15 @@ with sandbox blocks additionally requires
 `--snapshot-tier platform|workload-start|instance-checkpoint`. Platform and
 workload-start snapshots are reusable clones; instance checkpoints are
 single-use resumes.
+
+Sandbox-block capture defaults to whole-file SHA-256 identity and private
+scratch copying. Storage owners may opt into
+`--snapshot-block-identity generation --snapshot-generation-id <32-HEX-DIGITS>`
+when an authenticated immutable generation already binds the supplied files.
+This avoids capture- and restore-time block scans; it does not authenticate
+bytes by itself. `--snapshot-scratch-restore-mode` records `private-copy`,
+reflink-only `copy-on-write` for workload-start clones, or `direct-claimed`
+for instance checkpoints.
 
 ```admonish warning
 Automatically allocated microVM RAM and the snapshot destination are on the
@@ -75,17 +85,25 @@ use an independent memory copy. Automatic microVM backing uses its exact RAM
 file when the filesystem supports hard links. The destination must not already
 exist. Publishing the completed directory is the commit point.
 
-On Windows, large mapped-RAM flushes use up to eight concurrent, disjoint,
-page-aligned ranges to reduce sensitivity to fragmented dirty-page writeback.
-Small ranges are flushed inline. Capture waits for every range, including
-when a flush fails; an error prevents publication. The subsequent file and
-directory durability barriers are unchanged.
-Worker startup has a cost on fast storage; this policy targets writeback
-stalls rather than guaranteeing lower capture latency on every host.
+On Windows, NTFS zero-fills a file below any write that starts past the file's
+valid data length, and a newly created RAM backing file has none. Capture
+therefore first marks every page of the writable guest RAM views modified,
+without changing its contents and on up to eight threads for large ranges, and
+then flushes the whole range with one ascending `FlushViewOfFile`. The flush
+writes each page once, in large sequential writes, whatever the guest's
+dirty-page layout, so a 128-MiB guest writes at most 128 MiB. Flushing disjoint
+ranges concurrently instead let NTFS zero ranges that another range then wrote
+again, and flushing scattered dirty pages serially issues one small,
+latency-bound write per run. Pages of read-only views, such as deferred-protect
+windows that the guest never wrote, are flushed as they are. Marking faults in
+the pages of writable views that the guest never touched, so the file cache
+holds the whole range after capture. An error prevents publication. The
+subsequent file and directory durability barriers are unchanged.
 
 The Windows-only `sparse_mmap` test `profile_fragmented_file_flush` reproduces
-the fragmented writeback workload with alternating dirty 4-KiB pages in a
-128-MiB file. It compares serial and bounded-parallel flushing, including the
+the fragmented writeback workload with alternating dirty 4-KiB pages in a new
+128-MiB file. It compares the former policy, which flushed bounded-parallel
+ranges without marking their pages, with the current flush, including the
 subsequent file sync, and verifies the persisted bytes. Run it on an otherwise
 idle host:
 
@@ -156,14 +174,39 @@ releasing gated input. The peer must accept and read while resume is in
 progress; on Windows, flush completion waits until the named-pipe peer consumes
 the complete frame.
 
-For a tiered microVM restore, OpenVMM starts device workers with network and
-control input gated. The guest performs post-restore repair and writes the
-existing snapshot port (`0x605`) to acknowledge completion. OpenVMM stops at
-that exact post-write boundary, completes the deferred write while the vCPU is
-stopped, and then releases device input before resuming the vCPU. The acknowledgement is bounded by
-`--restore-gate-timeout-ms` (60000 milliseconds by default). Platform manifests
+For a tiered microVM restore, OpenVMM starts device workers with network,
+control, and filesystem input gated. The guest performs post-restore repair
+and writes the existing snapshot port (`0x605`) to acknowledge completion.
+OpenVMM stops at that exact post-write boundary, completes the deferred write
+while the vCPU is stopped, and then releases device input before resuming the
+vCPU. Until then, the guest's virtio-fs requests wait on their virtqueues, so
+repair must not wait for a virtio-fs reply. The acknowledgement is bounded by
+`--restore-gate-timeout-ms` (60000 milliseconds by default). A control-console
+host can connect while input is gated, but OpenVMM reads its authentication
+only after the release, so its `--microvm-control-auth-timeout-ms` deadline
+starts over when the gate releases. Platform manifests
 leave read-only layer identities unbound, while later tiers require exact image
-identities. An instance-checkpoint restore attempt atomically creates
+identities. A platform restore also presents the captured capacity of its
+`distro` block before any vCPU runs, so one platform snapshot serves images of
+any length up to that capacity. An image with the captured logical and
+physical block sizes may be shorter, and reads past its end, including the tail
+of a request that crosses it, return zeros. OpenVMM rejects a longer image and
+never resizes, pads, or writes the image file. A platform restore may also
+declare its fresh scratch absent with `--restore-absent-scratch`, for a clone
+that never writes it, such as one that keeps its upper layer in RAM. OpenVMM
+then attaches the scratch device with no file, at the captured length and
+block sizes. The device stays writable, as the guest negotiated it, but reads
+return zeros and writes fail with an I/O error: OpenVMM never drops a write or
+keeps one in host memory. Only a platform snapshot's fresh scratch may be
+absent, and a scratch file, when given, keeps the exact captured length. A
+platform snapshot whose NIC was captured with a complete deny-all policy,
+`--network-egress deny` and `--host-loopback deny` without egress rules, a
+proxy, or ingress, is a NIC template: with `--restore-network-policy`, each
+clone installs the policy of its own restore options, which may publish its
+listeners and forward host ports, instead of the captured one. OpenVMM
+validates that policy as at a cold boot and installs it before any vCPU runs,
+and the NIC keeps its captured identity. Every other networked restore
+requires the captured policy. An instance-checkpoint restore attempt atomically creates
 `resume.claim`; subsequent restores are rejected. The claim is committed after
 artifact and configuration validation but before worker construction, so the
 restore attempt remains consumed if later worker startup fails.
@@ -215,6 +258,10 @@ onlines and verifies that prefix before acknowledging the restore gate.
 On MSHV, an explicit target instantiates and binds only that VP prefix; saving
 such a reduced-prefix runtime is unsupported. MSHV restores without an explicit
 target, and all KVM and WHP restores, instantiate the full VP capacity.
+Platform snapshots support the same opt-in. Their command line may carry one
+`maxcpus=` token, which must be the canonical form of the recorded
+boot-online count, so each clone of one platform capture can bring its own
+prefix online, as each clone can expand its RAM with `--restore-memory`.
 A microVM restore sets the TSC of every instantiated VP in one synchronized
 operation before any VP runs: each TSC continues from the capture anchor,
 advanced by the host downtime at the declared rate. KVM sets one common TSC
@@ -223,6 +270,11 @@ and resume partition time. Every backend reads each VP's TSC back and rejects
 a restore whose values differ (`E_TSC_SYNC_READBACK`), and one-shot LAPIC
 timers advance by the same downtime. The guest TSC is never scaled, and
 RDTSC is never trapped or emulated.
+VM time and the RTC stop with the state units shortly before the public
+capture anchor. New snapshots record that cut-to-anchor interval, measured on
+the host monotonic clock that the anchor samples, and add it to their VM-time
+and RTC advancement; older snapshots retain the previous anchor-based
+behavior.
 Snapshots without the explicit capture-time `maxcpus` opt-in reject a restore
 target. This is not a post-readiness hotplug API and cannot add VPs absent
 from the saved topology.
@@ -231,11 +283,13 @@ from the saved topology.
 Snapshots do not contain or validate embedded checksums for
 `state.bin` or `memory.bin`. Restore still requires regular files, bounded
 manifest and state decoding, exact artifact lengths, and a compatible machine
-contract, but same-length payload changes are not detected. Paired
-`scratch.img` does have an exact length and SHA-256 identity because it must
-match captured guest filesystem state. Protect snapshot directories with host
-access controls. Integrity or authentication for export and transport must be
-supplied outside the default snapshot format.
+contract, but same-length payload changes are not detected. Paired `scratch.img` always
+has an exact length and uses either the default SHA-256 identity or an explicit
+caller-authenticated storage generation. Generation mode avoids reading the
+file solely for verification and therefore relies on the storage owner to keep
+that generation immutable and correctly bound. Protect snapshot directories
+with host access controls. Integrity or authentication for export and
+transport must be supplied outside the default snapshot format.
 ```
 
 ```admonish note
@@ -265,28 +319,59 @@ every backend. OpenVMM pins `intel.skylake-sp.v1` (Xeon Scalable, first
 generation: family 6, model 85, steppings 0 to 4), `intel.icelake-sp.v1`
 (Xeon Scalable, third generation: 6/106), `intel.emeraldrapids.v1` (Xeon
 Scalable, fifth generation: 6/207), `intel.alderlake.v1` (Core, twelfth
-generation: 6/151 and 6/154), and `amd.milan.v1` (AMD EPYC, third generation:
-25/1). `--cpu-profile <ID>` selects one; the default,
-`auto`, selects the profile of the host's generation, and a host without one
-fails (`E_PROFILE_HOST_UNKNOWN`). On an Intel or AMD development host without
-one, `--cpu-profile host` boots on a host profile instead: OpenVMM
-fingerprints the backend on this host, as `--cpu-fingerprint` does, and
-applies the pinned profiles' derivation policy to it. A host profile,
+generation: 6/151 and 6/154), `amd.milan.v1` (AMD EPYC, third generation:
+25/1), `amd.genoa.v1` and `amd.genoa.v2` (AMD EPYC, fourth generation:
+25/17), and `amd.turin.v1` (AMD EPYC, fifth generation: 26/2).
+`amd.genoa.v2` drops what `amd.genoa.v1` presents in `0x80000021`, `LFENCE`
+serialization and the TSA immunities, which not every Genoa host's
+hypervisor presents. `--cpu-profile <ID>` selects one; the default,
+`auto`, selects the latest revision of the host's generation's profile. An
+earlier revision stays pinned, so its snapshots still restore. An Intel or
+AMD host that no pinned profile serves boots on a host profile
+instead: `auto` falls back to the profile that `--cpu-profile host`
+selects, for which OpenVMM fingerprints the backend on this host, as
+`--cpu-fingerprint` does, and applies the pinned profiles' derivation policy
+to it. Every cold boot that falls back logs a warning at the default log
+level that starts with `NVX-CPU-PROFILE-FALLBACK:`, names the CPU and the
+host profile with its digest, says what that cold boot's fingerprint took,
+and asks for the CPU's fingerprint so that a
+pinned profile can serve it. A host of another vendor without a profile
+fails (`E_PROFILE_HOST_UNKNOWN`). A host profile,
 `intel.host.v1` or `amd.host.v1`, serves only the host's CPU model and
-stepping, is not pinned, and can change with the host's microcode, firmware,
-or hypervisor. Every boot checks that the backend
+stepping, is not pinned, can change with the host's microcode, firmware,
+or hypervisor, and costs a fingerprint of the backend at every cold boot.
+Every profile, pinned or host, fixes the CPU time bits that the time ABI
+requires: the hypervisor, TSC, RDTSCP, ARAT, and invariant-TSC bits set, and
+no TSC-deadline timer, `IA32_TSC_ADJUST`, PDCM, performance monitoring leaf
+`0xa`, or rate leaves `0x15` and `0x16`; OpenVMM refuses a profile that
+violates them (`E_PROFILE_DIGEST`). Before a partition uses a pinned profile,
+OpenVMM verifies the profile's built-in data, once per process: a valid
+profile, CPU time bits included, whose built-in encoding, which snapshots
+embed, is its canonical encoding (`E_PROFILE_DIGEST`).
+Every boot checks that the backend
 supports the profile (`E_PROFILE_UNSUPPORTED`) and that VP 0 observes its
-effective CPUID (`E_CPU_SURFACE`). On an Intel or AMD host, `auto`'s errors
-name `--cpu-profile host` both where no pinned profile serves the host and
-where the backend does not support the one that does, because a host profile
-derives from what the backend supports. A snapshot records the profile and the
+effective CPUID (`E_CPU_SURFACE`); where `auto` fell back, such a failure
+says so. On an Intel or AMD host, `auto`'s error names `--cpu-profile host`
+where the backend does not support the pinned profile of the host's
+generation, because a host profile derives from what the backend supports.
+A snapshot records the profile and the
 effective CPUID. Restore requires the same profile, pinned in this OpenVMM with
 the same digest, or, for a host profile, the snapshot's own copy of it, which
-must match the recorded digest; a host of the profile's generation; and an
-identical effective CPUID.
+must be a valid profile, its CPU time bits included, with the recorded digest;
+a host of the profile's generation; and an identical effective CPUID.
 OpenVMM computes the effective CPUID, including its own leaves and the bits
 it owns, such as the cache topology, so an OpenVMM build that computes it
-differently rejects earlier snapshots with `E_CPU_SURFACE`.
+differently rejects earlier snapshots with `E_CPU_SURFACE`. That error names
+each entry in which the two effective CPUIDs differ, with every register in
+which it differs, each entry that only one of them has, each entry that the
+snapshot lists more than once, and a snapshot that does not list its entries
+in order of leaf and subleaf.
+These checks all run, even after one of them fails: on restore, the
+comparison of the effective CPUID with the snapshot's, then, on every boot,
+the check that VP 0 observes it and the check that the backend supports the
+profile. Their error thus names every violation of each, leads with the code
+of the first that fails, in that order, and goes on with the failures of the
+others.
 
 Restore also requires:
 
@@ -316,7 +401,9 @@ For standard-machine snapshots, device flags must still be supplied on restore
 and must reproduce the saved machine. For microVM snapshots, the manifest is
 authoritative for RAM, topology, ABI, fixed devices, placement,
 features, interrupts, and the effective Linux direct command line. Restore-time
-guest-visible overrides are rejected.
+guest-visible overrides are rejected. Restore reuses the saved command line
+verbatim, and rejects one longer than the microVM limit of 2047 bytes plus the
+terminating NUL instead of rewriting it.
 
 Every snapshot records a complete state-unit inventory. Each emulated device
 saves state under a unique name (for example `"pit"`, `"vmbus"`, or `"ide"`),
@@ -340,31 +427,40 @@ post-restore acknowledgement boundary. Teardown still depends on the affected
 backends responding; it does not provide a bounded shutdown deadline.
 
 For microVM virtio-fs, the manifest always records the fixed,
-guest-discoverable first slot. A dormant slot has no host attachment or
+guest-discoverable slot. A dormant slot has no host attachment or
 filesystem policy and carries explicit dormant device-private state. An active
 slot also records the stable attachment ID, exact canonical host path, pinned
-root identity, guest mount target, access mode, ownership mode, no-DAX queue
-policy, and `live-revalidate` restore mode. A second slot is recorded only
-when a second share was attached, with the same fields for that share.
+root identity, guest mount target, access mode, denied, allowed, and writable
+paths, ownership mode, no-DAX queue
+policy, and `live-revalidate` restore mode.
 Its device-private payload records FUSE negotiation, namespace IDs and aliases,
 lookup counts, reopenable handles, bounded directory-entry snapshots and
 cookies, and queue progress. Native file descriptors and Windows handles are
-never serialized.
+never serialized. For an aggregate filesystem (`--mount-aggregate`), the
+manifest records each child's name, kind (directory or file), canonical host
+path, root identity, access mode, and denied, allowed, and writable paths, and
+the device-private payload records the children and the inodes of each. A
+snapshot that an earlier OpenVMM captured with a second virtio-fs slot cannot
+be restored.
 
-Restoring active slots requires a fresh
-`--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>` attachment for each, in capture
-order, with the same canonical host path, target, and mode, and the same
+Restoring an active slot requires a fresh
+`--mount <GUEST_TARGET,HOST_PATH[,ro|rw]>` attachment, or `--mount-aggregate`
+and its `--mount-child` options in the same order, with the same canonical
+host paths, kinds, target, and modes, the same
+`--mount-deny`, `--mount-allow`, and `--mount-write` paths, and the same
 `--mount-owner` mode. OpenVMM independently validates the roots and every
 saved object identity before starting a vCPU. A dormant-slot snapshot may
-restore without an attachment or bind one new attachment to the first slot.
+restore without an attachment or bind one new `--mount` to the slot, and a
+platform snapshot may instead bind a new `--mount-aggregate`, which OpenVMM
+validates as at a cold boot.
 For a new attachment, the resumed guest explicitly mounts tag `microvm`; the
 cold-boot mount hook does not run again.
 
 ```admonish warning
-The host directory is external live state, not snapshot content. Host
-mutations after capture can change restored reads or make restore fail. A
-read-write restore also changes the shared host directory, and restoring the
-same VM snapshot again does not roll those changes back.
+Shared host directories and files are external live state, not snapshot
+content. Host mutations after capture can change restored reads or make
+restore fail. A read-write restore also changes the shared host data, and
+restoring the same VM snapshot again does not roll those changes back.
 ```
 
 The rules are:
@@ -457,7 +553,8 @@ immediately with a clear error if any active device does not support it.
   supported.
 - MicroVM restore requires the backend, CPU generation, and CPU profile of
   the capture, and an OpenVMM build that computes the same effective CPUID.
-  A host profile's snapshot restores only on a host of the capture host's CPU
-  model and stepping.
+  A host profile's snapshot, including one of a cold boot whose `auto` fell
+  back to a host profile, restores only on a host of the capture host's CPU
+  model and stepping whose backend supports the profile.
   Snapshots from manifest versions before 6, or from a build that computes a
   different effective CPUID, must be recaptured.

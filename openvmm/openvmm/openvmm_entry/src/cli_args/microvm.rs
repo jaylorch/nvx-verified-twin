@@ -11,6 +11,7 @@ use super::SmtConfigCli;
 use anyhow::Context;
 use clap::ValueEnum;
 use openvmm_defs::config::DeviceVtl;
+#[cfg(guest_arch = "x86_64")]
 use openvmm_defs::config::X2ApicConfig;
 use openvmm_defs::microvm::MachineProfile;
 use openvmm_defs::microvm::MicrovmNetworkProfile;
@@ -154,6 +155,69 @@ pub enum SnapshotTierCli {
     InstanceCheckpoint,
 }
 
+/// Identity policy for sandbox blocks captured in a microVM snapshot.
+#[derive(Debug, Copy, Clone, Default, ValueEnum, PartialEq, Eq)]
+pub enum SnapshotBlockIdentityCli {
+    /// Compute and verify whole-file SHA-256 identities.
+    #[default]
+    Sha256,
+    /// Trust the caller-supplied immutable storage generation.
+    Generation,
+}
+
+/// Restore-time materialization policy for paired scratch.
+#[derive(Debug, Copy, Clone, Default, ValueEnum, PartialEq, Eq)]
+pub enum SnapshotScratchRestoreModeCli {
+    /// Create an independent private file, falling back to sparse copying.
+    #[default]
+    PrivateCopy,
+    /// Require a filesystem copy-on-write clone.
+    CopyOnWrite,
+    /// Attach the paired scratch file after the resume snapshot is claimed.
+    DirectClaimed,
+}
+
+impl SnapshotScratchRestoreModeCli {
+    pub(crate) fn manifest_name(self) -> &'static str {
+        match self {
+            Self::PrivateCopy => {
+                openvmm_helpers::snapshot::microvm::SNAPSHOT_SCRATCH_RESTORE_PRIVATE_COPY
+            }
+            Self::CopyOnWrite => {
+                openvmm_helpers::snapshot::microvm::SNAPSHOT_SCRATCH_RESTORE_COPY_ON_WRITE
+            }
+            Self::DirectClaimed => {
+                openvmm_helpers::snapshot::microvm::SNAPSHOT_SCRATCH_RESTORE_DIRECT_CLAIMED
+            }
+        }
+    }
+}
+
+/// Caller-supplied immutable storage generation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct SnapshotGenerationIdCli(pub(crate) [u8; 16]);
+
+impl FromStr for SnapshotGenerationIdCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        anyhow::ensure!(
+            value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "snapshot generation ID must be exactly 32 hexadecimal characters"
+        );
+        let mut generation = [0_u8; 16];
+        for (index, byte) in generation.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .context("snapshot generation ID contains invalid hexadecimal")?;
+        }
+        anyhow::ensure!(
+            generation.iter().any(|byte| *byte != 0),
+            "snapshot generation ID must be nonzero"
+        );
+        Ok(Self(generation))
+    }
+}
+
 impl SnapshotTierCli {
     pub(crate) fn manifest_name(self) -> &'static str {
         match self {
@@ -224,6 +288,26 @@ pub struct MicrovmCli {
     #[clap(long, value_name = "SIZE", requires = "restore_snapshot")]
     pub restore_memory: Option<vmm_cli::MemorySize>,
 
+    /// Attach a platform snapshot's fresh scratch with no file.
+    ///
+    /// The scratch device keeps the captured length and block sizes, and stays
+    /// writable, as the guest negotiated it: reads return zeros, and writes
+    /// fail with an I/O error. Do not pass a scratch block with it.
+    #[clap(long, requires = "restore_snapshot")]
+    pub restore_absent_scratch: bool,
+
+    /// Install this restore's network policy in place of the complete
+    /// deny-all policy that a platform snapshot's NIC was captured with.
+    ///
+    /// The NIC keeps its captured identity. The network policy options of
+    /// this restore, which may include `--network-ingress allow`,
+    /// `--host-loopback allow`, and `--host-loopback-forward`, are validated
+    /// as at a cold boot, and the policy is installed before any vCPU runs.
+    /// The snapshot must have been captured with `--network-egress deny` and
+    /// `--host-loopback deny`, without egress rules, a proxy, or ingress.
+    #[clap(long, requires = "restore_snapshot")]
+    pub restore_network_policy: bool,
+
     /// Maximum time allowed for a microVM guest to complete post-restore repair.
     #[clap(long, value_name = "MILLISECONDS", default_value_t = 60000)]
     pub restore_gate_timeout_ms: u64,
@@ -244,6 +328,31 @@ pub struct MicrovmCli {
         requires = "snapshot_destination"
     )]
     pub snapshot_tier: Option<SnapshotTierCli>,
+
+    /// Sandbox-block identity policy for this capture.
+    ///
+    /// `sha256` is the default. `generation` avoids whole-file hashing and
+    /// requires an immutable generation supplied by the storage owner.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "MODE",
+        requires = "snapshot_destination"
+    )]
+    pub snapshot_block_identity: Option<SnapshotBlockIdentityCli>,
+
+    /// Immutable storage generation used by `--snapshot-block-identity generation`.
+    #[clap(long, value_name = "HEX", requires = "snapshot_destination")]
+    pub snapshot_generation_id: Option<SnapshotGenerationIdCli>,
+
+    /// Restore-time materialization policy recorded for paired scratch.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "MODE",
+        requires = "snapshot_destination"
+    )]
+    pub snapshot_scratch_restore_mode: Option<SnapshotScratchRestoreModeCli>,
 
     /// Maximum time allowed to quiesce the VM for a guest-requested snapshot.
     #[clap(long, value_name = "MILLISECONDS", default_value_t = 5000)]
@@ -283,29 +392,47 @@ pub struct MicrovmCli {
 
     /// Default action for new connections initiated toward the microVM guest.
     ///
-    /// The portable profile supports only `deny`: its NAT admits responses to
-    /// guest-initiated flows but exposes no listener for new inbound connections.
+    /// With `allow`, the guest announces the TCP and UDP ports on which it
+    /// listens, and the portable profile listens on every host address at
+    /// those port numbers for clients on the host's private networks, whose
+    /// addresses are not globally reachable. Globally reachable clients are
+    /// refused, and so is the host itself unless `--host-loopback allow`
+    /// admits it. Replies to admitted traffic pass regardless of the egress
+    /// policy. Snapshot capture does not support it, and a restore supports it
+    /// only with `--restore-network-policy`.
     #[clap(long, value_enum, value_name = "ACTION")]
     pub network_ingress: Option<MicrovmNetworkActionCli>,
 
-    /// Permit matching IPv4 destinations, optionally restricted by TCP/UDP port.
+    /// Permit matching IPv4 or IPv6 destinations, optionally restricted to
+    /// TCP, UDP, or ICMP, and for TCP or UDP optionally to one destination
+    /// port or to an inclusive range of them. A rule matches only its own
+    /// address family.
     #[clap(
         long = "network-egress-allow",
-        value_name = "IPv4[/PREFIX][:tcp|udp:PORT]"
+        value_name = "CIDR[:tcp[:PORT[-PORT]]|:udp[:PORT[-PORT]]|:icmp]"
     )]
     pub network_egress_allow: Vec<net_backend_resources::egress::EgressRule>,
 
-    /// Deny matching IPv4 destinations before evaluating allow rules.
+    /// Deny matching IPv4 or IPv6 destinations before evaluating allow rules.
     #[clap(
         long = "network-egress-deny",
-        value_name = "IPv4[/PREFIX][:tcp|udp:PORT]"
+        value_name = "CIDR[:tcp[:PORT[-PORT]]|:udp[:PORT[-PORT]]|:icmp]"
     )]
     pub network_egress_deny: Vec<net_backend_resources::egress::EgressRule>,
 
-    /// Deny host-loopback access, or allow it with explicit localhost forwards.
+    /// Deny or allow bidirectional host-loopback access.
     ///
-    /// Explicit `allow` without forwards is unsupported: portable NAT cannot
-    /// provide generic bidirectional host-loopback connectivity.
+    /// Explicit `allow` lets the guest reach host loopback services through
+    /// its gateway, subject to the egress policy, and publishes every TCP and
+    /// UDP port on which the guest listens on host loopback for the host
+    /// alone, without a port list: the guest announces its listeners, and
+    /// replies to the host pass regardless of the egress policy. With
+    /// `--network-ingress allow`, the listeners published to the host's
+    /// private networks admit the host instead. Explicit forwards may publish
+    /// further ports. Explicit `allow` requires an IPv4 network of /29 or
+    /// larger, whose subnet leaves addresses at which host peers reach the
+    /// guest. Snapshot capture does not support explicit `allow`, and
+    /// a restore supports it only with `--restore-network-policy`.
     #[clap(long, value_enum, value_name = "ACTION")]
     pub host_loopback: Option<MicrovmNetworkActionCli>,
 
@@ -335,32 +462,98 @@ pub struct MicrovmCli {
     #[clap(long, value_name = "IPv4:TCP-PORT", conflicts_with_all = ["allow_host", "block_host"])]
     pub allow_endpoint: Vec<net_backend_resources::egress::TcpEndpoint>,
 
-    /// attach a host directory to the next fixed microVM virtio-fs slot
+    /// attach a host directory to the fixed microVM virtio-fs slot
     ///
-    /// Repeat once to attach a second directory. The first directory uses the
-    /// `microvm` tag and the second the `microvm1` tag. Guest targets and host
-    /// directories must not overlap. An active snapshot requires the same
-    /// canonical host paths, guest targets, and modes, in the same order. A
-    /// dormant-slot snapshot may bind one new attachment on restore; the
-    /// resumed guest must mount the `microvm` tag explicitly.
+    /// The directory uses the `microvm` tag. GUEST_TARGET ends at the first
+    /// comma, and the optional mode follows the last comma, so HOST_PATH may
+    /// contain commas when the mode is given. An active snapshot requires the
+    /// same canonical host path, guest target, and mode. A dormant-slot
+    /// snapshot may bind one new attachment on restore; the resumed guest
+    /// must mount the `microvm` tag explicitly. To share several host
+    /// directories, use `--mount-aggregate` and `--mount-child` instead.
     #[clap(
         long = "mount",
         value_name = "GUEST_TARGET,HOST_PATH[,ro|rw]",
         conflicts_with_all = ["virtio_fs", "virtio_fs_shmem"]
     )]
-    pub microvm_mount: Vec<MicrovmMountCli>,
+    pub microvm_mount: Option<MicrovmMountCli>,
+
+    /// attach several host directories or files to the fixed microVM
+    /// virtio-fs slot as one aggregate, mounted at GUEST_TARGET
+    ///
+    /// The aggregate's root is read-only, only the guest's root user may
+    /// enter it, and it lists one directory or regular file per
+    /// `--mount-child`, which has its own access mode. The guest mounts the
+    /// `microvm` tag at GUEST_TARGET with `virtfs_aggregate=1` on its command
+    /// line, and is expected to bind-mount each child where it is needed. A
+    /// platform snapshot's dormant slot may bind an aggregate on restore,
+    /// validated as at a cold boot; the resumed guest keeps its captured
+    /// command line, so it must learn of the aggregate from its host and
+    /// mount the `microvm` tag explicitly.
+    #[clap(
+        long = "mount-aggregate",
+        value_name = "GUEST_TARGET",
+        conflicts_with_all = ["microvm_mount", "virtio_fs", "virtio_fs_shmem"]
+    )]
+    pub microvm_mount_aggregate: Option<String>,
+
+    /// expose a host directory or, with `file`, a regular host file as a
+    /// named child of the `--mount-aggregate` root
+    ///
+    /// Repeat for each child; the guest lists the children in this order.
+    /// NAME is 1 to 64 ASCII letters, digits, `.`, `_`, or `-`. The optional
+    /// mode, and the optional `file` flag after it, follow the last commas,
+    /// so HOST_PATH may contain commas when the mode is given. Without
+    /// `file`, HOST_PATH must be a directory; with it, a regular file, which
+    /// the child exposes alone, without anything else of its host directory.
+    /// A file child's mode applies to the whole file, which no
+    /// `--mount-deny`, `--mount-allow`, or `--mount-write` path may name.
+    /// Host paths must not overlap: a file must not lie inside a directory
+    /// child. A snapshot that attached an aggregate requires the same
+    /// children, in the same order, on restore.
+    #[clap(
+        long = "mount-child",
+        value_name = "NAME,HOST_PATH[,ro|rw][,file]",
+        requires = "microvm_mount_aggregate"
+    )]
+    pub microvm_mount_child: Vec<MicrovmMountChildCli>,
 
     /// Hide an existing host path inside a microVM filesystem export.
     ///
-    /// The path is hidden in the `--mount` whose host directory contains it.
-    /// A relative path is relative to the host directory of the only
-    /// `--mount`; with several, the path must be absolute.
-    #[clap(
-        long = "mount-deny",
-        value_name = "HOST_PATH",
-        requires = "microvm_mount"
-    )]
+    /// A relative path is relative to the host directory of `--mount`. With
+    /// `--mount-aggregate`, the path must be absolute, and it is hidden in
+    /// the `--mount-child` whose host directory contains it.
+    #[clap(long = "mount-deny", value_name = "HOST_PATH")]
     pub microvm_mount_deny: Vec<PathBuf>,
+
+    /// Expose an existing host path inside a `--mount-deny` path again
+    ///
+    /// The path and everything below it become visible in the export whose
+    /// host directory contains it, subject to the export's write policy. The
+    /// hidden directories on the way to it become traverse-only: the guest
+    /// can look them up and list the entries that lead to allowed paths, but
+    /// sees nothing else in them and cannot modify them. The nearest
+    /// `--mount-deny` or `--mount-allow` path that contains the path must be a
+    /// `--mount-deny` path, which may itself lie inside another
+    /// `--mount-allow` path. A relative path is relative to the host
+    /// directory of `--mount`; with `--mount-aggregate`, the path must be
+    /// absolute.
+    #[clap(long = "mount-allow", value_name = "HOST_PATH")]
+    pub microvm_mount_allow: Vec<PathBuf>,
+
+    /// Limit the guest's writes in a read-write export to an existing host
+    /// path
+    ///
+    /// Repeat to declare more writable files or directories. With any, they
+    /// and everything below them are the only parts of the read-write
+    /// `--mount` or `--mount-child` whose host directory contains them that
+    /// the guest can modify; the rest of it is read-only, and the guest's
+    /// modifications there fail with EROFS. The paths must not overlap or be
+    /// hidden by `--mount-deny`. A relative path is relative to the host
+    /// directory of `--mount`; with `--mount-aggregate`, the path must be
+    /// absolute.
+    #[clap(long = "mount-write", value_name = "HOST_PATH")]
+    pub microvm_mount_write: Vec<PathBuf>,
 
     /// Select the host identity of the guest's `--mount` operations
     ///
@@ -372,13 +565,9 @@ pub struct MicrovmCli {
     /// CAP_SETGID unless every caller has OpenVMM's own UID and GID and
     /// OpenVMM has no other supplementary groups; an operation that cannot
     /// run as its caller fails with EPERM. The mode applies to every
-    /// `--mount`.
-    #[clap(
-        long = "mount-owner",
-        value_enum,
-        value_name = "OWNER",
-        requires = "microvm_mount"
-    )]
+    /// `--mount-child`, whose host directories and files must then have the
+    /// same owner.
+    #[clap(long = "mount-owner", value_enum, value_name = "OWNER")]
     pub microvm_mount_owner: Option<MicrovmMountOwnerCli>,
 
     /// dedicated microVM control console backed by a local serial endpoint
@@ -397,7 +586,8 @@ pub struct MicrovmCli {
     )]
     pub microvm_control_auth_stdin: bool,
 
-    /// maximum time for a control-console client to authenticate
+    /// maximum time for a control-console client to authenticate, counted
+    /// while host input is read
     #[clap(
         long = "microvm-control-auth-timeout-ms",
         value_name = "MILLISECONDS",
@@ -407,8 +597,10 @@ pub struct MicrovmCli {
     pub microvm_control_auth_timeout_ms: u64,
 
     /// microVM CPU profile: a pinned profile ID, `auto` (the default) to
-    /// select the host's profile, or `host` to derive a development profile
-    /// from this host; a restore must name the snapshot's profile
+    /// select the host's profile, falling back with a warning to a development
+    /// profile derived from this host where no pinned profile serves its CPU,
+    /// or `host` to derive that development profile; a restore must name the
+    /// snapshot's profile
     #[clap(long = "cpu-profile", value_name = "ID", hide = true)]
     pub cpu_profile: Option<String>,
 
@@ -441,25 +633,84 @@ impl FromStr for MicrovmMountCli {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let mut fields = value.splitn(3, ',');
-        let guest_target = fields
-            .next()
-            .filter(|value| !value.is_empty())
-            .context("expected <guest-target>,<host-path>[,ro|rw]")?;
-        let host_path = fields
-            .next()
-            .filter(|value| !value.is_empty())
-            .context("expected <guest-target>,<host-path>[,ro|rw]")?;
-        let access = match fields.next().unwrap_or("ro") {
+        const USAGE: &str = "expected <guest-target>,<host-path>[,ro|rw]";
+        // The guest target ends at the first comma. With another comma, the
+        // mode follows the last one, so a host path may contain commas when
+        // the mode is given.
+        let (guest_target, rest) = value.split_once(',').context(USAGE)?;
+        let (host_path, mode) = rest.rsplit_once(',').unwrap_or((rest, "ro"));
+        anyhow::ensure!(!guest_target.is_empty() && !host_path.is_empty(), USAGE);
+        let access = match mode {
             "ro" => openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly,
             "rw" => openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite,
-            mode => anyhow::bail!("invalid microVM mount mode '{mode}'; expected ro or rw"),
+            mode => anyhow::bail!(
+                "invalid microVM mount mode '{mode}'; expected ro or rw (if HOST_PATH \
+                 contains commas, end the value with ,ro or ,rw)"
+            ),
         };
         openvmm_defs::microvm::MicrovmFilesystemConfig::new(guest_target.to_owned(), access)?;
         Ok(Self {
             guest_target: guest_target.to_owned(),
             host_path: PathBuf::from(host_path),
             access,
+        })
+    }
+}
+
+/// A `--mount-child` argument: one host directory or regular file of the
+/// aggregate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicrovmMountChildCli {
+    /// Name of the child under the aggregate's root.
+    pub name: String,
+    /// Live host directory or regular file supplied for this run.
+    pub host_path: PathBuf,
+    /// Snapshot-authoritative access policy.
+    pub access: openvmm_defs::microvm::MicrovmFilesystemAccess,
+    /// What `host_path` must be: a directory, or with the `file` flag a
+    /// regular file.
+    pub kind: openvmm_defs::microvm::MicrovmFilesystemChildKind,
+}
+
+impl FromStr for MicrovmMountChildCli {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        const USAGE: &str = "expected <name>,<host-path>[,ro|rw][,file]";
+        let (name, rest) = value.split_once(',').context(USAGE)?;
+        // The `file` flag ends the value, and the mode follows the last comma
+        // before it, so a host path may contain commas.
+        let (rest, kind) = match rest.rsplit_once(',') {
+            Some((rest, "file")) => (
+                rest,
+                openvmm_defs::microvm::MicrovmFilesystemChildKind::File,
+            ),
+            _ => (
+                rest,
+                openvmm_defs::microvm::MicrovmFilesystemChildKind::Directory,
+            ),
+        };
+        let (host_path, access) = match rest.rsplit_once(',') {
+            Some((host_path, "ro")) => (
+                host_path,
+                openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly,
+            ),
+            Some((host_path, "rw")) => (
+                host_path,
+                openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite,
+            ),
+            _ => (
+                rest,
+                openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly,
+            ),
+        };
+        anyhow::ensure!(!host_path.is_empty(), USAGE);
+        openvmm_defs::microvm::MicrovmFilesystemChildConfig::new(name.to_owned(), access)?;
+        Ok(Self {
+            name: name.to_owned(),
+            host_path: PathBuf::from(host_path),
+            access,
+            kind,
         })
     }
 }
@@ -505,16 +756,32 @@ pub(super) fn parse_endpoint(network: &str) -> Result<EndpointConfigCli, String>
         .map_err(|error| format!("invalid microVM network: {error}"))
 }
 
+/// Longest IPv4 prefix of a microVM network that explicit `--host-loopback
+/// allow` accepts. Consomme presents host peers to the guest at addresses of
+/// the guest's subnet, allocated downward from its last usable address, which
+/// a /30, holding only the gateway and the guest, cannot spare.
+const MICROVM_HOST_LOOPBACK_MAX_PREFIX_LENGTH: u8 = 29;
+
 impl Options {
     /// Rejects unsupported microVM combinations before opening host resources.
     pub(crate) fn validate_microvm_host_loopback(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.machine != MachineProfileCli::Microvm
                 || self.microvm.host_loopback != Some(MicrovmNetworkActionCli::Allow)
-                || !self.microvm.host_loopback_forward.is_empty(),
-            "the portable microVM network profile does not support generic host-loopback connectivity; explicit --host-loopback allow requires --host-loopback-forward for deliberate port publishing"
+                || self.microvm_admits_live_network_attachments(),
+            "microVM snapshots do not support --host-loopback allow, whose published guest listeners are live host attachments, except at a restore with --restore-network-policy"
         );
         Ok(())
+    }
+
+    /// Returns whether this launch may create live network attachments: the
+    /// guest listeners that ingress and explicit host-loopback access publish,
+    /// and host-loopback forwards. A snapshot cannot capture them, so a launch
+    /// may create them unless it captures one, and a restore only when it
+    /// installs a new policy with `--restore-network-policy`.
+    fn microvm_admits_live_network_attachments(&self) -> bool {
+        self.microvm.snapshot_destination.is_none()
+            && (self.restore_snapshot.is_none() || self.microvm.restore_network_policy)
     }
 
     pub(crate) fn validate_microvm_options(&self) -> anyhow::Result<()> {
@@ -533,18 +800,28 @@ impl Options {
                     && self.microvm.allow_host.is_empty()
                     && self.microvm.block_host.is_empty()
                     && self.microvm.allow_endpoint.is_empty()
-                    && self.microvm.microvm_mount.is_empty()
+                    && self.microvm.microvm_mount.is_none()
+                    && self.microvm.microvm_mount_aggregate.is_none()
+                    && self.microvm.microvm_mount_child.is_empty()
                     && self.microvm.microvm_mount_deny.is_empty()
+                    && self.microvm.microvm_mount_allow.is_empty()
+                    && self.microvm.microvm_mount_write.is_empty()
+                    && self.microvm.microvm_mount_owner.is_none()
                     && self.microvm.microvm_sandbox_block.is_empty()
                     && self.microvm.microvm_workload_identity.is_none()
                     && self.microvm.microvm_lifecycle.is_none()
                     && self.microvm.microvm_report.is_none()
                     && self.microvm.restore_processors.is_none()
                     && self.microvm.restore_memory.is_none()
+                    && !self.microvm.restore_absent_scratch
+                    && !self.microvm.restore_network_policy
                     && self.microvm.memory_capacity.is_none()
+                    && self.microvm.snapshot_block_identity.is_none()
+                    && self.microvm.snapshot_generation_id.is_none()
+                    && self.microvm.snapshot_scratch_restore_mode.is_none()
                     && self.microvm.microvm_control_console.is_none()
                     && !self.microvm.microvm_control_auth_stdin,
-                "--network-profile, --net-tap, --mount, --microvm-sandbox-block, --microvm-workload-identity, --microvm-lifecycle, --microvm-control-console, --microvm-control-auth-stdin, --restore-processors, --restore-memory, --memory-capacity, and microVM network policy require a microVM machine"
+                "--network-profile, --net-tap, --mount, --mount-aggregate, --microvm-sandbox-block, --microvm-workload-identity, --microvm-lifecycle, --microvm-control-console, --microvm-control-auth-stdin, --restore-processors, --restore-memory, --restore-absent-scratch, --restore-network-policy, --memory-capacity, snapshot block policy, and microVM network policy require a microVM machine"
             );
             return Ok(());
         }
@@ -553,6 +830,14 @@ impl Options {
             cfg!(guest_arch = "x86_64"),
             "microVM requires an x86-64 guest"
         );
+        let ramfs_overlay =
+            openvmm_defs::microvm::ramfs_overlay_requested(&self.cmdline.join(" "))?;
+        if ramfs_overlay {
+            anyhow::ensure!(
+                self.microvm.snapshot_destination.is_none() && self.restore_snapshot.is_none(),
+                "microVM RAM-backed overlay does not support snapshot or restore"
+            );
+        }
         anyhow::ensure!(
             openvmm_defs::microvm::microvm_processor_count_supported(self.processors),
             "microVM does not support {} vCPUs",
@@ -563,10 +848,12 @@ impl Options {
             "microVM does not support custom NUMA topology"
         );
         anyhow::ensure!(
-            self.vps_per_socket.is_none()
-                && self.smt == SmtConfigCli::Auto
-                && self.apic_id_offset == 0
-                && matches!(self.x2apic, X2ApicConfig::Auto),
+            self.vps_per_socket.is_none() && self.smt == SmtConfigCli::Auto,
+            "microVM owns CPU topology and APIC configuration"
+        );
+        #[cfg(guest_arch = "x86_64")]
+        anyhow::ensure!(
+            self.apic_id_offset == 0 && matches!(self.x2apic, X2ApicConfig::Auto),
             "microVM owns CPU topology and APIC configuration"
         );
         if self.microvm.snapshot_destination.is_some() {
@@ -587,6 +874,53 @@ impl Options {
                     != self.microvm.microvm_sandbox_block.is_empty(),
                 "--snapshot-tier is required exactly for microVM snapshot capture with sandbox blocks"
             );
+            let identity = self
+                .microvm
+                .snapshot_block_identity
+                .unwrap_or(SnapshotBlockIdentityCli::Sha256);
+            anyhow::ensure!(
+                !self.microvm.microvm_sandbox_block.is_empty()
+                    || self.microvm.snapshot_block_identity.is_none(),
+                "--snapshot-block-identity requires microVM sandbox blocks"
+            );
+            anyhow::ensure!(
+                matches!(
+                    (identity, self.microvm.snapshot_generation_id),
+                    (SnapshotBlockIdentityCli::Sha256, None)
+                        | (
+                            SnapshotBlockIdentityCli::Generation,
+                            Some(SnapshotGenerationIdCli(_))
+                        )
+                ),
+                "--snapshot-generation-id is required exactly for --snapshot-block-identity generation"
+            );
+            if let Some(mode) = self.microvm.snapshot_scratch_restore_mode {
+                let tier = self
+                    .microvm
+                    .snapshot_tier
+                    .context("--snapshot-scratch-restore-mode requires --snapshot-tier")?;
+                #[cfg(not(target_os = "linux"))]
+                anyhow::ensure!(
+                    mode != SnapshotScratchRestoreModeCli::CopyOnWrite,
+                    "--snapshot-scratch-restore-mode copy-on-write is unsupported on this platform"
+                );
+                anyhow::ensure!(
+                    tier.requires_paired_scratch(),
+                    "--snapshot-scratch-restore-mode requires a paired-scratch snapshot tier"
+                );
+                anyhow::ensure!(
+                    match mode {
+                        SnapshotScratchRestoreModeCli::PrivateCopy => true,
+                        SnapshotScratchRestoreModeCli::CopyOnWrite => {
+                            tier == SnapshotTierCli::WorkloadStart
+                        }
+                        SnapshotScratchRestoreModeCli::DirectClaimed => {
+                            tier == SnapshotTierCli::InstanceCheckpoint
+                        }
+                    },
+                    "copy-on-write scratch requires workload-start clone semantics, and direct-claimed scratch requires instance-checkpoint resume semantics"
+                );
+            }
             if let Some(memory_capacity) = self.microvm.memory_capacity {
                 anyhow::ensure!(
                     memory_capacity.0 >= self.memory_size(),
@@ -602,6 +936,17 @@ impl Options {
                 );
             }
         }
+        // Clap's `requires` does not hold when an option that conflicts with
+        // --restore-snapshot, such as --kernel, is present, so a cold boot
+        // would otherwise ignore these declarations.
+        anyhow::ensure!(
+            self.restore_snapshot.is_some() || !self.microvm.restore_absent_scratch,
+            "--restore-absent-scratch requires --restore-snapshot"
+        );
+        anyhow::ensure!(
+            self.restore_snapshot.is_some() || !self.microvm.restore_network_policy,
+            "--restore-network-policy requires --restore-snapshot"
+        );
         if self.restore_snapshot.is_some() {
             anyhow::ensure!(
                 self.microvm.microvm_workload_identity.is_none(),
@@ -776,24 +1121,55 @@ impl Options {
             self.microvm.microvm_sandbox_block.len() <= 4,
             "microVM permits at most three read-only layers and one writable scratch device"
         );
+        let has_filesystem =
+            self.microvm.microvm_mount.is_some() || self.microvm.microvm_mount_aggregate.is_some();
         anyhow::ensure!(
-            self.microvm.microvm_mount_deny.len() <= 128,
-            "microVM filesystem permits at most 128 denied paths"
+            has_filesystem
+                || (self.microvm.microvm_mount_deny.is_empty()
+                    && self.microvm.microvm_mount_allow.is_empty()
+                    && self.microvm.microvm_mount_write.is_empty()
+                    && self.microvm.microvm_mount_owner.is_none()),
+            "--mount-deny, --mount-allow, --mount-write, and --mount-owner require --mount or --mount-aggregate"
         );
-        openvmm_defs::microvm::validate_microvm_filesystems(
-            &self
-                .microvm
-                .microvm_mount
-                .iter()
-                .map(|mount| {
-                    openvmm_defs::microvm::MicrovmFilesystemConfig::new(
-                        mount.guest_target.clone(),
-                        mount.access,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-        .context("invalid --mount options")?;
+        // An aggregate's children each have these bounds, which their policy
+        // validation enforces.
+        if self.microvm.microvm_mount_aggregate.is_none() {
+            anyhow::ensure!(
+                self.microvm.microvm_mount_deny.len() <= 128,
+                "microVM filesystem permits at most 128 denied paths"
+            );
+            anyhow::ensure!(
+                self.microvm.microvm_mount_allow.len() <= 128,
+                "microVM filesystem permits at most 128 allowed paths"
+            );
+            anyhow::ensure!(
+                self.microvm.microvm_mount_write.len() <= 128,
+                "microVM filesystem permits at most 128 writable paths"
+            );
+        }
+        if let Some(mount) = &self.microvm.microvm_mount {
+            openvmm_defs::microvm::MicrovmFilesystemConfig::new(
+                mount.guest_target.clone(),
+                mount.access,
+            )
+            .context("invalid --mount option")?;
+        }
+        if let Some(target) = &self.microvm.microvm_mount_aggregate {
+            openvmm_defs::microvm::MicrovmFilesystemConfig::new_aggregate(
+                target.clone(),
+                self.microvm
+                    .microvm_mount_child
+                    .iter()
+                    .map(|child| {
+                        openvmm_defs::microvm::MicrovmFilesystemChildConfig::new(
+                            child.name.clone(),
+                            child.access,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .context("invalid --mount-aggregate or --mount-child options")?;
+        }
         anyhow::ensure!(
             cfg!(target_os = "linux")
                 || self.microvm.microvm_mount_owner != Some(MicrovmMountOwnerCli::Caller),
@@ -820,7 +1196,16 @@ impl Options {
                 );
             }
         }
-        if !self.microvm.microvm_sandbox_block.is_empty() && self.restore_snapshot.is_none() {
+        if ramfs_overlay {
+            anyhow::ensure!(
+                self.microvm.microvm_sandbox_block.len() == 1
+                    && self.microvm.microvm_sandbox_block[0].role
+                        == MicrovmSandboxBlockRole::Distro
+                    && self.microvm.microvm_sandbox_block[0].disk.read_only,
+                "microVM RAM-backed overlay requires exactly one read-only distro block"
+            );
+        } else if !self.microvm.microvm_sandbox_block.is_empty() && self.restore_snapshot.is_none()
+        {
             anyhow::ensure!(
                 self.microvm
                     .microvm_sandbox_block
@@ -897,8 +1282,9 @@ impl Options {
             "--net-tap is incompatible with the portable microVM network profile"
         );
         anyhow::ensure!(
-            self.microvm.network_ingress != Some(MicrovmNetworkActionCli::Allow),
-            "--network-ingress allow is unsupported by the portable microVM network profile"
+            self.microvm.network_ingress != Some(MicrovmNetworkActionCli::Allow)
+                || self.microvm_admits_live_network_attachments(),
+            "microVM snapshots do not support --network-ingress allow, whose published guest listeners are live host attachments, except at a restore with --restore-network-policy"
         );
         anyhow::ensure!(
             self.microvm.network_egress_allow.len() <= 256
@@ -915,8 +1301,8 @@ impl Options {
                 "--host-loopback-forward requires explicit --host-loopback allow"
             );
             anyhow::ensure!(
-                self.microvm.snapshot_destination.is_none() && self.restore_snapshot.is_none(),
-                "microVM snapshots do not support live host-loopback port forwards"
+                self.microvm_admits_live_network_attachments(),
+                "microVM snapshots do not support live host-loopback port forwards, except at a restore with --restore-network-policy"
             );
             let mut forwards = self.microvm.host_loopback_forward.clone();
             forwards.sort_unstable();
@@ -979,9 +1365,12 @@ impl Options {
                 && self.pcie_root_port.is_empty()
                 && self.pcie_switch.is_empty()
                 && self.pcie_generic_initiator.is_empty()
-                && self.pcie_remote.is_empty()
-                && self.amd_iommu.is_empty()
-                && self.intel_vtd.is_empty(),
+                && self.pcie_remote.is_empty(),
+            "microVM does not support PCIe or IOMMU devices"
+        );
+        #[cfg(guest_arch = "x86_64")]
+        anyhow::ensure!(
+            self.amd_iommu.is_empty() && self.intel_vtd.is_empty(),
             "microVM does not support PCIe or IOMMU devices"
         );
         #[cfg(windows)]
@@ -1010,13 +1399,16 @@ impl Options {
         Ok(())
     }
 
+    /// Binds the network policy of these options to `network`: the identity
+    /// that `--net` names, or at a restore the one that the snapshot recorded.
+    ///
+    /// Refuses explicit `--host-loopback allow` on a network whose prefix is
+    /// longer than [`MICROVM_HOST_LOOPBACK_MAX_PREFIX_LENGTH`], which leaves no
+    /// address at which Consomme can present host peers to the guest.
     pub(crate) fn microvm_egress_policy(
         &self,
         network: &openvmm_defs::microvm::MicrovmNetworkConfig,
-    ) -> Result<
-        net_backend_resources::egress::EgressPolicy,
-        net_backend_resources::egress::InvalidEgressPolicy,
-    > {
+    ) -> anyhow::Result<net_backend_resources::egress::EgressPolicy> {
         use net_backend_resources::egress::EgressPolicyMode;
 
         let mode = if !self.microvm.network_egress_allow.is_empty()
@@ -1042,22 +1434,49 @@ impl Options {
         } else {
             EgressPolicyMode::AllowAll
         };
-        net_backend_resources::egress::EgressPolicy::bind(
-            network.guest_ipv4,
-            network.prefix_length,
-            network.guest_mac,
-            network.derived_gateway_ipv4,
-            mode,
+        let policy = network.bind_egress_policy(mode).and_then(|policy| {
+            Ok(policy
+                .with_host_loopback(
+                    self.microvm
+                        .host_loopback
+                        .unwrap_or(MicrovmNetworkActionCli::Allow)
+                        .into(),
+                    self.microvm.network_proxy,
+                )?
+                .with_ingress(
+                    self.microvm
+                        .network_ingress
+                        .unwrap_or(MicrovmNetworkActionCli::Deny)
+                        .into(),
+                )
+                .with_host_loopback_ingress(
+                    self.microvm
+                        .host_loopback
+                        .unwrap_or(MicrovmNetworkActionCli::Deny)
+                        .into(),
+                ))
+        })?;
+        // Binding the policy has checked the prefix, so a longer one is a /30.
+        anyhow::ensure!(
+            self.microvm.host_loopback != Some(MicrovmNetworkActionCli::Allow)
+                || network.prefix_length <= MICROVM_HOST_LOOPBACK_MAX_PREFIX_LENGTH,
+            "--host-loopback allow requires an IPv4 network of /{MICROVM_HOST_LOOPBACK_MAX_PREFIX_LENGTH} or larger: a /{} holds only the gateway and the guest, and leaves no address at which to present host peers to the guest",
+            network.prefix_length
+        );
+        Ok(policy)
+    }
+
+    /// Returns the publication of the guest's listeners to the host's private
+    /// networks that `--network-ingress allow` requests, which admits the
+    /// host itself only with explicit `--host-loopback allow`.
+    pub(crate) fn microvm_private_network_ingress(
+        &self,
+    ) -> Option<net_backend_resources::consomme::PrivateNetworkIngress> {
+        (self.microvm.network_ingress == Some(MicrovmNetworkActionCli::Allow)).then_some(
+            net_backend_resources::consomme::PrivateNetworkIngress {
+                admit_host: self.microvm.host_loopback == Some(MicrovmNetworkActionCli::Allow),
+            },
         )
-        .and_then(|policy| {
-            policy.with_host_loopback(
-                self.microvm
-                    .host_loopback
-                    .unwrap_or(MicrovmNetworkActionCli::Allow)
-                    .into(),
-                self.microvm.network_proxy,
-            )
-        })
     }
 }
 
@@ -1071,6 +1490,7 @@ mod tests {
     use openvmm_defs::microvm::append_microvm_virtio_discovery;
     use openvmm_defs::microvm::build_microvm_command_line;
     use openvmm_defs::microvm::build_microvm_control_command_line;
+    use openvmm_defs::microvm::check_microvm_command_line;
     use test_with_tracing::test;
 
     #[test]
@@ -1089,6 +1509,19 @@ mod tests {
         assert!(Options::try_parse_from(["openvmm", "--machine", "unknown"]).is_err());
     }
 
+    /// The microVM profile requires an x86-64 guest, so the tests that
+    /// validate microVM options run only for x86-64 guests.
+    #[cfg(not(guest_arch = "x86_64"))]
+    #[test]
+    fn test_microvm_requires_an_x86_64_guest() {
+        let options = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
+        assert_eq!(
+            options.validate_microvm_options().unwrap_err().to_string(),
+            "microVM requires an x86-64 guest"
+        );
+    }
+
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn test_microvm_processor_validation() {
         for processors in [1, 2, 4, 8] {
@@ -1152,6 +1585,7 @@ mod tests {
         }
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn test_microvm_memory_capacity_and_restore_target_parsing() {
         let capture = Options::try_parse_from([
@@ -1211,6 +1645,121 @@ mod tests {
         assert!(unaligned.validate_microvm_options().is_err());
     }
 
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_restore_absent_scratch_requires_a_microvm_restore() {
+        let restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-absent-scratch",
+        ])
+        .unwrap();
+        restore.validate_microvm_options().unwrap();
+        assert!(restore.microvm.restore_absent_scratch);
+
+        // A cold boot has no captured scratch to declare absent.
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--restore-absent-scratch",
+            ])
+            .is_err()
+        );
+        // Clap accepts it when --kernel, which conflicts with --restore-snapshot,
+        // lifts the requirement, so the validation refuses it.
+        let cold_boot = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--kernel",
+            "vmlinux",
+            "--restore-absent-scratch",
+        ])
+        .unwrap();
+        assert_eq!(
+            cold_boot
+                .validate_microvm_options()
+                .unwrap_err()
+                .to_string(),
+            "--restore-absent-scratch requires --restore-snapshot"
+        );
+        // Nor does a standard machine.
+        let standard = Options::try_parse_from([
+            "openvmm",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-absent-scratch",
+        ])
+        .unwrap();
+        assert!(standard.validate_microvm_options().is_err());
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_restore_network_policy_requires_a_microvm_restore() {
+        let restore = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--restore-snapshot",
+            "snapshot",
+            "--network-profile",
+            "portable",
+            "--restore-network-policy",
+        ])
+        .unwrap();
+        restore.validate_microvm_options().unwrap();
+        assert!(restore.microvm.restore_network_policy);
+
+        // A cold boot has no captured policy to replace.
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--restore-network-policy",
+            ])
+            .is_err()
+        );
+        // Clap accepts it when --kernel, which conflicts with --restore-snapshot,
+        // lifts the requirement, so the validation refuses it.
+        let cold_boot = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--kernel",
+            "vmlinux",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--restore-network-policy",
+        ])
+        .unwrap();
+        assert_eq!(
+            cold_boot
+                .validate_microvm_options()
+                .unwrap_err()
+                .to_string(),
+            "--restore-network-policy requires --restore-snapshot"
+        );
+        // Nor does a standard machine.
+        let standard = Options::try_parse_from([
+            "openvmm",
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-network-policy",
+        ])
+        .unwrap();
+        assert!(standard.validate_microvm_options().is_err());
+    }
+
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn test_microvm_sandbox_block_parser_and_validation() {
         let valid = Options::try_parse_from([
@@ -1264,6 +1813,89 @@ mod tests {
         }
     }
 
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_ramfs_overlay_requires_one_distro_and_no_snapshot() {
+        let valid = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--cmdline",
+            "quiet nvx_overlay_upper=ramfs",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+        ])
+        .unwrap();
+        valid.validate_microvm_options().unwrap();
+
+        for args in [
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--cmdline",
+                "nvx_overlay_upper=ramfs",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--cmdline",
+                "nvx_overlay_upper=ramfs nvx_overlay_upper=ramfs",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--cmdline",
+                "nvx_overlay_upper=ramfs nvx_overlay_upper",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--cmdline",
+                "nvx_overlay_upper",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--microvm-sandbox-block",
+                "scratch:mem:1M",
+            ],
+            vec![
+                "openvmm",
+                "--machine",
+                "microvm",
+                "--cmdline",
+                "nvx_overlay_upper=ramfs",
+                "--microvm-sandbox-block",
+                "distro:mem:1M,ro",
+                "--snapshot-destination",
+                "snapshot",
+                "--snapshot-tier",
+                "workload-start",
+            ],
+        ] {
+            let options = Options::try_parse_from(args).unwrap();
+            assert!(options.validate_microvm_options().is_err());
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn test_microvm_snapshot_tier_is_explicit() {
         for tier in ["platform", "workload-start", "instance-checkpoint"] {
@@ -1335,6 +1967,95 @@ mod tests {
         assert!(zero_timeout.validate_microvm_options().is_err());
     }
 
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_snapshot_identity_and_scratch_restore_modes_are_explicit() {
+        let generation = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--snapshot-destination",
+            "snapshot",
+            "--snapshot-tier",
+            "workload-start",
+            "--snapshot-block-identity",
+            "generation",
+            "--snapshot-generation-id",
+            "00112233445566778899aabbccddeeff",
+            "--snapshot-scratch-restore-mode",
+            "copy-on-write",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ])
+        .unwrap();
+        #[cfg(target_os = "linux")]
+        generation.validate_microvm_options().unwrap();
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            generation
+                .validate_microvm_options()
+                .unwrap_err()
+                .to_string()
+                .contains("copy-on-write is unsupported on this platform")
+        );
+
+        let missing_generation = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--snapshot-destination",
+            "snapshot",
+            "--snapshot-tier",
+            "workload-start",
+            "--snapshot-block-identity",
+            "generation",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ])
+        .unwrap();
+        assert!(missing_generation.validate_microvm_options().is_err());
+
+        let direct_clone = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--snapshot-destination",
+            "snapshot",
+            "--snapshot-tier",
+            "workload-start",
+            "--snapshot-scratch-restore-mode",
+            "direct-claimed",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ])
+        .unwrap();
+        assert!(direct_clone.validate_microvm_options().is_err());
+
+        let resume = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--snapshot-destination",
+            "snapshot",
+            "--snapshot-tier",
+            "instance-checkpoint",
+            "--snapshot-scratch-restore-mode",
+            "direct-claimed",
+            "--microvm-sandbox-block",
+            "distro:mem:1M,ro",
+            "--microvm-sandbox-block",
+            "scratch:mem:1M",
+        ])
+        .unwrap();
+        resume.validate_microvm_options().unwrap();
+    }
+
     #[test]
     fn test_microvm_command_line_is_owned_and_bounded() {
         assert_eq!(
@@ -1398,7 +2119,8 @@ mod tests {
             Some((
                 &network,
                 openvmm_defs::microvm::MICROVM_VIRTIO_NET_KVM_IRQ,
-                false,
+                None,
+                None,
             )),
             false,
             &[],
@@ -1410,25 +2132,34 @@ mod tests {
         assert_eq!(
             with_network,
             format!(
-                "{MICROVM_BASE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0000000:10 virtnet_ip=10.0.0.2 virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1"
+                "{MICROVM_BASE_COMMAND_LINE} virtio_mmio.device=0x1000@0xd0000000:10 virtnet_ip=10.0.0.2 virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1 virtnet_ip6=fd00::a00:2/120 virtnet_gw6=fd00::a00:1"
             )
         );
-        let mut with_whp_network = build_microvm_command_line(&[], false).unwrap();
-        append_microvm_virtio_discovery(
-            &mut with_whp_network,
-            Some((
-                &network,
-                openvmm_defs::microvm::MICROVM_VIRTIO_NET_WHP_IRQ,
-                true,
-            )),
-            false,
-            &[],
-            false,
-            false,
-            &[],
-        )
-        .unwrap();
-        assert!(with_whp_network.ends_with("virtnet_dns=10.0.0.1"));
+        // The guest names either gateway as its DNS server.
+        for (server, dns) in [("10.0.0.1", "10.0.0.1"), ("fd00::a00:1", "fd00::a00:1")] {
+            let mut with_whp_network = build_microvm_command_line(&[], false).unwrap();
+            append_microvm_virtio_discovery(
+                &mut with_whp_network,
+                Some((
+                    &network,
+                    openvmm_defs::microvm::MICROVM_VIRTIO_NET_WHP_IRQ,
+                    Some(server.parse().unwrap()),
+                    None,
+                )),
+                false,
+                &[],
+                false,
+                false,
+                &[],
+            )
+            .unwrap();
+            assert!(
+                with_whp_network.ends_with(&format!(
+                    "virtnet_dns={dns} virtnet_ip6=fd00::a00:2/120 virtnet_gw6=fd00::a00:1"
+                )),
+                "{with_whp_network}"
+            );
+        }
 
         let filesystem = openvmm_defs::microvm::MicrovmFilesystemConfig::new(
             "/mnt/share".to_owned(),
@@ -1461,6 +2192,7 @@ mod tests {
             "virtnet_mask=255.255.255.0",
             "virtnet_gw=10.0.0.1",
             "virtnet_dns=10.0.0.1",
+            "virtnet_ingress=allow",
             "nr_cpus=1",
             "virtfs_dir=/other",
             "virtfs_tag=other",
@@ -1483,12 +2215,22 @@ mod tests {
             assert!(build_microvm_command_line(&[delimiter.into()], false).is_ok());
         }
         assert!(build_microvm_command_line(&["foo=bar\0baz".into()], false).is_err());
-        assert!(
-            build_microvm_command_line(&["x".repeat(MICROVM_COMMAND_LINE_MAX_SIZE)], false)
-                .is_err()
-        );
+        // The text and its terminating NUL must fit in the guest kernel's
+        // buffer: 2,047 bytes of text pass, and 2,048 fail with the shared
+        // check's error for that line, whose text openvmm_defs tests.
+        let line = |fill: usize| format!("{MICROVM_BASE_COMMAND_LINE} {}", "x".repeat(fill));
+        let fill = (MICROVM_COMMAND_LINE_MAX_SIZE - 1)
+            .checked_sub(MICROVM_BASE_COMMAND_LINE.len() + 1)
+            .expect("the base command line leaves room for the caller's argument");
+        let longest = build_microvm_command_line(&["x".repeat(fill)], false).unwrap();
+        assert_eq!(longest, line(fill));
+        assert_eq!(longest.len(), MICROVM_COMMAND_LINE_MAX_SIZE - 1);
+        let error = build_microvm_command_line(&["x".repeat(fill + 1)], false).unwrap_err();
+        let expected = check_microvm_command_line(&line(fill + 1)).unwrap_err();
+        assert_eq!(error.to_string(), expected.to_string());
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn test_microvm_preflight_rejects_unsupported_combinations() {
         let valid = Options::try_parse_from(["openvmm", "--machine", "microvm"]).unwrap();
@@ -1696,6 +2438,7 @@ mod tests {
         }
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn control_auth_stdin_is_explicit_and_exclusive() {
         let endpoint = if cfg!(windows) {
@@ -1757,8 +2500,12 @@ mod tests {
         );
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
-    fn test_microvm_host_loopback_generic_allow_is_rejected() {
+    fn test_microvm_host_loopback_allow_publishes_guest_listeners() {
+        use net_backend_resources::egress::EgressAction;
+
+        let network: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
         let common = [
             "openvmm",
             "--machine",
@@ -1768,18 +2515,89 @@ mod tests {
             "--host-loopback",
             "allow",
         ];
+        // Explicit allow needs neither a forward nor private-network ingress.
         for extra in [
             vec!["--net", "10.0.0.2/24"],
+            vec!["--net", "10.0.0.2/24", "--network-egress", "deny"],
+            vec![
+                "--net",
+                "10.0.0.2/24",
+                "--network-ingress",
+                "deny",
+                "--network-proxy",
+                "10.0.0.1:3128",
+            ],
+        ] {
+            let options = Options::try_parse_from(common.into_iter().chain(extra)).unwrap();
+            options.validate_microvm_options().unwrap();
+            let policy = options.microvm_egress_policy(&network).unwrap();
+            assert_eq!(policy.ingress_action(), EgressAction::Deny);
+            assert_eq!(policy.host_loopback_ingress_action(), EgressAction::Allow);
+            assert_eq!(options.microvm_private_network_ingress(), None);
+        }
+        // Snapshots cannot carry published listeners: neither a capture nor a
+        // restore that keeps the captured policy may publish them.
+        for extra in [
             vec!["--net", "10.0.0.2/24", "--snapshot-destination", "snapshot"],
             vec!["--restore-snapshot", "snapshot"],
         ] {
             let options = Options::try_parse_from(common.into_iter().chain(extra)).unwrap();
-            let error = options.validate_microvm_options().unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("generic host-loopback connectivity"),
-                "{error}"
+            for error in [
+                options.validate_microvm_host_loopback().unwrap_err(),
+                options.validate_microvm_options().unwrap_err(),
+            ] {
+                assert!(
+                    error.to_string().contains("--host-loopback allow"),
+                    "{error}"
+                );
+            }
+        }
+        // A restore that installs a new policy may, as a cold boot may, with
+        // forwards.
+        let replacement = Options::try_parse_from(common.into_iter().chain([
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-network-policy",
+            "--host-loopback-forward",
+            "tcp:3000:8080",
+        ]))
+        .unwrap();
+        replacement.validate_microvm_host_loopback().unwrap();
+        replacement.validate_microvm_options().unwrap();
+        let mut kept = replacement;
+        kept.microvm.restore_network_policy = false;
+        let error = kept.validate_microvm_options().unwrap_err();
+        assert!(
+            error.to_string().contains("--host-loopback allow"),
+            "{error}"
+        );
+        // Omitted or denied host loopback publishes nothing.
+        for host_loopback in [None, Some("deny")] {
+            let options = Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--network-profile",
+                    "portable",
+                    "--net",
+                    "10.0.0.2/24",
+                ]
+                .into_iter()
+                .chain(
+                    host_loopback
+                        .into_iter()
+                        .flat_map(|action| ["--host-loopback", action]),
+                ),
+            )
+            .unwrap();
+            options.validate_microvm_options().unwrap();
+            assert_eq!(
+                options
+                    .microvm_egress_policy(&network)
+                    .unwrap()
+                    .host_loopback_ingress_action(),
+                EgressAction::Deny
             );
         }
         let forwarded = Options::try_parse_from(common.into_iter().chain([
@@ -1796,6 +2614,74 @@ mod tests {
         forwarded.validate_microvm_options().unwrap();
     }
 
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_host_loopback_allow_needs_an_address_for_host_peers() {
+        let parse = |arguments: &[&str]| {
+            Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--network-profile",
+                    "portable",
+                ]
+                .into_iter()
+                .chain(arguments.iter().copied()),
+            )
+            .unwrap()
+        };
+        // Consomme presents host peers at addresses of the guest's subnet,
+        // which a /30, holding only the gateway and the guest, cannot spare,
+        // whether the host reaches the guest's listeners on loopback, through
+        // private-network ingress, or through forwards.
+        let slash_30: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/30".parse().unwrap();
+        for extra in [
+            &[][..],
+            &["--network-egress", "deny"][..],
+            &["--network-ingress", "allow"][..],
+            &["--host-loopback-forward", "udp:3000:8080"][..],
+        ] {
+            let options = parse(
+                &[
+                    &["--net", "10.0.0.2/30", "--host-loopback", "allow"][..],
+                    extra,
+                ]
+                .concat(),
+            );
+            for error in [
+                options.validate_microvm_options().unwrap_err(),
+                options.microvm_egress_policy(&slash_30).unwrap_err(),
+            ] {
+                assert!(
+                    error.to_string().contains(
+                        "--host-loopback allow requires an IPv4 network of /29 or larger"
+                    ),
+                    "{extra:?}: {error:#}"
+                );
+            }
+        }
+        // A /29 leaves four addresses for host peers.
+        let options = parse(&["--net", "10.0.0.2/29", "--host-loopback", "allow"]);
+        options.validate_microvm_options().unwrap();
+        options
+            .microvm_egress_policy(&"10.0.0.2/29".parse().unwrap())
+            .unwrap();
+        // Without explicit host-loopback access, no host peer reaches the
+        // guest at a synthetic address, so a /30 serves every other policy.
+        for extra in [
+            &[][..],
+            &["--host-loopback", "deny"][..],
+            &["--network-ingress", "allow"][..],
+            &["--network-ingress", "allow", "--host-loopback", "deny"][..],
+        ] {
+            let options = parse(&[&["--net", "10.0.0.2/30"][..], extra].concat());
+            options.validate_microvm_options().unwrap();
+            options.microvm_egress_policy(&slash_30).unwrap();
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn test_microvm_egress_policy_is_typed_and_canonical() {
         let options = Options::try_parse_from([
@@ -1880,6 +2766,314 @@ mod tests {
         assert!(standard.validate_microvm_options().is_err());
     }
 
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_l3_l4_rules_are_explicit_and_composable() {
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+            "--network-egress-allow",
+            "192.0.2.0/24:tcp:443",
+            "--network-egress-allow",
+            "192.0.2.7:udp:53",
+            "--network-egress-deny",
+            "192.0.2.9:tcp:443",
+        ])
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        let network: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = options.microvm_egress_policy(&network).unwrap();
+        let net_backend_resources::egress::EgressPolicyMode::Rules {
+            default_action,
+            allow,
+            deny,
+        } = policy.mode()
+        else {
+            panic!("expected rule-based egress policy")
+        };
+        assert_eq!(
+            *default_action,
+            net_backend_resources::egress::EgressAction::Deny
+        );
+        assert_eq!((allow.len(), deny.len()), (2, 1));
+
+        let missing_default = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress-allow",
+            "192.0.2.0/24",
+        ])
+        .unwrap();
+        assert!(missing_default.validate_microvm_options().is_err());
+
+        let mixed_legacy = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+            "--network-egress-allow",
+            "192.0.2.0/24",
+            "--allow-host",
+            "192.0.2.0/24",
+        ])
+        .unwrap();
+        assert!(mixed_legacy.validate_microvm_options().is_err());
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_protocol_wide_egress_rules_parse_before_resources() {
+        use net_backend_resources::egress::EgressRule;
+        use net_backend_resources::egress::EgressTransport;
+
+        let network_options = [
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+        ];
+        let options = Options::try_parse_from(network_options.into_iter().chain([
+            "--network-egress-allow",
+            "198.51.100.0/24:udp",
+            "--network-egress-allow",
+            "198.51.100.0/24:tcp",
+            "--network-egress-allow",
+            "198.51.100.0/24:icmp",
+            "--network-egress-deny",
+            "198.51.100.7:tcp:443",
+            "--network-egress-deny",
+            "198.51.100.7:icmp",
+        ]))
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        let network: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = options.microvm_egress_policy(&network).unwrap();
+        let net_backend_resources::egress::EgressPolicyMode::Rules { allow, deny, .. } =
+            policy.mode()
+        else {
+            panic!("expected rule-based egress policy")
+        };
+        let selectors = |rules: &[EgressRule]| {
+            rules
+                .iter()
+                .map(|rule| (rule.transport(), rule.port()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selectors(allow),
+            [
+                (EgressTransport::Tcp, 0),
+                (EgressTransport::Udp, 0),
+                (EgressTransport::Icmp, 0),
+            ]
+        );
+        assert_eq!(
+            selectors(deny),
+            [(EgressTransport::Tcp, 443), (EgressTransport::Icmp, 0)]
+        );
+
+        for rule in [
+            "192.0.2.1:icmp:8",
+            "192.0.2.1:any",
+            "192.0.2.1:any:443",
+            "192.0.2.1:tcp:0",
+        ] {
+            assert!(
+                Options::try_parse_from(
+                    network_options
+                        .into_iter()
+                        .chain(["--network-egress-allow", rule])
+                )
+                .is_err(),
+                "{rule}"
+            );
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_egress_port_ranges_parse_before_resources() {
+        use net_backend_resources::egress::EgressRule;
+        use net_backend_resources::egress::EgressTransport;
+
+        let network_options = [
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+        ];
+        let options = Options::try_parse_from(network_options.into_iter().chain([
+            "--network-egress-allow",
+            "198.51.100.0/24:udp:5000-5010",
+            "--network-egress-allow",
+            "198.51.100.0/24:tcp:8000-8010",
+            "--network-egress-allow",
+            "198.51.100.0/24:tcp:443-443",
+            "--network-egress-deny",
+            "198.51.100.7:tcp:8005",
+        ]))
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        let network: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = options.microvm_egress_policy(&network).unwrap();
+        let net_backend_resources::egress::EgressPolicyMode::Rules { allow, deny, .. } =
+            policy.mode()
+        else {
+            panic!("expected rule-based egress policy")
+        };
+        let selectors = |rules: &[EgressRule]| {
+            rules
+                .iter()
+                .map(|rule| (rule.transport(), rule.port(), rule.end_port()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selectors(allow),
+            [
+                (EgressTransport::Tcp, 443, 443),
+                (EgressTransport::Tcp, 8000, 8010),
+                (EgressTransport::Udp, 5000, 5010),
+            ]
+        );
+        assert_eq!(selectors(deny), [(EgressTransport::Tcp, 8005, 8005)]);
+
+        for rule in [
+            "192.0.2.1:tcp:8010-8000",
+            "192.0.2.1:tcp:-8010",
+            "192.0.2.1:udp:8000-",
+            "192.0.2.1:tcp:0-8010",
+            "192.0.2.1:udp:8000-65536",
+            "192.0.2.1:icmp:1-2",
+        ] {
+            assert!(
+                Options::try_parse_from(
+                    network_options
+                        .into_iter()
+                        .chain(["--network-egress-deny", rule])
+                )
+                .is_err(),
+                "{rule}"
+            );
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_ipv6_egress_rules_bind_to_the_dual_stack_identity() {
+        use net_backend_resources::egress::EgressDestination;
+
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--net",
+            "10.0.0.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+            "--network-egress-allow",
+            "2001:db8:1::/64:tcp:443",
+            "--network-egress-allow",
+            "2001:db8:2::/48:udp:5000-5010",
+            "--network-egress-allow",
+            "0.0.0.0/0:udp:53",
+            "--network-egress-deny",
+            "2001:db8:1::123/128",
+            "--network-egress-deny",
+            "::/0:icmp",
+        ])
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        let network: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let policy = options.microvm_egress_policy(&network).unwrap();
+        let net_backend_resources::egress::EgressPolicyMode::Rules { allow, deny, .. } =
+            policy.mode()
+        else {
+            panic!("expected rule-based egress policy")
+        };
+        let families = |rules: &[net_backend_resources::egress::EgressRule]| {
+            rules
+                .iter()
+                .map(|rule| rule.destination().is_ipv6())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(families(allow), [false, true, true]);
+        assert_eq!(families(deny), [true, true]);
+        assert!(
+            allow.iter().any(|rule| rule.destination().is_ipv6()
+                && (rule.port(), rule.end_port()) == (5000, 5010))
+        );
+        assert!(deny.iter().any(|rule| rule.destination()
+            == EgressDestination::Ipv6("2001:db8:1::123/128".parse().unwrap())));
+        let link = policy.ipv6_link().unwrap();
+        assert_eq!(
+            (link.guest(), link.prefix_length(), link.gateway()),
+            (
+                "fd00::a00:2".parse().unwrap(),
+                120,
+                "fd00::a00:1".parse().unwrap()
+            )
+        );
+        assert_eq!(
+            policy.encoding_version(),
+            net_backend_resources::egress::EGRESS_POLICY_ENCODING_VERSION
+        );
+
+        for rule in [
+            "2001:db8::/64:sctp:443",
+            "2001:db8::/129",
+            "2001:db8::zz",
+            "2001:db8::/64:tcp:443-80",
+        ] {
+            assert!(
+                Options::try_parse_from([
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--net",
+                    "10.0.0.2/24",
+                    "--network-profile",
+                    "portable",
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-allow",
+                    rule,
+                ])
+                .is_err(),
+                "{rule}"
+            );
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn test_microvm_workload_identity_is_non_root_and_not_restorable() {
         for identity in ["0:1", "1:0", "root:1", "1:root", "1", "1:2:3"] {
@@ -1893,77 +3087,6 @@ mod tests {
                 ])
                 .is_err()
             );
-        }
-
-        #[test]
-        fn test_microvm_l3_l4_rules_are_explicit_and_composable() {
-            let options = Options::try_parse_from([
-                "openvmm",
-                "--machine",
-                "microvm",
-                "--net",
-                "10.0.0.2/24",
-                "--network-profile",
-                "portable",
-                "--network-egress",
-                "deny",
-                "--network-egress-allow",
-                "192.0.2.0/24:tcp:443",
-                "--network-egress-allow",
-                "192.0.2.7:udp:53",
-                "--network-egress-deny",
-                "192.0.2.9:tcp:443",
-            ])
-            .unwrap();
-            options.validate_microvm_options().unwrap();
-            let network: openvmm_defs::microvm::MicrovmNetworkConfig =
-                "10.0.0.2/24".parse().unwrap();
-            let policy = options.microvm_egress_policy(&network).unwrap();
-            let net_backend_resources::egress::EgressPolicyMode::Rules {
-                default_action,
-                allow,
-                deny,
-            } = policy.mode()
-            else {
-                panic!("expected rule-based egress policy")
-            };
-            assert_eq!(
-                *default_action,
-                net_backend_resources::egress::EgressAction::Deny
-            );
-            assert_eq!((allow.len(), deny.len()), (2, 1));
-
-            let missing_default = Options::try_parse_from([
-                "openvmm",
-                "--machine",
-                "microvm",
-                "--net",
-                "10.0.0.2/24",
-                "--network-profile",
-                "portable",
-                "--network-egress-allow",
-                "192.0.2.0/24",
-            ])
-            .unwrap();
-            assert!(missing_default.validate_microvm_options().is_err());
-
-            let mixed_legacy = Options::try_parse_from([
-                "openvmm",
-                "--machine",
-                "microvm",
-                "--net",
-                "10.0.0.2/24",
-                "--network-profile",
-                "portable",
-                "--network-egress",
-                "deny",
-                "--network-egress-allow",
-                "192.0.2.0/24",
-                "--allow-host",
-                "192.0.2.0/24",
-            ])
-            .unwrap();
-            assert!(mixed_legacy.validate_microvm_options().is_err());
         }
 
         fn check_microvm_host_loopback_policy_and_explicit_forwards() {
@@ -2120,6 +3243,7 @@ mod tests {
         assert!(disconnected_control.validate_microvm_options().is_err());
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn test_microvm_directional_network_policy_is_independent_and_fail_closed() {
         let network: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
@@ -2165,8 +3289,6 @@ mod tests {
         }
 
         for arguments in [
-            ["--network-ingress", "allow"].as_slice(),
-            ["--network-egress", "deny", "--network-ingress", "allow"].as_slice(),
             ["--network-egress", "allow", "--allow-host", "192.0.2.1"].as_slice(),
             ["--network-egress", "deny", "--block-host", "192.0.2.1"].as_slice(),
         ] {
@@ -2186,6 +3308,125 @@ mod tests {
             .unwrap();
             assert!(options.validate_microvm_options().is_err());
         }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn test_microvm_private_network_ingress_publishes_guest_listeners() {
+        use net_backend_resources::egress::EgressAction;
+
+        let network: openvmm_defs::microvm::MicrovmNetworkConfig = "10.0.0.2/24".parse().unwrap();
+        let parse = |arguments: &[&str]| {
+            Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--machine",
+                    "microvm",
+                    "--network-profile",
+                    "portable",
+                ]
+                .into_iter()
+                .chain(arguments.iter().copied()),
+            )
+            .unwrap()
+        };
+        for (arguments, mode, admit_host) in [
+            (
+                ["--network-ingress", "allow"].as_slice(),
+                "allow-all",
+                false,
+            ),
+            (
+                [
+                    "--network-egress",
+                    "deny",
+                    "--network-ingress",
+                    "allow",
+                    "--host-loopback",
+                    "deny",
+                ]
+                .as_slice(),
+                "deny-all",
+                false,
+            ),
+            // Published listeners provide generic host-to-guest connectivity,
+            // so host-loopback allow needs no explicit forward.
+            (
+                [
+                    "--network-egress",
+                    "deny",
+                    "--network-egress-allow",
+                    "192.0.2.0/24:tcp:443",
+                    "--network-ingress",
+                    "allow",
+                    "--host-loopback",
+                    "allow",
+                ]
+                .as_slice(),
+                "rules",
+                true,
+            ),
+        ] {
+            let options = parse(&[["--net", "10.0.0.2/24"].as_slice(), arguments].concat());
+            options.validate_microvm_options().unwrap();
+            let policy = options.microvm_egress_policy(&network).unwrap();
+            assert_eq!(policy.mode_name(), mode);
+            assert_eq!(policy.ingress_action(), EgressAction::Allow);
+            assert_eq!(
+                options.microvm_private_network_ingress(),
+                Some(net_backend_resources::consomme::PrivateNetworkIngress { admit_host })
+            );
+        }
+
+        let denied = parse(&["--net", "10.0.0.2/24", "--network-ingress", "deny"]);
+        denied.validate_microvm_options().unwrap();
+        assert_eq!(
+            denied
+                .microvm_egress_policy(&network)
+                .unwrap()
+                .ingress_action(),
+            EgressAction::Deny
+        );
+        assert_eq!(denied.microvm_private_network_ingress(), None);
+
+        // Snapshots cannot carry published listeners: neither a capture nor a
+        // restore that keeps the captured policy may publish them.
+        for arguments in [
+            [
+                "--net",
+                "10.0.0.2/24",
+                "--network-ingress",
+                "allow",
+                "--snapshot-destination",
+                "snapshot",
+            ]
+            .as_slice(),
+            [
+                "--restore-snapshot",
+                "snapshot",
+                "--network-ingress",
+                "allow",
+            ]
+            .as_slice(),
+        ] {
+            let error = parse(arguments).validate_microvm_options().unwrap_err();
+            assert!(
+                error.to_string().contains("--network-ingress allow"),
+                "{error}"
+            );
+        }
+        // A restore that installs a new policy may, as a cold boot may.
+        parse(&[
+            "--restore-snapshot",
+            "snapshot",
+            "--restore-network-policy",
+            "--network-ingress",
+            "allow",
+            "--host-loopback",
+            "allow",
+        ])
+        .validate_microvm_options()
+        .unwrap();
     }
 
     #[test]
@@ -2237,53 +3478,122 @@ mod tests {
         assert!(MicrovmMountCli::from_str("relative,host").is_err());
         assert!(MicrovmMountCli::from_str("/mnt/../escape,host").is_err());
         assert!(MicrovmMountCli::from_str("/mnt/share,host,write").is_err());
+
+        // The mode follows the last comma, so a host path may contain commas
+        // when the mode is given.
+        let commas = MicrovmMountCli::from_str("/mnt/share,/srv/alpha,beta,rw").unwrap();
+        assert_eq!(commas.guest_target, "/mnt/share");
+        assert_eq!(commas.host_path, PathBuf::from("/srv/alpha,beta"));
+        assert_eq!(
+            commas.access,
+            openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite
+        );
+        let spaced = MicrovmMountCli::from_str(r"/reports,C:\reports\2026, final,ro").unwrap();
+        assert_eq!(spaced.host_path, PathBuf::from(r"C:\reports\2026, final"));
+        assert_eq!(
+            spaced.access,
+            openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly
+        );
+        // A host path that ends in a comma or in what looks like a mode keeps
+        // it before the mode.
+        let suffixed = MicrovmMountCli::from_str("/mnt/share,/srv/data,rw,ro").unwrap();
+        assert_eq!(suffixed.host_path, PathBuf::from("/srv/data,rw"));
+        assert_eq!(
+            suffixed.access,
+            openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly
+        );
+        let trailing = MicrovmMountCli::from_str("/mnt/share,/srv/data,,rw").unwrap();
+        assert_eq!(trailing.host_path, PathBuf::from("/srv/data,"));
+        for invalid in [
+            "",
+            "/mnt/share",
+            "/mnt/share,",
+            ",host",
+            ",host,rw",
+            "/mnt/share,,rw",
+            "/mnt/share,host,",
+            // Without the mode, the text after the last comma is no mode.
+            "/mnt/share,/srv/alpha,beta",
+            "/mnt/share,host,rw,write",
+        ] {
+            assert!(MicrovmMountCli::from_str(invalid).is_err(), "{invalid}");
+        }
+        // The error for another mode suggests the mode for a host path with
+        // commas.
+        let error = MicrovmMountCli::from_str("/mnt/share,/srv/alpha,beta")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("mode 'beta'") && error.contains("if HOST_PATH contains commas"),
+            "{error}"
+        );
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
-    fn test_microvm_mount_is_repeatable_up_to_the_slot_count() {
-        let parse = |mounts: &[&str]| {
-            let mut args = vec!["openvmm", "--machine", "microvm"];
-            for mount in mounts {
-                args.extend(["--mount", mount]);
-            }
-            Options::try_parse_from(args).unwrap()
+    fn test_microvm_mount_appears_once_and_aggregates_children() {
+        let parse = |args: &[&str]| {
+            Options::try_parse_from(
+                ["openvmm", "--machine", "microvm"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
         };
-        let options = parse(&["/workspace,work,rw", "/opt/hostedtoolcache,tools"]);
+        let options = parse(&["--mount", "/workspace,work,rw"]).unwrap();
         options.validate_microvm_options().unwrap();
-        let targets = options
+        assert_eq!(
+            options.microvm.microvm_mount.unwrap().access,
+            openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite
+        );
+        assert!(
+            parse(&[
+                "--mount",
+                "/workspace,work,rw",
+                "--mount",
+                "/opt/tools,tools"
+            ])
+            .is_err()
+        );
+
+        let options = parse(&[
+            "--mount-aggregate",
+            "/run/nvx/shares",
+            "--mount-child",
+            "work,work,rw",
+            "--mount-child",
+            "tools,tools",
+        ])
+        .unwrap();
+        options.validate_microvm_options().unwrap();
+        let children = options
             .microvm
-            .microvm_mount
+            .microvm_mount_child
             .iter()
-            .map(|mount| (mount.guest_target.as_str(), mount.access))
+            .map(|child| (child.name.as_str(), child.access))
             .collect::<Vec<_>>();
         assert_eq!(
-            targets,
+            children,
             [
                 (
-                    "/workspace",
+                    "work",
                     openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite
                 ),
                 (
-                    "/opt/hostedtoolcache",
+                    "tools",
                     openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly
                 ),
             ]
         );
 
-        for (mounts, expected) in [
-            (&["/a,a", "/b,b", "/c,c"][..], "at most 2 filesystems"),
-            (&["/workspace,a,rw", "/workspace,b"][..], "overlap"),
-            (&["/workspace,a,rw", "/workspace/cache,b"][..], "overlap"),
-            (&["/opt/tools/node,a", "/opt,b,rw"][..], "overlap"),
-        ] {
-            let error = parse(mounts).validate_microvm_options().unwrap_err();
-            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        // --mount-deny and --mount-owner still require a filesystem.
+        for args in [&["--mount-deny", "x"][..], &["--mount-owner", "vmm"][..]] {
+            let error = parse(args).unwrap().validate_microvm_options().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("require --mount or --mount-aggregate"),
+                "{error:#}"
+            );
         }
-
-        // --mount-deny and --mount-owner still require a --mount.
-        assert!(
-            Options::try_parse_from(["openvmm", "--machine", "microvm", "--mount-deny", "x"])
-                .is_err()
-        );
     }
 }

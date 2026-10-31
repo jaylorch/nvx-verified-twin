@@ -4,21 +4,26 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import json
 import math
 import os
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
-from .common import bytes_to_mib, positive_int
+from . import benchmark_host, host_telemetry, storage_events
+from .build_constants import BuildConstants
+from .common import bytes_to_mib, positive_int, sha256_file
 
+ROOT = BuildConstants.REPO_ROOT
 LEGACY_CSV_FIELDS = ["commit", "metric", "unit", "direction", "p50"]
 CSV_FIELDS = [
     "platform",
@@ -72,11 +77,16 @@ LIFECYCLE_MEMORY_MIB = 128
 LIFECYCLE_BOOT_MARKER = "ALPINE-MICROVM-BOOT-OK"
 LIFECYCLE_RESTORE_MARKER = "OPENVMM-SNAPSHOT-RESTORE-OK"
 LIFECYCLE_CAPTURE_TIMING = "openvmm-input-gate-to-publication"
-LIFECYCLE_STABILITY_MINIMUM_SAMPLES = 10
-LIFECYCLE_STABILITY_MINIMUM_CLUSTER_SAMPLES = 2
-LIFECYCLE_SNAPSHOT_MAX_P50_OVER_P25 = 1.25
-LIFECYCLE_SNAPSHOT_MAX_CLUSTER_GAP = 1.25
-UNSTABLE_LIFECYCLE_EXIT_CODE = 75
+STABILITY_MINIMUM_SAMPLES = 10
+STABILITY_MINIMUM_CLUSTER_SAMPLES = 2
+STABILITY_MAX_P50_OVER_P25 = 1.25
+STABILITY_MAX_CLUSTER_GAP = 1.25
+UNSTABLE_EXIT_CODE = 75
+LIFECYCLE_ATTEMPT_LOG_SCHEMA_VERSION = 1
+LIFECYCLE_ATTEMPT_STATUSES = {0: "valid", UNSTABLE_EXIT_CODE: "unstable"}
+"""Validation statuses by exit status; any other status is ``invalid``."""
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 NUMBER = r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SHELL_SNAPSHOT_MEMORIES_MIB = (128, 256, 512)
@@ -100,6 +110,21 @@ SHELL_SNAPSHOT_SECTION = re.compile(
     r"(?P<body>.*?)(?=^==\s*[0-9]+\s+MiB\s*==\s*$|\Z)",
     re.IGNORECASE | re.MULTILINE | re.DOTALL,
 )
+SHELL_SNAPSHOT_RESTORE_LOGS = ("shell-snapshot.log", "shell-snapshot-restore.log")
+SHELL_SNAPSHOT_RESTORE_SUMMARY = re.compile(
+    rf"^\s*snapshot restore\s*:\s*median\s+(?P<median>{NUMBER})\s*ms\b"
+    r"[^\n]*\bn=(?P<count>[0-9]+)\)",
+    re.IGNORECASE | re.MULTILINE,
+)
+SHELL_SNAPSHOT_RESTORE_SAMPLES = re.compile(
+    r"^\s*restore samples\s*:[ \t]*(?P<samples>[^\r\n]*?)[ \t]*ms[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+SAMPLE_VALUE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+# The KVM CI runners restore a shell snapshot in two modes about twice apart,
+# so about a third of their restore series exceed the stability limits without
+# a host stall, against fewer than 0.1% on MSHV and WHP (#345).
+RESTORE_STABILITY_BACKENDS = frozenset({"mshv", "whp"})
 
 
 class PerformanceError(RuntimeError):
@@ -136,6 +161,20 @@ class BenchmarkDimensions:
     platform: str
     microvm_abi_version: int
     processors: int
+
+
+@dataclass(frozen=True)
+class LifecycleAttempt:
+    """One bounded lifecycle measurement and its validation outcome."""
+
+    number: int
+    file: str
+    sha256: str | None
+    status: str
+    exit_status: int
+    message: str | None
+    published: bool = False
+    document: dict[str, object] | None = None
 
 
 MetricValue = tuple[str, str, float]
@@ -345,6 +384,57 @@ def _parse_shell_snapshot_restore(text: str) -> dict[str, MetricValue]:
             )
         )
     return metrics
+
+
+def _shell_snapshot_restore_samples(text: str, source: str) -> dict[int, list[float]]:
+    """Return the restore samples that each memory section of a shell-snapshot
+    log lists, by memory size.
+
+    A section whose summary counts at least ``STABILITY_MINIMUM_SAMPLES``
+    restores must list them, so that a log can't evade the stability guard by
+    omitting them. The listed samples must be positive and match the summary's
+    count and median.
+    """
+    sections = _shell_snapshot_sections(text, source)
+    if not sections:
+        raise PerformanceError(f"missing memory sections in {source}")
+    series: dict[int, list[float]] = {}
+    for memory_mib, body in sorted(sections.items()):
+        location = f"{source} ({memory_mib} MiB)"
+        summary = SHELL_SNAPSHOT_RESTORE_SUMMARY.search(body)
+        if summary is None:
+            raise PerformanceError(f"missing snapshot restore summary in {location}")
+        count = int(summary.group("count"))
+        listed = SHELL_SNAPSHOT_RESTORE_SAMPLES.search(body)
+        if listed is None:
+            if count >= STABILITY_MINIMUM_SAMPLES:
+                raise PerformanceError(f"missing restore samples in {location}")
+            continue
+        values = [value.strip() for value in listed.group("samples").split(",")]
+        if not all(SAMPLE_VALUE.fullmatch(value) for value in values):
+            raise PerformanceError(
+                f"malformed restore samples in {location}: {listed.group('samples')!r}"
+            )
+        samples = [float(value) for value in values]
+        # The stability guard divides by samples.
+        if not all(sample > 0 for sample in samples):
+            raise PerformanceError(f"non-positive restore sample in {location}")
+        if len(samples) != count:
+            raise PerformanceError(
+                f"{location} lists {len(samples)} restore samples, but its "
+                f"summary counts {count}"
+            )
+        median = statistics.median(samples)
+        reported = _number(summary.group("median"))
+        # The summary rounds the median to 0.1 ms, and the list rounds each
+        # sample to 0.001 ms.
+        if abs(median - reported) > 0.051:
+            raise PerformanceError(
+                f"{location} lists restore samples with median {median:.3f} ms, "
+                f"but its summary reports {reported:g} ms"
+            )
+        series[memory_mib] = samples
+    return series
 
 
 def _parse_network(text: str) -> dict[str, MetricValue]:
@@ -934,25 +1024,27 @@ def _openvmm_statistics(
     return p50, minimum, maximum, len(samples)
 
 
-def _validate_snapshot_generation_stability(
-    document: dict[str, object], backend: str, source: Path
-) -> None:
-    samples = _openvmm_samples(
-        document, "snapshot_capture", backend, "samples_ms", source
-    )
-    if len(samples) < LIFECYCLE_STABILITY_MINIMUM_SAMPLES:
+def _validate_sample_stability(samples: Sequence[float], series: str) -> None:
+    """Reject a millisecond series that a transient host stall split.
+
+    With at least ``STABILITY_MINIMUM_SAMPLES`` samples, a p50 more than 25%
+    above p25, or a gap of more than 25% between adjacent sorted samples with
+    at least two samples on each side, raises ``UnstablePerformanceError``.
+    A single outlier and a uniformly slower series both pass. Callers must
+    pass positive samples.
+    """
+    if len(samples) < STABILITY_MINIMUM_SAMPLES:
         return
 
     ordered = sorted(samples)
     p25 = ordered[math.ceil(len(ordered) * 0.25) - 1]
     p50 = statistics.median(ordered)
     ratio = p50 / p25
-    if ratio > LIFECYCLE_SNAPSHOT_MAX_P50_OVER_P25:
+    if ratio > STABILITY_MAX_P50_OVER_P25:
         raise UnstablePerformanceError(
-            f"unstable snapshot generation at {source}:snapshot_capture."
-            f"{backend}.samples_ms: p50 {p50:.3f} ms is "
+            f"unstable {series}: p50 {p50:.3f} ms is "
             f"{(ratio - 1) * 100:.1f}% above p25 {p25:.3f} ms "
-            f"(limit {(LIFECYCLE_SNAPSHOT_MAX_P50_OVER_P25 - 1) * 100:.1f}%); "
+            f"(limit {(STABILITY_MAX_P50_OVER_P25 - 1) * 100:.1f}%); "
             "rerun on an idle host"
         )
 
@@ -964,20 +1056,84 @@ def _validate_snapshot_generation_stability(
             ordered[split_index],
         )
         for split_index in range(
-            LIFECYCLE_STABILITY_MINIMUM_CLUSTER_SAMPLES,
-            len(ordered) - LIFECYCLE_STABILITY_MINIMUM_CLUSTER_SAMPLES + 1,
+            STABILITY_MINIMUM_CLUSTER_SAMPLES,
+            len(ordered) - STABILITY_MINIMUM_CLUSTER_SAMPLES + 1,
         )
     )
     gap_ratio, split_index, lower, upper = max(cluster_gaps)
-    if gap_ratio > LIFECYCLE_SNAPSHOT_MAX_CLUSTER_GAP:
+    if gap_ratio > STABILITY_MAX_CLUSTER_GAP:
         raise UnstablePerformanceError(
-            f"unstable snapshot generation at {source}:snapshot_capture."
-            f"{backend}.samples_ms: samples split {split_index}/"
+            f"unstable {series}: samples split {split_index}/"
             f"{len(ordered) - split_index} between {lower:.3f} ms and "
             f"{upper:.3f} ms ({(gap_ratio - 1) * 100:.1f}% gap, "
-            f"limit {(LIFECYCLE_SNAPSHOT_MAX_CLUSTER_GAP - 1) * 100:.1f}%); "
+            f"limit {(STABILITY_MAX_CLUSTER_GAP - 1) * 100:.1f}%); "
             "rerun on an idle host"
         )
+
+
+def _validate_snapshot_generation_stability(
+    document: dict[str, object], backend: str, source: Path
+) -> None:
+    _validate_sample_stability(
+        _openvmm_samples(document, "snapshot_capture", backend, "samples_ms", source),
+        f"snapshot generation at {source}:snapshot_capture.{backend}.samples_ms",
+    )
+
+
+def _shell_snapshot_restore_logs(input_dir: Path) -> list[Path]:
+    return [
+        input_dir / filename
+        for filename in SHELL_SNAPSHOT_RESTORE_LOGS
+        if (input_dir / filename).is_file()
+    ]
+
+
+def _validate_restore_stability(logs: Sequence[Path]) -> int:
+    """Reject the shell-snapshot restore series in ``logs`` that a transient
+    host stall split, reporting every such series, and return how many series
+    had enough samples to check."""
+    checked = 0
+    unstable: list[str] = []
+    for path in logs:
+        series = _shell_snapshot_restore_samples(_read_log(path), str(path))
+        for memory_mib, samples in series.items():
+            if len(samples) < STABILITY_MINIMUM_SAMPLES:
+                continue
+            checked += 1
+            try:
+                _validate_sample_stability(
+                    samples, f"shell-snapshot restore at {path} ({memory_mib} MiB)"
+                )
+            except UnstablePerformanceError as error:
+                unstable.append(str(error))
+    if unstable:
+        raise UnstablePerformanceError("\n".join(unstable))
+    return checked
+
+
+def validate_workload_stability(platform: str, input_dir: Path) -> None:
+    """Check the workload logs in ``input_dir`` for series that a transient
+    host stall split, so that the caller can remeasure them before collection.
+
+    Only the shell-snapshot restore series have a guard, and only on the
+    backends in ``RESTORE_STABILITY_BACKENDS``.
+    """
+    backend = OPENVMM_BACKENDS.get(platform)
+    if backend is None:
+        raise PerformanceError(f"unsupported OpenVMM benchmark platform: {platform!r}")
+    logs = _shell_snapshot_restore_logs(input_dir)
+    if not logs:
+        raise PerformanceError(f"no shell-snapshot restore log found in {input_dir}")
+    if backend not in RESTORE_STABILITY_BACKENDS:
+        print(
+            f"SKIP: shell-snapshot restore series have no stability guard on {backend}"
+        )
+        return
+    checked = _validate_restore_stability(logs)
+    print(
+        f"Shell-snapshot restore series in {input_dir} are stable "
+        f"({checked} with at least {STABILITY_MINIMUM_SAMPLES} samples checked)"
+    )
 
 
 def read_lifecycle_data(platform: str, input_path: Path) -> LifecycleData:
@@ -1177,12 +1333,170 @@ def read_lifecycle_data(platform: str, input_path: Path) -> LifecycleData:
     )
 
 
+def record_lifecycle_attempt(
+    log_path: Path,
+    platform: str,
+    input_path: Path,
+    exit_status: int,
+    message: str | None,
+) -> LifecycleAttempt:
+    """Append a lifecycle validation outcome to the attempt log.
+
+    The log keeps every bounded remeasurement in order, so collection can
+    name the attempt that supplied the published lifecycle metrics.
+    """
+    attempts = (
+        read_lifecycle_attempt_log(log_path, platform) if log_path.exists() else []
+    )
+    try:
+        location = Path(
+            os.path.relpath(input_path.resolve(), log_path.resolve().parent)
+        ).as_posix()
+    except ValueError:
+        location = str(input_path.resolve())
+    attempt = LifecycleAttempt(
+        number=len(attempts) + 1,
+        file=location,
+        sha256=sha256_file(input_path) if input_path.is_file() else None,
+        status=LIFECYCLE_ATTEMPT_STATUSES.get(exit_status, "invalid"),
+        exit_status=exit_status,
+        message=message,
+    )
+    attempts.append(attempt)
+    document = {
+        "schema_version": LIFECYCLE_ATTEMPT_LOG_SCHEMA_VERSION,
+        "platform": platform,
+        "attempts": [
+            {
+                "attempt": item.number,
+                "file": item.file,
+                "sha256": item.sha256,
+                "status": item.status,
+                "exit_status": item.exit_status,
+                "message": item.message,
+            }
+            for item in attempts
+        ],
+    }
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    return attempt
+
+
+def read_lifecycle_attempt_log(log_path: Path, platform: str) -> list[LifecycleAttempt]:
+    try:
+        document = _json_object(
+            json.loads(log_path.read_text(encoding="utf-8")), str(log_path)
+        )
+    except FileNotFoundError as error:
+        raise PerformanceError(
+            f"lifecycle attempt log not found: {log_path}"
+        ) from error
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise PerformanceError(
+            f"invalid lifecycle attempt log {log_path}: {error}"
+        ) from error
+    if document.get("schema_version") != LIFECYCLE_ATTEMPT_LOG_SCHEMA_VERSION:
+        raise PerformanceError(
+            f"{log_path} has unsupported schema_version "
+            f"{document.get('schema_version')!r}"
+        )
+    if document.get("platform") != platform:
+        raise PerformanceError(
+            f"{log_path} records platform {document.get('platform')!r}, "
+            f"expected {platform!r}"
+        )
+    entries = document.get("attempts")
+    if not isinstance(entries, list):
+        raise PerformanceError(f"expected an attempt list at {log_path}:attempts")
+    attempts: list[LifecycleAttempt] = []
+    for index, value in enumerate(cast(list[object], entries)):
+        location = f"{log_path}:attempts[{index}]"
+        entry = _json_object(value, location)
+        number = entry.get("attempt")
+        file = entry.get("file")
+        digest = entry.get("sha256")
+        status = entry.get("status")
+        exit_status = entry.get("exit_status")
+        message = entry.get("message")
+        if (
+            isinstance(number, bool)
+            or number != index + 1
+            or not isinstance(file, str)
+            or not file
+            or isinstance(exit_status, bool)
+            or not isinstance(exit_status, int)
+            or status != LIFECYCLE_ATTEMPT_STATUSES.get(exit_status, "invalid")
+            or not (digest is None or isinstance(digest, str))
+            or (isinstance(digest, str) and not SHA256_HEX.fullmatch(digest))
+            or not (message is None or isinstance(message, str))
+        ):
+            raise PerformanceError(f"invalid lifecycle attempt at {location}")
+        attempts.append(
+            LifecycleAttempt(
+                number=index + 1,
+                file=file,
+                sha256=digest,
+                status=str(status),
+                exit_status=exit_status,
+                message=message,
+            )
+        )
+    return attempts
+
+
+def read_lifecycle_attempts(
+    log_path: Path, platform: str, published_path: Path
+) -> list[LifecycleAttempt]:
+    """Read every logged attempt and mark the one published as
+    ``published_path``, which must be a byte-identical copy of exactly one
+    valid attempt."""
+    attempts = read_lifecycle_attempt_log(log_path, platform)
+    try:
+        digest = sha256_file(published_path)
+    except OSError as error:
+        raise PerformanceError(
+            f"cannot read lifecycle result {published_path}: {error}"
+        ) from error
+    published = [
+        attempt
+        for attempt in attempts
+        if attempt.status == "valid" and attempt.sha256 == digest
+    ]
+    if len(published) != 1:
+        raise PerformanceError(
+            f"{published_path} matches {len(published)} valid attempts in "
+            f"{log_path}; expected exactly one"
+        )
+    return [
+        replace(
+            attempt,
+            published=attempt is published[0],
+            document=_read_attempt_document(log_path.parent / attempt.file),
+        )
+        for attempt in attempts
+    ]
+
+
+def _read_attempt_document(path: Path) -> dict[str, object] | None:
+    # A rejected attempt's diagnostics must not block publication.
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return cast(dict[str, object], document) if isinstance(document, dict) else None
+
+
 def append_openvmm_diagnostics(
     path: Path,
     platform: str,
     lifecycle: LifecycleData,
     source: Path,
+    attempts: Sequence[LifecycleAttempt] = (),
 ) -> None:
+    """Append lifecycle diagnostics, the benchmark host, and storage
+    telemetry. ``attempts`` adds every logged lifecycle attempt, including
+    rejected ones, to the attempt and telemetry tables."""
     document = lifecycle.document
     backend = lifecycle.backend
     cold_start = _openvmm_value(document, "backends", backend, "p50_ms", source)
@@ -1291,8 +1605,315 @@ def append_openvmm_diagnostics(
             "",
         ]
     )
+    lines.extend(_lifecycle_attempt_lines(attempts, backend))
+    host = _optional_object(document.get("host"))
+    if host:
+        lines.extend(_host_provenance_lines(host))
+    sources = (
+        [
+            (attempt.document, _attempt_label(attempt))
+            for attempt in attempts
+            if attempt.document is not None
+        ]
+        if attempts
+        else [(document, None)]
+    )
+    lines.extend(_storage_telemetry_lines(sources, backend))
     with path.open("a", encoding="utf-8", newline="\n") as output:
         output.write("\n" + "\n".join(lines))
+
+
+def _optional_object(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def _markdown_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ")
+
+
+def _attempt_label(attempt: LifecycleAttempt) -> str:
+    published = ", published" if attempt.published else ""
+    return f"Attempt {attempt.number}: {attempt.status}{published} (`{attempt.file}`)"
+
+
+def _lifecycle_attempt_lines(
+    attempts: Sequence[LifecycleAttempt], backend: str
+) -> list[str]:
+    if not attempts:
+        return []
+    lines = [
+        "### Lifecycle attempts",
+        "",
+        "| Attempt | File | Result | Snapshot generation p50 | Published |",
+        "| ---: | --- | --- | ---: | --- |",
+    ]
+    for attempt in attempts:
+        capture = _optional_object(
+            _optional_object((attempt.document or {}).get("snapshot_capture")).get(
+                backend
+            )
+        )
+        result = attempt.status
+        if attempt.message is not None:
+            result = f"{result}: {attempt.message}"
+        lines.append(
+            f"| {attempt.number} | `{attempt.file}` | {_markdown_cell(result)} | "
+            f"{_summary_number(capture.get('p50_ms'), ' ms', 2)} | "
+            f"{'yes' if attempt.published else 'no'} |"
+        )
+    return [*lines, ""]
+
+
+def _host_provenance_lines(host: dict[str, object]) -> list[str]:
+    lines = ["### Benchmark host", "", "| Property | Value |", "| --- | --- |"]
+    lines.extend(
+        f"| {label} | {_markdown_cell(value)} |"
+        for label, value in host_telemetry.host_provenance_rows(host)
+    )
+    return [*lines, ""]
+
+
+def _summary_number(value: object, unit: str, digits: int) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{value:.{digits}f}{unit}"
+
+
+def _storage_telemetry_lines(
+    sources: Sequence[tuple[dict[str, object], str | None]], backend: str
+) -> list[str]:
+    sections: list[str] = []
+    for document, label in sources:
+        table = _storage_telemetry_table(document, backend)
+        if not table:
+            continue
+        if label is not None:
+            sections.extend([f"#### {label}", ""])
+        sections.extend([*table, ""])
+    if not sections:
+        return []
+    return [
+        "### Snapshot generation storage telemetry",
+        "",
+        (
+            "Each row describes one measured capture. Rates and averages span "
+            "the telemetry samples nearest to the start and end of its "
+            "`capture.mapped_memory_flush` phase. Other volumes are the "
+            "monitored workspace and system volumes that do not hold scratch."
+        ),
+        "",
+        *sections,
+    ]
+
+
+def _storage_telemetry_table(document: dict[str, object], backend: str) -> list[str]:
+    capture = _optional_object(
+        _optional_object(document.get("snapshot_capture")).get(backend)
+    )
+    raw_samples = _optional_object(capture.get("profile")).get("raw_samples")
+    if not isinstance(raw_samples, list):
+        return []
+    rows: list[str] = []
+    scratch_volumes: set[str] = set()
+    for number, sample in enumerate(
+        map(_optional_object, cast(list[object], raw_samples)), 1
+    ):
+        telemetry = _optional_object(sample.get("storage_telemetry"))
+        if not telemetry:
+            continue
+        window = _optional_object(
+            _optional_object(telemetry.get("phases")).get("capture.mapped_memory_flush")
+        )
+        roles = _optional_object(telemetry.get("volumes"))
+        volumes = _optional_object(window.get("volumes"))
+        scratch_keys = {
+            key
+            for key, value in roles.items()
+            if isinstance(value, list) and "scratch" in cast(list[object], value)
+        }
+        scratch_volumes.update(scratch_keys)
+        scratch = _optional_object(
+            next((volumes[key] for key in scratch_keys if key in volumes), None)
+        )
+        other_writes = [
+            value
+            for key, stats in volumes.items()
+            if key not in scratch_keys
+            and isinstance(
+                value := _optional_object(stats).get("write_mib_per_second"),
+                (int, float),
+            )
+        ]
+        memory = _optional_object(window.get("memory"))
+        defender = _optional_object(window.get("defender"))
+        generation = sample.get("generation_duration_ns")
+        records = sample.get("records")
+        flush = next(
+            (
+                record.get("duration_ns")
+                for record in map(
+                    _optional_object,
+                    cast(list[object], records) if isinstance(records, list) else [],
+                )
+                if record.get("operation") == "capture"
+                and record.get("phase") == "mapped_memory_flush"
+            ),
+            None,
+        )
+        cells = [
+            str(number),
+            _summary_number(
+                generation / 1_000_000 if isinstance(generation, int) else None,
+                " ms",
+                2,
+            ),
+            _summary_number(
+                flush / 1_000_000 if isinstance(flush, int) else None, " ms", 2
+            ),
+            _summary_number(scratch.get("write_mib_per_second"), " MiB/s", 1),
+            _summary_number(scratch.get("average_write_latency_ms"), " ms", 2),
+            _summary_number(scratch.get("average_queue_length"), "", 1),
+            _summary_number(scratch.get("busy_percent"), "%", 0),
+            _summary_number(sum(other_writes) if other_writes else None, " MiB/s", 1),
+            _summary_number(
+                _optional_object(window.get("cpu")).get("busy_percent"), "%", 0
+            ),
+            _summary_number(memory.get("cache_dirty_mib_max"), " MiB", 1),
+            _summary_number(memory.get("lazy_write_mib_per_second"), " MiB/s", 1),
+            _summary_number(defender.get("cpu_percent"), "%", 1),
+        ]
+        rows.append("| " + " | ".join(cells) + " |")
+    if not rows:
+        return []
+    scratch_names = ", ".join(f"`{name}`" for name in sorted(scratch_volumes))
+    return [
+        f"Scratch volume: {scratch_names or 'not monitored'}.",
+        "",
+        (
+            "| Sample | Generation | Flush | Scratch write | Write latency | "
+            "Queue | Busy | Other write | CPU busy | Dirty cache | Lazy writes | "
+            "Defender CPU |"
+        ),
+        (
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+            "| ---: | ---: |"
+        ),
+        *rows,
+    ]
+
+
+RecordedHost = tuple[Path, dict[str, object]]
+"""A benchmark host identity and the first document that records it."""
+
+
+def _annotation(kind: str, title: str, message: str) -> str:
+    """Return a GitHub Actions workflow command that annotates the job."""
+
+    def escape(text: str) -> str:
+        return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+    title = escape(title).replace(":", "%3A").replace(",", "%2C")
+    return f"::{kind} title={title}::{escape(message)}"
+
+
+def _read_host(path: Path, platform: str) -> dict[str, object]:
+    try:
+        return benchmark_host.read_host(path, platform)
+    except benchmark_host.HostFileError as error:
+        raise PerformanceError(str(error)) from error
+
+
+def _host_differences(
+    expected: dict[str, object], actual: dict[str, object]
+) -> list[benchmark_host.HostField]:
+    return [
+        field
+        for field in benchmark_host.compare_hosts(expected, actual)
+        if field.result != benchmark_host.MATCH
+    ]
+
+
+def _describe_fields(fields: Sequence[benchmark_host.HostField]) -> str:
+    return "; ".join(field.describe() for field in fields)
+
+
+def _recorded_host(
+    platform: str, sources: Sequence[tuple[Path, object]]
+) -> RecordedHost | None:
+    """Return the host that the benchmark documents ``sources`` record: all
+    of them must record the same host, or none of them may record one."""
+    recorded = [
+        (
+            path,
+            benchmark_host.host_identity(platform, _json_object(host, f"{path}:host")),
+        )
+        for path, host in sources
+        if host is not None
+    ]
+    if not recorded:
+        return None
+    unrecorded = [path for path, host in sources if host is None]
+    if unrecorded:
+        raise PerformanceError(
+            f"{recorded[0][0]} records a host, but {unrecorded[0]} records none"
+        )
+    (first_path, first), *others = recorded
+    for path, host in others:
+        differences = _host_differences(first, host)
+        if differences:
+            raise PerformanceError(
+                f"{first_path} and {path} record different hosts: "
+                + _describe_fields(differences)
+            )
+    return first_path, first
+
+
+def _check_recorded_host(
+    platform: str,
+    output_dir: Path,
+    recorded: RecordedHost | None,
+    output_path: Path,
+) -> None:
+    """Refuse to collect results into a directory whose results of the same
+    platform record another host, or mix results that record a host with
+    results that record none."""
+    path = benchmark_host.host_file(output_dir, platform)
+    if not path.exists():
+        if recorded is not None:
+            unrecorded = [
+                result_path
+                for result_path in sorted(output_dir.glob("*.csv"))
+                if result_path != output_path
+                and any(row.platform == platform for row in read_results(result_path))
+            ]
+            if unrecorded:
+                raise PerformanceError(
+                    f"{unrecorded[0]} holds {platform} results that record no "
+                    f"host, so the results of {recorded[0]} cannot join them"
+                )
+        return
+    if recorded is None:
+        raise PerformanceError(
+            f"the {platform} results record no host, but {path} records the "
+            f"host of the results in {output_dir}"
+        )
+    source, host = recorded
+    differences = _host_differences(_read_host(path, platform), host)
+    if differences:
+        raise PerformanceError(
+            f"{path} records another host than {source}: "
+            + _describe_fields(differences)
+        )
+
+
+def _write_recorded_host(
+    platform: str, output_dir: Path, recorded: RecordedHost | None
+) -> None:
+    if recorded is None:
+        return
+    path = benchmark_host.host_file(output_dir, platform)
+    benchmark_host.write_host(path, recorded[1])
+    print(f"Recorded the {platform} benchmark host: {path}")
 
 
 def collect_openvmm_results(
@@ -1305,6 +1926,7 @@ def collect_openvmm_results(
     if not commit:
         raise PerformanceError("commit must not be empty")
     lifecycle = read_lifecycle_data(platform, input_path)
+    host = _recorded_host(platform, [(input_path, lifecycle.document.get("host"))])
     results = [
         Result(
             commit,
@@ -1322,7 +1944,9 @@ def collect_openvmm_results(
         platform, lifecycle.microvm_abi_version, lifecycle.processors
     )
     output_path = output_dir / _result_filename(dimensions)
+    _check_recorded_host(platform, output_dir, host, output_path)
     write_results(output_path, results)
+    _write_recorded_host(platform, output_dir, host)
     if summary_path is not None:
         append_results_summary(summary_path, platform, results)
         append_openvmm_diagnostics(summary_path, platform, lifecycle, input_path)
@@ -1343,11 +1967,14 @@ def collect_results(
     summary_path: Path | None = None,
     lifecycle_input: Path | None = None,
     require_shell_snapshot_restore_512: bool = False,
+    lifecycle_attempt_log: Path | None = None,
 ) -> Path:
     if not platform or "/" in platform or platform in {".", ".."}:
         raise PerformanceError(f"invalid platform name: {platform!r}")
     if not commit:
         raise PerformanceError("commit must not be empty")
+    if lifecycle_attempt_log is not None and lifecycle_input is None:
+        raise PerformanceError("a lifecycle attempt log requires a lifecycle input")
     if require_shell_snapshot_restore_512 and (
         require_network
         or require_shell_snapshot
@@ -1394,6 +2021,9 @@ def collect_results(
                 raise PerformanceError(f"required benchmark log not found: {path}")
             print(f"SKIP: optional benchmark log not found: {path}")
             continue
+        if filename == "device-io.log" and not device_io_suite:
+            print(f"SKIP: device-io log belongs to another suite: {path}")
+            continue
         if filename == "device-io.log" and device_io_suite:
             assert workload_metadata is not None
             warmups = workload_metadata.get("warmups")
@@ -1419,12 +2049,25 @@ def collect_results(
             if metric in collected:
                 raise PerformanceError(f"duplicate collected metric: {metric}")
             collected[metric] = value
+    if OPENVMM_BACKENDS.get(platform) in RESTORE_STABILITY_BACKENDS:
+        _validate_restore_stability(_shell_snapshot_restore_logs(input_dir))
 
     lifecycle = (
         read_lifecycle_data(platform, lifecycle_input)
         if lifecycle_input is not None
         else None
     )
+    attempts: list[LifecycleAttempt] = []
+    if lifecycle_attempt_log is not None:
+        assert lifecycle_input is not None
+        attempts = read_lifecycle_attempts(
+            lifecycle_attempt_log, platform, lifecycle_input
+        )
+        source = next(attempt for attempt in attempts if attempt.published)
+        print(
+            f"Lifecycle metrics come from attempt {source.number} of "
+            f"{len(attempts)}: {source.file}"
+        )
     if lifecycle is not None:
         lifecycle_dimensions = (
             lifecycle.microvm_abi_version,
@@ -1584,6 +2227,17 @@ def collect_results(
             + ")"
         )
 
+    # The workload logs always contribute metrics; without metadata, they
+    # record no host.
+    host_sources: list[tuple[Path, object]] = [
+        (
+            input_dir / BENCHMARK_METADATA_FILENAME,
+            None if workload_metadata is None else workload_metadata.get("host"),
+        )
+    ]
+    if lifecycle is not None and lifecycle_input is not None:
+        host_sources.append((lifecycle_input, lifecycle.document.get("host")))
+    host = _recorded_host(platform, host_sources)
     results = [
         Result(
             commit,
@@ -1598,7 +2252,9 @@ def collect_results(
         for metric, (unit, direction, p50) in sorted(collected.items())
     ]
     output_path = output_dir / _result_filename(dimensions)
+    _check_recorded_host(platform, output_dir, host, output_path)
     write_results(output_path, results)
+    _write_recorded_host(platform, output_dir, host)
     if summary_path is not None:
         append_results_summary(summary_path, platform, results)
         if lifecycle is not None:
@@ -1608,6 +2264,7 @@ def collect_results(
                 platform,
                 lifecycle,
                 lifecycle_input,
+                attempts,
             )
     print(f"Collected {len(results)} p50 metric(s) for {platform}: {output_path}")
     return output_path
@@ -1689,10 +2346,236 @@ def _compatible_baseline_results(
     return compatible
 
 
+def _verify_result_hosts(
+    source_dir: Path, history_dir: Path, platforms: Iterable[str], require_host: bool
+) -> None:
+    """Refuse results whose recorded host, the source's host file, differs
+    from the host of the history, the history's host file, in a required
+    field, and results that record no host for a history that records one.
+    With ``require_host``, both files must exist."""
+    for platform in sorted(platforms):
+        recorded_path = benchmark_host.host_file(source_dir, platform)
+        expected_path = benchmark_host.host_file(history_dir, platform)
+        missing = [
+            path for path in (recorded_path, expected_path) if not path.is_file()
+        ]
+        if missing:
+            if require_host or missing == [recorded_path]:
+                raise PerformanceError(
+                    f"cannot verify the host of the {platform} results: "
+                    f"{missing[0]} does not exist"
+                )
+            continue
+        fields = benchmark_host.compare_hosts(
+            _read_host(expected_path, platform), _read_host(recorded_path, platform)
+        )
+        changed = benchmark_host.mismatches(fields)
+        if changed:
+            raise PerformanceError(
+                f"refusing to persist the {platform} results: their host differs "
+                f"from {expected_path} in required fields: " + _describe_fields(changed)
+            )
+        drifted = benchmark_host.drift(fields)
+        if drifted:
+            print(
+                _annotation(
+                    "warning",
+                    "Benchmark host drift",
+                    f"The host of the {platform} results differs from "
+                    f"{expected_path} in advisory fields: " + _describe_fields(drifted),
+                )
+            )
+
+
+def _git(checkout: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise PerformanceError(
+            f"git {' '.join(args)} failed: {completed.stderr.strip()}"
+        )
+    return completed.stdout
+
+
+def _resolve_commit_id(revision: str, checkout: Path) -> str:
+    """Return the full ID of the commit that ``revision`` names in ``checkout``.
+
+    A symbolic revision such as ``HEAD`` names another commit by the time its
+    results are persisted, so results record the commit ID instead.
+    """
+    if COMMIT_ID.fullmatch(revision):
+        return revision
+    if not revision.startswith("-"):
+        try:
+            commit = _git(
+                checkout, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"
+            ).strip()
+        except PerformanceError:
+            commit = ""
+        if COMMIT_ID.fullmatch(commit):
+            return commit
+    raise PerformanceError(f"--commit {revision} does not name a commit in {checkout}")
+
+
+def _committed_results(top: Path, revision: str, relative: str) -> list[Result]:
+    shown = subprocess.run(
+        ["git", "-C", str(top), "show", f"{revision}:{relative}"],
+        check=False,
+        capture_output=True,
+    )
+    if shown.returncode != 0:
+        return []
+    with tempfile.TemporaryDirectory() as temporary:
+        # Keep the basename: a legacy CSV takes its platform from the file name.
+        path = Path(temporary) / Path(relative).name
+        path.write_bytes(shown.stdout)
+        return read_results(path)
+
+
+def _dimension_counts(
+    top: Path,
+    revision: str,
+    relative: str,
+) -> Counter[tuple[str, int, int, str]]:
+    return Counter(
+        _dimension_key(result, "")
+        for result in _committed_results(top, revision, relative)
+    )
+
+
+def _reset_dimensions_since(
+    git_checkout: Path,
+    history_path: Path,
+    commit: str,
+) -> set[tuple[str, int, int, str]]:
+    """Return the dimensions whose committed history lost rows after ``commit``.
+
+    A result measured at ``commit`` predates any later commit that removes the
+    dimension's rows, so it must not be appended onto the reset series.
+    """
+    # A mutable reference such as HEAD would compare the history with itself.
+    if not COMMIT_ID.fullmatch(commit):
+        raise PerformanceError(f"result commit {commit} is not a full commit ID")
+    top = Path(_git(git_checkout, "rev-parse", "--show-toplevel").strip()).resolve()
+    try:
+        relative = history_path.resolve().relative_to(top).as_posix()
+    except ValueError as error:
+        raise PerformanceError(f"{history_path} is outside the git checkout") from error
+    ancestor = subprocess.run(
+        ["git", "-C", str(top), "merge-base", "--is-ancestor", commit, "HEAD"],
+        check=False,
+        capture_output=True,
+    )
+    if ancestor.returncode != 0:
+        raise PerformanceError(
+            f"result commit {commit} is not an ancestor of the target history"
+        )
+    # Compare each commit with its own parents: a side branch forked before
+    # ``commit`` can hold fewer rows than ``commit`` without having reset them.
+    later = _git(
+        top,
+        "log",
+        "--reverse",
+        "--full-history",
+        "--sparse",
+        "--format=%H %P",
+        f"{commit}..HEAD",
+        "--",
+        relative,
+    ).splitlines()
+    resets: set[tuple[str, int, int, str]] = set()
+    for line in later:
+        revision, *parents = line.split()
+        # Ignore commits on side branches that are not part of the history
+        # leading from the measurement to HEAD, even if later merged/reverted.
+        if not _on_measurement_line(top, revision, commit):
+            continue
+        current = _dimension_counts(top, revision, relative)
+        for parent in parents:
+            # A branch that neither predates nor follows the measurement can drop rows
+            # that were already reset before it, so only the measurement's line counts.
+            if not _on_measurement_line(top, parent, commit):
+                continue
+            before = _dimension_counts(top, parent, relative)
+            resets.update(key for key, count in before.items() if current[key] < count)
+    return resets
+
+
+def _on_measurement_line(top: Path, revision: str, measured: str) -> bool:
+    """Return whether ``revision`` is on the path from ``measured`` to HEAD."""
+    return all(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(top),
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+        for ancestor, descendant in ((measured, revision), (revision, "HEAD"))
+    )
+
+
+def _without_reset_rows(
+    git_checkout: Path,
+    history_path: Path,
+    results: Sequence[Result],
+) -> list[Result]:
+    resets: dict[str, set[tuple[str, int, int, str]]] = {}
+    kept: list[Result] = []
+    for result in results:
+        if result.commit not in resets:
+            resets[result.commit] = _reset_dimensions_since(
+                git_checkout, history_path, result.commit
+            )
+        if _dimension_key(result, "") in resets[result.commit]:
+            print(
+                f"Skipped {result.metric} measured at {result.commit[:12]}: "
+                f"{history_path.name} was reset after that commit"
+            )
+            continue
+        kept.append(result)
+    return kept
+
+
+def _git_checkout_of(path: Path) -> Path | None:
+    """Return the nearest existing directory of ``path`` when it is in a git checkout.
+
+    ``path`` need not exist, as for a new history directory or one that a reset
+    removed; neither may skip the reset and ancestry checks. CI's history is
+    always in a checkout.
+    """
+    directory = path.resolve()
+    while not directory.is_dir():
+        if directory.parent == directory:
+            return None
+        directory = directory.parent
+    probe = subprocess.run(
+        ["git", "-C", str(directory), "rev-parse", "--is-inside-work-tree"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    inside = probe.returncode == 0 and probe.stdout.strip() == "true"
+    return directory if inside else None
+
+
 def persist_results(
     source_dir: Path,
     history_dir: Path,
     excluded_metrics: Iterable[str] = (),
+    require_host: bool = False,
+    git_checkout: Path | None = None,
 ) -> None:
     source_files = sorted(source_dir.glob("*.csv"))
     if not source_files:
@@ -1703,12 +2586,26 @@ def persist_results(
     for path, results in loaded.items():
         _validate_current_results(path, results)
     _validate_result_files(source_files, loaded)
+    _verify_result_hosts(
+        source_dir,
+        history_dir,
+        {result.platform for results in loaded.values() for result in results},
+        require_host,
+    )
 
     for source_path in source_files:
         source_results = loaded[source_path]
         current = [result for result in source_results if result.metric not in excluded]
         history_path = history_dir / source_path.name
         existing = read_results(history_path) if history_path.exists() else []
+        existing_keys = {_result_identity(result) for result in existing}
+        current = [
+            result
+            for result in current
+            if _result_identity(result) not in existing_keys
+        ]
+        if git_checkout is not None:
+            current = _without_reset_rows(git_checkout, history_path, current)
         metadata = {
             (
                 result.platform,
@@ -1734,12 +2631,7 @@ def persist_results(
                     f"{expected} -> {actual}"
                 )
 
-        existing_keys = {_result_identity(result) for result in existing}
-        new_results = [
-            result
-            for result in current
-            if _result_identity(result) not in existing_keys
-        ]
+        new_results = current
         if not new_results:
             print(f"No new performance rows to persist for {source_path.name}")
             continue
@@ -1788,6 +2680,16 @@ def gate_results(
     for path, results in loaded_targets.items():
         _validate_current_results(path, results)
     _validate_result_files(target_files, loaded_targets)
+    host_changes = _host_changes(
+        baseline_dir,
+        history_reset_dir,
+        {
+            result.platform or path.stem
+            for path, results in loaded_targets.items()
+            for result in results
+        },
+    )
+    unreset: dict[str, int] = defaultdict(int)
 
     checked = 0
     regressions = 0
@@ -1799,9 +2701,21 @@ def gate_results(
         f"lower-is-better millisecond metrics "
         f"must also increase by >{absolute_tolerance_ms:g} ms).",
         "",
-        "| Platform | Metric | PR p50 | Base p50 median | Delta | Result |",
-        "| --- | --- | ---: | ---: | ---: | --- |",
     ]
+    for platform, changed in host_changes.items():
+        summary.extend(
+            (
+                f"This change accepts a new expected host for {platform}, so each "
+                f"of its metrics must restart its warmup: {_describe_fields(changed)}.",
+                "",
+            )
+        )
+    summary.extend(
+        (
+            "| Platform | Metric | PR p50 | Base p50 median | Delta | Result |",
+            "| --- | --- | ---: | ---: | ---: | --- |",
+        )
+    )
 
     for target_path in target_files:
         targets = loaded_targets[target_path]
@@ -1852,6 +2766,20 @@ def gate_results(
                 summary.append(
                     f"| {dimension} | `{target.metric}` | "
                     f"{_format_value(target.p50, target.unit)} | - | - | {status} |"
+                )
+                continue
+            if platform in host_changes:
+                # Persisting this host's results after the previous host's
+                # would mix two hosts in one series.
+                unreset[platform] += 1
+                print(
+                    f"HOST CHANGED: {dimension}/{target.metric} keeps "
+                    f"{len(samples)} base-branch point(s) of the previous host"
+                )
+                summary.append(
+                    f"| {dimension} | `{target.metric}` | "
+                    f"{_format_value(target.p50, target.unit)} | - | - | "
+                    "**Host changed without a history reset** |"
                 )
                 continue
             if len(samples) < minimum_history:
@@ -1915,25 +2843,221 @@ def gate_results(
                 f"{status} |"
             )
 
-    summary.extend(
-        [
-            "",
-            f"Checked {checked} metric(s); found {regressions} regression(s).",
-            "",
-        ]
-    )
+    totals = f"Checked {checked} metric(s); found {regressions} regression(s)."
+    summary.extend(["", totals, ""])
+    # A series with a new host must keep no row of the previous host in any
+    # history file, including metrics that this change no longer measures.
+    kept_history: dict[str, str] = {}
+    for platform in host_changes:
+        assert history_reset_dir is not None
+        rows = _retained_rows(history_reset_dir, platform)
+        if rows:
+            kept_history[platform] = ", ".join(
+                f"{path.name} ({count} row(s))" for path, count in rows.items()
+            )
+        elif unreset[platform]:
+            kept_history[platform] = (
+                f"{unreset[platform]} metric(s) with base-branch history"
+            )
+    for platform, kept in kept_history.items():
+        summary.extend(
+            (
+                f"**The {platform} series keeps the previous host's history**: "
+                f"{kept}. Truncate each of its history files to its header line.",
+                "",
+            )
+        )
     if summary_path is not None:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         with summary_path.open("a", encoding="utf-8") as output:
             output.write("\n".join(summary))
 
+    for platform, kept in kept_history.items():
+        assert history_reset_dir is not None
+        print(
+            _annotation(
+                "error",
+                "Benchmark host changed without a history reset",
+                f"{benchmark_host.host_file(history_reset_dir, platform)} changes "
+                f"required fields of the {platform} host "
+                f"({_describe_fields(host_changes[platform])}), but the series "
+                f"keeps the previous host's history: {kept}. Truncate each of the "
+                "series' history files to its header line in the same change "
+                '(doc/benchmarks.md, "Expected benchmark hosts").',
+            )
+        )
     print(
         f"Checked {checked} metric(s), found {regressions} regression(s) "
         f"(threshold: >{threshold:g}% vs {window}-point median; "
         f"minimum history: {minimum_history}; "
         f"absolute latency tolerance: {absolute_tolerance_ms:g} ms)."
     )
-    return 1 if regressions else 0
+    return 1 if regressions or kept_history else 0
+
+
+def _retained_rows(directory: Path, platform: str) -> dict[Path, int]:
+    """Count the rows of ``platform`` in each history file in ``directory``."""
+    counts: dict[Path, int] = {}
+    for path in sorted(directory.glob("*.csv")):
+        count = sum(result.platform == platform for result in read_results(path))
+        if count:
+            counts[path] = count
+    return counts
+
+
+def _host_changes(
+    baseline_dir: Path, candidate_dir: Path | None, platforms: Iterable[str]
+) -> dict[str, list[benchmark_host.HostField]]:
+    """Return the required fields in which each platform's expected host in
+    ``candidate_dir`` differs from the base branch's in ``baseline_dir``."""
+    changes: dict[str, list[benchmark_host.HostField]] = {}
+    if candidate_dir is None:
+        return changes
+    for platform in sorted(platforms):
+        base = benchmark_host.host_file(baseline_dir, platform)
+        candidate = benchmark_host.host_file(candidate_dir, platform)
+        if base.is_file() and candidate.is_file():
+            changed = benchmark_host.mismatches(
+                benchmark_host.compare_hosts(
+                    _read_host(base, platform), _read_host(candidate, platform)
+                )
+            )
+            if changed:
+                changes[platform] = changed
+    return changes
+
+
+def check_host(
+    platform: str,
+    history_dir: Path,
+    scratch_dir: Path | None = None,
+    output: Path | None = None,
+    summary_path: Path | None = None,
+) -> int:
+    """Compare this host with the expected host of ``platform``'s series, in
+    ``history_dir``. Return 0 when every required field matches, even with
+    advisory drift, 1 when one differs, and 2 when the expected host is
+    missing or malformed."""
+    provenance = host_telemetry.host_provenance(
+        benchmark_host.benchmark_volumes(scratch_dir)
+    )
+    print("Benchmark host: " + host_telemetry.describe_host_provenance(provenance))
+    actual = benchmark_host.host_identity(platform, provenance)
+    expected_path = benchmark_host.host_file(history_dir, platform)
+    title = PLATFORM_NAMES.get(platform, platform)
+    # Read the expected host first: --output may name the expected host file
+    # itself, and the check must compare with the file as it was.
+    expected: dict[str, object] = {}
+    failure: benchmark_host.HostFileError | None = None
+    try:
+        expected = benchmark_host.read_host(expected_path, platform)
+    except benchmark_host.HostFileError as error:
+        failure = error
+    if output is not None:
+        benchmark_host.write_host(output, actual)
+    if failure is not None:
+        print(
+            _annotation(
+                "error",
+                "Benchmark host",
+                f"{title}: {failure}. Add the series' expected host, such as this "
+                "runner's from the step summary, as doc/benchmarks.md "
+                '("Expected benchmark hosts") describes.',
+            )
+        )
+        print(benchmark_host.format_host(actual), end="")
+        if summary_path is not None:
+            with summary_path.open("a", encoding="utf-8", newline="\n") as summary:
+                summary.write(
+                    "\n".join(
+                        (
+                            "",
+                            f"## Benchmark host check: {title}",
+                            "",
+                            f"**No valid expected host**: {failure}.",
+                            "",
+                            *benchmark_host.actual_host_markdown(actual),
+                        )
+                    )
+                )
+        return 2
+    fields = benchmark_host.compare_hosts(expected, actual)
+    changed = benchmark_host.mismatches(fields)
+    drifted = benchmark_host.drift(fields)
+    for field in fields:
+        print(f"{field.result.upper()}: {field.describe()}")
+    if changed:
+        print(
+            _annotation(
+                "error",
+                "Benchmark host mismatch",
+                f"{title}: this runner differs from {expected_path} in "
+                f"{len(changed)} required field(s): {_describe_fields(changed)}. "
+                "The series' history comes from the expected host; to measure "
+                "it here, accept this host and reset the history "
+                '(doc/benchmarks.md, "Expected benchmark hosts").',
+            )
+        )
+    if drifted:
+        print(
+            _annotation(
+                "warning",
+                "Benchmark host drift",
+                f"{title}: this runner differs from {expected_path} in "
+                f"advisory field(s): {_describe_fields(drifted)}. Update the "
+                "file to acknowledge them; that needs no history reset.",
+            )
+        )
+    if changed or drifted:
+        print(benchmark_host.format_host(actual), end="")
+    if summary_path is not None:
+        with summary_path.open("a", encoding="utf-8", newline="\n") as summary:
+            summary.write(
+                "\n"
+                + benchmark_host.host_check_markdown(
+                    title, expected_path, fields, actual
+                )
+            )
+    if changed:
+        outcome = f"{len(changed)} required field(s) differ"
+    elif drifted:
+        outcome = f"match with {len(drifted)} advisory difference(s)"
+    else:
+        outcome = "match"
+    print(f"Benchmark host check for {platform}: {outcome}")
+    return 1 if changed else 0
+
+
+def save_storage_events(
+    since: dt.datetime, output_dir: Path, scratch_dir: Path | None = None
+) -> int:
+    """Save the storage events of a Windows job's window, from ``since`` to
+    now, in ``output_dir``, print their summary, and warn of slow I/O and of
+    an unreadable log. A failed job saves them as diagnostics, so an
+    unreadable log doesn't fail the save; other hosts have no such events."""
+    if sys.platform != "win32":
+        print("ERROR: storage events are recorded only on Windows", file=sys.stderr)
+        return 2
+
+    def volumes() -> dict[str, Path]:
+        # Resolving a path on a stalled volume can wait for it, so this runs
+        # only after the export, and within its bound.
+        volumes = benchmark_host.benchmark_volumes(scratch_dir)
+        system_root = os.environ.get("SystemRoot")
+        if system_root:
+            volumes["system"] = Path(system_root)
+        return volumes
+
+    report = storage_events.save_storage_events(since, output_dir, volumes)
+    for line in report.lines():
+        print(line)
+    if report.unsaved:
+        print(f"Saved only part of the storage events in {output_dir}")
+    else:
+        print(f"Saved the storage events in {output_dir}")
+    for title, message in report.warnings():
+        print(_annotation("warning", title, message))
+    return 0
 
 
 def _non_negative_float(value: str) -> float:
@@ -1964,6 +3088,14 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="merge a 128 MiB e2e lifecycle benchmark JSON result",
     )
+    collect.add_argument(
+        "--lifecycle-attempt-log",
+        type=Path,
+        help=(
+            "lifecycle attempt log that must name --lifecycle-input as exactly "
+            "one valid attempt; the summary reports every attempt"
+        ),
+    )
     collect.add_argument("--summary", type=Path)
 
     validate_openvmm = commands.add_parser(
@@ -1971,6 +3103,18 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     validate_openvmm.add_argument("--platform", required=True)
     validate_openvmm.add_argument("--input", type=Path, required=True)
+    validate_openvmm.add_argument(
+        "--attempt-log",
+        type=Path,
+        help="append the validation outcome to this lifecycle attempt log",
+    )
+
+    validate_workload = commands.add_parser(
+        "validate-workload",
+        help="check workload logs for series that a transient host stall split",
+    )
+    validate_workload.add_argument("--platform", required=True)
+    validate_workload.add_argument("--input-dir", type=Path, required=True)
 
     collect_openvmm = commands.add_parser(
         "collect-openvmm", help="convert an OpenVMM benchmark JSON result to p50 CSV"
@@ -1982,14 +3126,21 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     collect_openvmm.add_argument("--summary", type=Path)
 
     gate = commands.add_parser("gate", help="check current p50 values for regressions")
-    gate.add_argument("--baseline-dir", type=Path, required=True)
+    gate.add_argument(
+        "--baseline-dir",
+        type=Path,
+        required=True,
+        help="base-branch histories and expected hosts (<platform>-host.json)",
+    )
     gate.add_argument("--target-dir", type=Path, required=True)
     gate.add_argument(
         "--history-reset-dir",
         type=Path,
         help=(
-            "tracked candidate histories; metrics removed from an existing "
-            "history file restart baseline warmup"
+            "tracked candidate histories and expected hosts; metrics removed "
+            "from an existing history file restart baseline warmup, and a "
+            "changed required field of an expected host requires that every "
+            "metric of its series restart"
         ),
     )
     gate.add_argument("--window", type=positive_int, default=10)
@@ -2023,6 +3174,59 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         metavar="NAME",
         help="metric to omit from persistence (repeatable)",
     )
+    persist.add_argument(
+        "--require-host",
+        action="store_true",
+        help=(
+            "require each platform's recorded host in --source-dir and expected "
+            "host in --history-dir (<platform>-host.json); without it, only "
+            "hosts that both directories record are compared"
+        ),
+    )
+
+    check = commands.add_parser(
+        "check-host",
+        help="compare this host with the expected host of a performance series",
+    )
+    check.add_argument("--platform", required=True)
+    check.add_argument(
+        "--history-dir",
+        type=Path,
+        required=True,
+        help="directory of the series' expected host, <platform>-host.json",
+    )
+    check.add_argument(
+        "--scratch-dir",
+        type=Path,
+        help=(
+            "benchmark scratch directory that the benchmarks will use "
+            "(default: the system temporary directory)"
+        ),
+    )
+    check.add_argument(
+        "--output", type=Path, help="write this host as a host file to this path"
+    )
+    check.add_argument("--summary", type=Path)
+
+    events = commands.add_parser(
+        "storage-events",
+        help=("save the Windows storage events of a job's window and warn of slow I/O"),
+    )
+    events.add_argument(
+        "--since",
+        type=storage_events.parse_utc,
+        required=True,
+        help="start of the window, an ISO 8601 time with a UTC offset or Z",
+    )
+    events.add_argument("--output-dir", type=Path, required=True)
+    events.add_argument(
+        "--scratch-dir",
+        type=Path,
+        help=(
+            "benchmark scratch directory, whose volume the summary names "
+            "(default: the system temporary directory)"
+        ),
+    )
     parser.set_defaults(handler=command_performance)
 
 
@@ -2031,7 +3235,7 @@ def command_performance(args: argparse.Namespace) -> int:
         if args.performance_command == "collect":
             collect_results(
                 args.platform,
-                args.commit,
+                _resolve_commit_id(args.commit, ROOT),
                 args.input_dir,
                 args.output_dir,
                 require_network=args.require_network,
@@ -2042,19 +3246,40 @@ def command_performance(args: argparse.Namespace) -> int:
                 require_shell_snapshot_restore_512=(
                     args.require_shell_snapshot_restore_512
                 ),
+                lifecycle_attempt_log=args.lifecycle_attempt_log,
             )
             return 0
         if args.performance_command == "validate-openvmm":
+            status, message = 0, None
             try:
                 read_lifecycle_data(args.platform, args.input)
             except UnstablePerformanceError as error:
-                print(f"ERROR: {error}", file=sys.stderr)
-                return UNSTABLE_LIFECYCLE_EXIT_CODE
+                status, message = UNSTABLE_EXIT_CODE, str(error)
+            except PerformanceError as error:
+                status, message = 2, str(error)
+            if message is not None:
+                print(f"ERROR: {message}", file=sys.stderr)
+            if args.attempt_log is not None:
+                attempt = record_lifecycle_attempt(
+                    args.attempt_log, args.platform, args.input, status, message
+                )
+                print(
+                    f"Recorded lifecycle attempt {attempt.number} "
+                    f"({attempt.status}) in {args.attempt_log}"
+                )
+            return status
+        if args.performance_command == "validate-workload":
+            try:
+                validate_workload_stability(args.platform, args.input_dir)
+            except UnstablePerformanceError as error:
+                for line in str(error).splitlines():
+                    print(f"ERROR: {line}", file=sys.stderr)
+                return UNSTABLE_EXIT_CODE
             return 0
         if args.performance_command == "collect-openvmm":
             collect_openvmm_results(
                 args.platform,
-                args.commit,
+                _resolve_commit_id(args.commit, ROOT),
                 args.input,
                 args.output_dir,
                 args.summary,
@@ -2071,7 +3296,23 @@ def command_performance(args: argparse.Namespace) -> int:
                 minimum_history=args.minimum_history,
                 history_reset_dir=args.history_reset_dir,
             )
-        persist_results(args.source_dir, args.history_dir, args.exclude_metric)
+        if args.performance_command == "check-host":
+            return check_host(
+                args.platform,
+                args.history_dir,
+                scratch_dir=args.scratch_dir,
+                output=args.output,
+                summary_path=args.summary,
+            )
+        if args.performance_command == "storage-events":
+            return save_storage_events(args.since, args.output_dir, args.scratch_dir)
+        persist_results(
+            args.source_dir,
+            args.history_dir,
+            args.exclude_metric,
+            require_host=args.require_host,
+            git_checkout=_git_checkout_of(args.history_dir),
+        )
         return 0
     except (PerformanceError, OSError, csv.Error) as error:
         print(f"ERROR: {error}", file=sys.stderr)

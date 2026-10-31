@@ -13,7 +13,12 @@ from .build_constants import (
     BuildConstants,
     DockerBuildConstants,
 )
-from .common import ScriptError, download_verified, sha256_file
+from .common import (
+    ScriptError,
+    download_verified,
+    normalized_sha256_file,
+)
+from .guest_binaries import guest_binary_source_files
 
 _RPM_FIELD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~^-]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -101,10 +106,7 @@ def load_package_lock(path: Path | None = None) -> tuple[AzureLinuxLockedPackage
 
 def package_lock_sha256(path: Path | None = None) -> str:
     path = path or package_lock_path()
-    contents = path.read_bytes().replace(b"\r\n", b"\n")
-    if b"\r" in contents:
-        raise ScriptError(f"{path} contains unsupported carriage returns")
-    return hashlib.sha256(contents).hexdigest()
+    return normalized_sha256_file(path)
 
 
 def download_packages(destination: Path) -> tuple[Path, ...]:
@@ -127,8 +129,15 @@ def input_files() -> tuple[Path, ...]:
         # this digest, so changes to them must also rebuild the artifact.
         *(
             root / "scripts" / "nvx_tools" / name
-            for name in ("azurelinux.py", "build_constants.py", "common.py")
+            for name in (
+                "azurelinux.py",
+                "build_constants.py",
+                "common.py",
+                "elf.py",
+                "guest_binaries.py",
+            )
         ),
+        *guest_binary_source_files(),
     ]
     for directory in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES:
         files.extend(path for path in (root / directory).rglob("*") if path.is_file())
@@ -151,7 +160,7 @@ def input_sha256(
         "files": [
             {
                 "path": path.relative_to(root).as_posix(),
-                "sha256": sha256_file(path),
+                "sha256": normalized_sha256_file(path),
             }
             for path in input_files()
         ],

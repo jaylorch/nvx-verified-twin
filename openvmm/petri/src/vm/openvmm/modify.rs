@@ -126,11 +126,14 @@ impl PetriVmConfigOpenVmm {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
             static_ipv4: None,
+            static_ipv6: None,
             ports: Vec::new(),
             recv: None,
             allow_host_local_access: None,
             map_gateway_to_host_loopback: None,
             gateway_loopback_proxy_port: None,
+            private_network_ingress: None,
+            host_loopback_ingress: false,
         }
         .into_resource();
         if let Some(vtl2_settings) = self.runtime_config.vtl2_settings.as_mut() {
@@ -171,16 +174,75 @@ impl PetriVmConfigOpenVmm {
         self
     }
 
+    /// Add a single-vport MANA VF to VTL2 and expose its synthetic NIC to VTL0.
+    pub fn with_mana_vf(self, instance_id: Guid, mac_address: MacAddress) -> Self {
+        self.with_mana_vf_vports(instance_id, [mac_address])
+    }
+
+    /// Add a MANA VF to VTL2 and expose one synthetic NIC per vport to VTL0.
+    pub fn with_mana_vf_vports(
+        mut self,
+        instance_id: Guid,
+        mac_addresses: impl IntoIterator<Item = MacAddress>,
+    ) -> Self {
+        let vtl2_settings = self
+            .runtime_config
+            .vtl2_settings
+            .as_mut()
+            .expect("a VTL2 MANA VF requires OpenHCL firmware");
+
+        let vports = mac_addresses
+            .into_iter()
+            .map(|mac_address| VportDefinition {
+                mac_address,
+                endpoint: net_backend_resources::consomme::ConsommeHandle {
+                    cidr: None,
+                    static_ipv4: None,
+                    static_ipv6: None,
+                    ports: Vec::new(),
+                    recv: None,
+                    allow_host_local_access: None,
+                    map_gateway_to_host_loopback: None,
+                    gateway_loopback_proxy_port: None,
+                    private_network_ingress: None,
+                    host_loopback_ingress: false,
+                }
+                .into_resource(),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!vports.is_empty(), "a MANA VF requires at least one vport");
+
+        self.config.vpci_devices.push(VpciDeviceConfig {
+            vtl: DeviceVtl::Vtl2,
+            instance_id,
+            resource: GdmaDeviceHandle { vports }.into_resource(),
+            vnode: None,
+        });
+        vtl2_settings.dynamic.as_mut().unwrap().nic_devices.push(
+            vtl2_settings_proto::NicDeviceLegacy {
+                instance_id: instance_id.to_string(),
+                subordinate_instance_id: None,
+                max_sub_channels: None,
+            },
+        );
+
+        self
+    }
+
     /// Add a PCIe NIC to the VM using the MANA emulator.
     pub fn with_pcie_nic(mut self, port_name: &str, mac_address: MacAddress) -> Self {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
             static_ipv4: None,
+            static_ipv6: None,
             ports: Vec::new(),
             recv: None,
             allow_host_local_access: None,
             map_gateway_to_host_loopback: None,
             gateway_loopback_proxy_port: None,
+            private_network_ingress: None,
+            host_loopback_ingress: false,
         }
         .into_resource();
         self.config.pcie_devices.push(PcieDeviceConfig {
@@ -233,11 +295,14 @@ impl PetriVmConfigOpenVmm {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
             static_ipv4: None,
+            static_ipv6: None,
             ports: Vec::new(),
             recv: None,
             allow_host_local_access: None,
             map_gateway_to_host_loopback: None,
             gateway_loopback_proxy_port: None,
+            private_network_ingress: None,
+            host_loopback_ingress: false,
         }
         .into_resource();
 
@@ -272,6 +337,7 @@ impl PetriVmConfigOpenVmm {
         let endpoint = net_backend_resources::consomme::ConsommeHandle {
             cidr: None,
             static_ipv4: None,
+            static_ipv6: None,
             ports: vec![net_backend_resources::consomme::HostPortConfig {
                 protocol: net_backend_resources::consomme::HostPortProtocol::Tcp,
                 host_address: Some(net_backend_resources::consomme::HostIpAddress::Ipv4(
@@ -284,6 +350,8 @@ impl PetriVmConfigOpenVmm {
             allow_host_local_access: None,
             map_gateway_to_host_loopback: None,
             gateway_loopback_proxy_port: None,
+            private_network_ingress: None,
+            host_loopback_ingress: false,
         }
         .into_resource();
         self.push_virtio_nic(
@@ -317,12 +385,6 @@ impl PetriVmConfigOpenVmm {
             port_name: port_name.to_string(),
             resource: virtio_resources::VirtioPciDeviceHandle(nic.into_resource()).into_resource(),
         });
-    }
-
-    /// Request nested virtualization support from the host hypervisor.
-    pub fn with_nested_virt(mut self) -> Self {
-        self.config.hypervisor.nested_virt = true;
-        self
     }
 
     /// Enable a synthnic for the VM backed by the Windows vmswitch

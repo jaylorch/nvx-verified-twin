@@ -5,9 +5,9 @@
 
 use super::MAX_FUSE_REQUEST_BYTES;
 use super::owner::CallerIdentity;
+use super::policy::SubtreePolicy;
 use super::profile::MicroVmOwnerMode;
 use super::profile::MicroVmVirtioFsProfile;
-use super::saved_state::CALLER_IDENTITY_SCHEMA_VERSION;
 use super::saved_state::MAX_ALIAS_BYTES;
 use super::saved_state::MAX_ALIASES;
 use super::saved_state::MAX_ALIASES_PER_INODE;
@@ -15,15 +15,18 @@ use super::saved_state::MAX_DIRECTORY_BYTES;
 use super::saved_state::MAX_DIRECTORY_ENTRIES;
 use super::saved_state::MAX_HANDLES;
 use super::saved_state::MAX_INODES;
-use super::saved_state::SCHEMA_VERSION;
+use super::saved_state::SUBTREE_POLICY_SCHEMA_VERSION;
 use super::saved_state::SavedHandle;
 use super::saved_state::SavedInode;
 use super::saved_state::SavedState;
 use super::state::encode_relative_path;
 use super::state::fuse_negotiation_from_session;
 use super::state::reopen_flags;
+use super::state::saved_aggregate_children;
 use super::state::saved_identity;
 use super::state::saved_negotiation;
+use super::state::saved_policy_paths;
+use super::state::schema_version;
 use super::state::session_state_from_saved;
 use super::state::validate_identity;
 use super::state::validate_microvm_state;
@@ -38,6 +41,7 @@ use crate::InodeMap;
 use crate::VirtioFs;
 use crate::VirtioFsInner;
 use crate::VirtioFsMode;
+use crate::aggregate::AggregateState;
 use crate::file::VirtioFsFile;
 use crate::inode::VirtioFsInode;
 use crate::inode::VirtioFsVolume;
@@ -131,6 +135,84 @@ pub(crate) fn validate_file_insert(
     Ok(())
 }
 
+/// Opens the strict, policy-enforcing volume of a microVM share or aggregate
+/// child at `root_path`, as volume `volume_id`, and returns it with its root
+/// inode and the root's attributes. The caller validates the root's identity.
+///
+/// With `file`, `root_path` names a regular file, which becomes the volume's
+/// root object in place of `policy`'s directory: the volume opens the file's
+/// directory, but the guest receives no node of that directory, and the
+/// volume also hides the directory's root behind the file, so the guest
+/// reaches nothing but the file.
+fn open_microvm_volume(
+    root_path: &Path,
+    read_only: bool,
+    policy: &SubtreePolicy,
+    volume_id: u32,
+    file: bool,
+) -> anyhow::Result<(Arc<VirtioFsVolume>, VirtioFsInode, lx::Stat)> {
+    let (directory, exposed_file, policy) = if file {
+        anyhow::ensure!(
+            *policy == SubtreePolicy::default(),
+            "a microVM virtio-fs file child takes no denied, allowed, or writable paths"
+        );
+        let (Some(directory), Some(name)) = (root_path.parent(), root_path.file_name()) else {
+            anyhow::bail!(
+                "microVM virtio-fs file {} has no host directory",
+                root_path.display()
+            );
+        };
+        let exposed_file = PathBuf::from(name);
+        let policy = SubtreePolicy::new(
+            vec![PathBuf::new()],
+            vec![exposed_file.clone()],
+            Vec::new(),
+            read_only,
+        )?;
+        (directory, Some(exposed_file), policy)
+    } else {
+        (root_path, None, policy.clone())
+    };
+    let mut mount_options = LxVolumeOptions::new();
+    mount_options
+        .readonly(read_only)
+        .sandbox(true)
+        .confine_paths(true);
+    let volume = mount_options.new_volume(directory)?;
+    let mut pinned_identities = HashMap::new();
+    for (path, reachable_at) in policy.pinned_paths() {
+        let stat = volume.lstat(&path)?;
+        if reachable_at.is_some() && stat.mode & lx::S_IFMT != lx::S_IFDIR {
+            anyhow::bail!(
+                "microVM virtio-fs path {} leads to an allowed path but is not a directory",
+                path.display()
+            );
+        }
+        // An object pinned at two paths, such as through a bind mount, is
+        // reachable at neither.
+        pinned_identities
+            .entry((stat.device_nr, stat.inode_nr))
+            .and_modify(|pinned: &mut Option<PathBuf>| {
+                if *pinned != reachable_at {
+                    *pinned = None;
+                }
+            })
+            .or_insert(reachable_at);
+    }
+    let volume = Arc::new(VirtioFsVolume::new_with_strict_paths(
+        volume,
+        volume_id,
+        read_only,
+        true,
+        policy,
+        pinned_identities,
+        exposed_file,
+    ));
+    let root_entry = volume.root_entry().to_owned();
+    let (root_inode, root_stat) = VirtioFsInode::new(Arc::clone(&volume), root_entry)?;
+    Ok((volume, root_inode, root_stat))
+}
+
 impl VirtioFs {
     /// Creates a filesystem attachment for the fixed microVM profile.
     ///
@@ -141,32 +223,18 @@ impl VirtioFs {
         profile: MicroVmVirtioFsProfile,
     ) -> anyhow::Result<Self> {
         let root_path = root_path.as_ref();
+        anyhow::ensure!(
+            !profile.is_aggregate(),
+            "microVM aggregate virtio-fs requires one host root per child"
+        );
         profile.validate_root_path(root_path)?;
-        let mut mount_options = LxVolumeOptions::new();
-        mount_options
-            .readonly(profile.is_readonly())
-            .sandbox(true)
-            .confine_paths(true);
-        let volume = mount_options.new_volume(root_path)?;
-        let denied_identities = profile
-            .denied_paths()
-            .iter()
-            .map(|path| {
-                volume
-                    .lstat(path)
-                    .map(|stat| (stat.device_nr, stat.inode_nr))
-            })
-            .collect::<lx::Result<Vec<_>>>()?;
-        let mut inodes = InodeMap::new(false);
-        let volume = Arc::new(VirtioFsVolume::new_with_strict_paths(
-            volume,
-            0,
+        let (_, root_inode, root_stat) = open_microvm_volume(
+            root_path,
             profile.is_readonly(),
-            true,
-            profile.denied_paths().to_vec(),
-            denied_identities,
-        ));
-        let (root_inode, root_stat) = VirtioFsInode::new(Arc::clone(&volume), PathBuf::new())?;
+            profile.subtree_policy(),
+            0,
+            false,
+        )?;
         profile.validate_opened_root(root_path, &root_stat)?;
         let caller_identity = match profile.owner_mode() {
             MicroVmOwnerMode::Vmm => None,
@@ -175,6 +243,7 @@ impl VirtioFs {
                 root_stat.gid,
             )?),
         };
+        let mut inodes = InodeMap::new(false);
         if inodes.insert(root_inode)?.1 != FUSE_ROOT_ID {
             anyhow::bail!("microVM virtio-fs root received an invalid node ID");
         }
@@ -183,6 +252,74 @@ impl VirtioFs {
                 inodes: RwLock::new(inodes),
                 files: RwLock::new(HandleMap::new()),
                 mode: VirtioFsMode::Direct,
+                microvm_profile: Some(profile),
+                caller_identity,
+                negotiation: RwLock::new(FuseNegotiation::default()),
+            }),
+        })
+    }
+
+    /// Creates an aggregate filesystem attachment for the fixed microVM
+    /// profile. Node 1 is a synthetic, read-only directory that only the
+    /// guest's root may enter, and each of `root_paths`, in the order of the
+    /// profile's children, is the child of that name, with the child's own
+    /// access policy: a host directory, or the regular file of a child that
+    /// exposes a file.
+    ///
+    /// Like [`Self::new_microvm`], the paths are consumed only while opening
+    /// the attachment.
+    pub fn new_microvm_aggregate(
+        root_paths: &[impl AsRef<Path>],
+        profile: MicroVmVirtioFsProfile,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            profile.is_aggregate(),
+            "microVM virtio-fs with one host root is not an aggregate"
+        );
+        anyhow::ensure!(
+            root_paths.len() == profile.children().len(),
+            "microVM aggregate virtio-fs requires one host root per child"
+        );
+        let mut children = Vec::with_capacity(root_paths.len());
+        let mut root_owner = None;
+        for (index, (child, root_path)) in profile.children().iter().zip(root_paths).enumerate() {
+            let root_path = root_path.as_ref();
+            child
+                .validate_root_path(root_path)
+                .with_context(|| format!("microVM aggregate child '{}'", child.name()))?;
+            let volume_id = u32::try_from(index + 1).context("too many aggregate children")?;
+            let (volume, _, root_stat) = open_microvm_volume(
+                root_path,
+                child.is_readonly(),
+                child.subtree_policy(),
+                volume_id,
+                child.is_file(),
+            )?;
+            child
+                .validate_opened_root(root_path, &root_stat)
+                .with_context(|| format!("microVM aggregate child '{}'", child.name()))?;
+            // Caller ownership squashes guest root to one host identity, so
+            // every child root must have the same owner.
+            let owner = (root_stat.uid, root_stat.gid);
+            anyhow::ensure!(
+                profile.owner_mode() == MicroVmOwnerMode::Vmm
+                    || root_owner.is_none_or(|root_owner| root_owner == owner),
+                "microVM aggregate caller ownership requires every child root to have the same owner"
+            );
+            root_owner = Some(owner);
+            children.push((child.name().to_owned(), volume));
+        }
+        let caller_identity = match (profile.owner_mode(), root_owner) {
+            (MicroVmOwnerMode::Caller, Some((uid, gid))) => {
+                Some(CallerIdentity::for_export_root_owner(uid, gid)?)
+            }
+            _ => None,
+        };
+        Ok(Self {
+            inner: Arc::new(VirtioFsInner {
+                inodes: RwLock::new(InodeMap::new(true)),
+                files: RwLock::new(HandleMap::new()),
+                mode: VirtioFsMode::Aggregate(AggregateState::with_children(children)),
                 microvm_profile: Some(profile),
                 caller_identity,
                 negotiation: RwLock::new(FuseNegotiation::default()),
@@ -252,12 +389,13 @@ impl VirtioFs {
         volume_id: u32,
         old: &Path,
         new: &Path,
+        exchange: bool,
     ) -> lx::Result<()> {
         if self.is_microvm() {
             self.inner
                 .inodes
                 .read()
-                .preflight_microvm_rename(volume_id, old, new)
+                .preflight_microvm_rename(volume_id, old, new, exchange)
         } else {
             Ok(())
         }
@@ -278,8 +416,8 @@ impl VirtioFs {
             "virtio-fs attachment does not match the microVM profile"
         );
         anyhow::ensure!(
-            self.inner.aggregate().is_none(),
-            "aggregate virtio-fs is not part of the microVM ABI"
+            self.inner.aggregate().is_some() == profile.is_aggregate(),
+            "virtio-fs attachment layout does not match the microVM profile"
         );
 
         let (inodes, node_ids, next_node_id) = {
@@ -400,13 +538,20 @@ impl VirtioFs {
             *self.inner.negotiation.read() == negotiation,
             "FUSE session and filesystem negotiation state disagree"
         );
-        let caller_identity = profile.owner_mode() == MicroVmOwnerMode::Caller;
-        Ok(SavedState {
-            schema_version: if caller_identity {
-                CALLER_IDENTITY_SCHEMA_VERSION
+        let schema_version = schema_version(profile);
+        let policy = profile.subtree_policy();
+        let (denied_paths, allowed_paths, writable_paths) =
+            if schema_version == SUBTREE_POLICY_SCHEMA_VERSION {
+                (
+                    saved_policy_paths(policy.denied_paths()),
+                    saved_policy_paths(policy.allowed_paths()),
+                    saved_policy_paths(policy.writable_paths()),
+                )
             } else {
-                SCHEMA_VERSION
-            },
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+        Ok(SavedState {
+            schema_version,
             attachment_id: profile.attachment_id().to_owned(),
             access_mode: match profile.access_mode() {
                 super::profile::MicroVmAccessMode::ReadOnly => 1,
@@ -426,7 +571,11 @@ impl VirtioFs {
             attachment_root_identity: profile.root_identity().to_vec(),
             maximum_request_size: MAX_FUSE_REQUEST_BYTES as u32,
             dormant: false,
-            caller_identity,
+            caller_identity: profile.owner_mode() == MicroVmOwnerMode::Caller,
+            denied_paths,
+            allowed_paths,
+            writable_paths,
+            aggregate_children: saved_aggregate_children(profile),
         })
     }
 
@@ -443,32 +592,51 @@ impl VirtioFs {
         validate_microvm_state(&state, profile)?;
         let session_state = session_state_from_saved(&state.negotiation)?;
 
-        let current_root = self.get_inode(FUSE_ROOT_ID).map_err(anyhow::Error::from)?;
-        let current_root_stat = current_root
-            .object_stat()
-            .map_err(anyhow::Error::from)
-            .context("restore attachment root cannot be inspected")?;
-        let saved_root = state
-            .inodes
-            .iter()
-            .find(|inode| inode.node_id == FUSE_ROOT_ID)
-            .context("saved state does not contain a root inode")?;
-        validate_identity(&current_root_stat, &saved_root.object_identity)
-            .context("restore attachment root identity does not match")?;
-        let volume = current_root.volume();
+        // The volumes of the attachment, by ID. The root identity of each
+        // aggregate child was checked against the profile, which the saved
+        // state matches, when the attachment was opened.
+        let volumes: HashMap<u32, Arc<VirtioFsVolume>> = match self.inner.aggregate() {
+            Some(aggregate) => aggregate
+                .child_volumes()
+                .into_iter()
+                .map(|volume| (volume.id(), volume))
+                .collect(),
+            None => {
+                let current_root = self.get_inode(FUSE_ROOT_ID).map_err(anyhow::Error::from)?;
+                let current_root_stat = current_root
+                    .object_stat()
+                    .map_err(anyhow::Error::from)
+                    .context("restore attachment root cannot be inspected")?;
+                let saved_root = state
+                    .inodes
+                    .iter()
+                    .find(|inode| inode.node_id == FUSE_ROOT_ID)
+                    .context("saved state does not contain a root inode")?;
+                validate_identity(&current_root_stat, &saved_root.object_identity)
+                    .context("restore attachment root identity does not match")?;
+                HashMap::from([(0, current_root.volume())])
+            }
+        };
 
-        let mut restored_inodes = InodeMap::new(false);
+        let mut restored_inodes = InodeMap::new(profile.is_aggregate());
         let mut node_ids = HashSet::with_capacity(state.inodes.len());
         let mut alias_paths = HashSet::new();
         for saved in &state.inodes {
             anyhow::ensure!(node_ids.insert(saved.node_id), "duplicate saved inode ID");
-            anyhow::ensure!(saved.volume_id == 0, "unexpected saved volume ID");
+            let volume = volumes
+                .get(&saved.volume_id)
+                .context("saved inode belongs to an unknown volume")?;
+            let volume_root = if profile.is_aggregate() {
+                saved.relative_aliases.first().is_some_and(Vec::is_empty)
+            } else {
+                saved.node_id == FUSE_ROOT_ID
+            };
             let mut aliases = Vec::with_capacity(saved.relative_aliases.len());
             let mut first_stat = None;
             for saved_alias in &saved.relative_aliases {
                 let path = super::state::decode_relative_path(saved_alias)?;
                 validate_relative_path(&path, true).map_err(anyhow::Error::from)?;
-                if saved.node_id == FUSE_ROOT_ID {
+                if volume_root {
                     anyhow::ensure!(
                         path.as_os_str().is_empty(),
                         "root inode has a non-root alias"
@@ -480,10 +648,10 @@ impl VirtioFs {
                     );
                 }
                 anyhow::ensure!(
-                    alias_paths.insert(path.clone()),
+                    alias_paths.insert((saved.volume_id, path.clone())),
                     "saved aliases are duplicated or ambiguous"
                 );
-                let stat = validate_reopenable_alias(&volume, &path)
+                let stat = validate_reopenable_alias(volume, &path)
                     .context("saved inode alias cannot be reopened")?;
                 validate_identity(&stat, &saved.object_identity)
                     .context("saved inode identity does not match the attachment")?;
@@ -494,7 +662,7 @@ impl VirtioFs {
             }
             let stat = first_stat.context("saved inode has no reopenable aliases")?;
             let inode =
-                VirtioFsInode::from_saved(Arc::clone(&volume), aliases, saved.lookup_count, &stat)
+                VirtioFsInode::from_saved(Arc::clone(volume), aliases, saved.lookup_count, &stat)
                     .map_err(anyhow::Error::from)?;
             anyhow::ensure!(
                 inode.guest_inode_nr() == saved.guest_inode_id,

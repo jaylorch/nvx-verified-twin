@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "nvx": {
+    "repository": "jaylorch/nvx-verified-twin",
+    "revision": "2266fa593e8b8bd2f0375a61b1626f1a1abce2cb"
+  },
+  "openvmm": {
+    "repository": "microsoft/openvmm",
+    "revision": "3d7512af653717aa9123595e993a56cb8587106a"
+  }
+}

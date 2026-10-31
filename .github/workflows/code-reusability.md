@@ -1,7 +1,7 @@
 ---
 name: code-reusability
-description: Reuse one existing NVX tooling or aci_edge_sandboxes helper at a second call site
-intent: Reduce NVX maintenance cost by reusing one existing internal helper in the tooling or the aci_edge_sandboxes crate at a second proven call site without changing public behavior or repeating rejected work.
+description: Reuse one existing NVX tooling or nvx-rs helper at a second call site
+intent: Reduce NVX maintenance cost by reusing one existing internal helper in the tooling or the nvx-rs crate at a second proven call site without changing public behavior or repeating rejected work.
 on:
   schedule: hourly
   workflow_dispatch:
@@ -59,7 +59,7 @@ A qualifying candidate pairs an existing helper that already has at least one
 caller with a second call site that reimplements the same behavior inline: a
 Python helper in `scripts/nvx.py` or `scripts/nvx_tools/`, a function in one
 allowlisted shell script whose second call site is in the same script, or a
-function in `aci_edge_sandboxes/src/`. Prove that the helper's results, errors,
+function in `nvx-rs/src/`. Prove that the helper's results, errors,
 and messages match the inline code for every input the second site can pass,
 citing both definitions.
 

@@ -36,6 +36,10 @@ cancels an older run when a newer head is synchronized.
 - If a cancelled run's head differs from the current pull-request head and a newer run
   exists, classify it as expected supersession. Report the replacement run and stop
   unless cancellation cleanup itself failed.
+- When the workflow at its head sets `queue: max` for pushes, a `dev` push run waits
+  behind earlier pushes instead of being replaced, so its cancellation is never a
+  supersession. Under earlier workflows, a newer `dev` push replaced the one waiting
+  run.
 - A run started while a pull request was Ready remains active after conversion to
   Draft because `converted_to_draft` is not a workflow trigger. Do not diagnose this
   as the draft guard being ignored.
@@ -86,6 +90,13 @@ and generated artifacts as closely as practical.
   count, metric direction, current sample, and exact baseline window before running
   [nvx-benchmark](../nvx-benchmark/SKILL.md). Never compare different hosts or series
   as a reproduction.
+- A failed `Check Linux benchmark host` or `Check Windows benchmark host` step means
+  that the benchmark runner is no longer the host of its series' history; its error
+  annotation and step summary list every difference. Classify it as an infrastructure
+  change, not a product defect. Accept the new host and reset the series' history
+  only on request, as
+  [Expected benchmark hosts](../../../doc/benchmarks.md#expected-benchmark-hosts)
+  describes.
 
 Do not alter the current checkout merely to reach the run SHA. Use immutable `git show`
 content for inspection and report when exact-SHA execution is unavailable. Do not

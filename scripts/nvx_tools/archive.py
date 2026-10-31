@@ -22,6 +22,13 @@ def _normalize_member(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
     path = PurePosixPath(member.name)
     if "__pycache__" in path.parts or path.suffix in (".pyc", ".pyo"):
         return None
+    for excluded in ReleaseBuildConstants.PROJECT_SOURCE_EXCLUDES:
+        parts = PurePosixPath(excluded.as_posix()).parts
+        if any(
+            path.parts[index : index + len(parts)] == parts
+            for index in range(len(path.parts) - len(parts) + 1)
+        ):
+            return None
     member.uid = 0
     member.gid = 0
     member.uname = ""
@@ -156,7 +163,9 @@ def create_reproducible_release_archive(source: Path, output: Path) -> None:
                     archive.writestr(info, b"")
                 else:
                     with path.open("rb") as source_file:
-                        with archive.open(info, "w") as destination_file:
+                        with archive.open(
+                            info, "w", force_zip64=True
+                        ) as destination_file:
                             shutil.copyfileobj(
                                 source_file,
                                 destination_file,

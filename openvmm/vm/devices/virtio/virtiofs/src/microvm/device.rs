@@ -4,6 +4,7 @@
 //! microVM virtio-fs device construction and dormant-slot save/restore.
 
 use super::profile::MICROVM_REQUEST_QUEUES;
+use super::profile::MicroVmAggregateChild;
 use super::profile::MicroVmOwnerMode;
 use super::profile::MicroVmVirtioFsProfile;
 use super::profile::microvm_mount_tag;
@@ -91,18 +92,39 @@ impl VirtioFsDevice {
         root_identity: Vec<u8>,
         read_only: bool,
         denied_paths: Vec<String>,
+        allowed_paths: Vec<String>,
+        writable_paths: Vec<String>,
         owner_mode: MicroVmOwnerMode,
         root_path: impl AsRef<Path>,
         notify_corruption: Option<Arc<dyn Fn() + Sync + Send>>,
     ) -> anyhow::Result<Self> {
-        let profile = MicroVmVirtioFsProfile::from_attachment(
+        let profile = MicroVmVirtioFsProfile::from_attachment_with_policy(
             stable_id,
             root_identity,
             read_only,
             denied_paths,
+            allowed_paths,
+            writable_paths,
         )?
         .with_owner_mode(owner_mode)?;
         let fs = VirtioFs::new_microvm(root_path, profile.clone())?;
+        Self::new_microvm(driver_source, profile, fs, notify_corruption)
+    }
+
+    /// Creates the fixed no-DAX microVM aggregate device directly from the
+    /// `MicrovmAggregate` resource fields and the process-local host roots of
+    /// its children, in child order.
+    pub fn new_microvm_aggregate(
+        driver_source: &VmTaskDriverSource,
+        stable_id: String,
+        children: Vec<MicroVmAggregateChild>,
+        owner_mode: MicroVmOwnerMode,
+        root_paths: &[impl AsRef<Path>],
+        notify_corruption: Option<Arc<dyn Fn() + Sync + Send>>,
+    ) -> anyhow::Result<Self> {
+        let profile = MicroVmVirtioFsProfile::from_aggregate(stable_id, children)?
+            .with_owner_mode(owner_mode)?;
+        let fs = VirtioFs::new_microvm_aggregate(root_paths, profile.clone())?;
         Self::new_microvm(driver_source, profile, fs, notify_corruption)
     }
 }
@@ -273,7 +295,6 @@ pub(crate) fn device_state_validator(device: &VirtioFsDevice) -> DeviceStateVali
 mod tests {
     use super::*;
     use crate::profile::MICROVM_ATTACHMENT_ID;
-    use crate::profile::MICROVM_SLOTS;
     use crate::profile::microvm_root_identity;
     use chipset_device::io::IoResult;
     use chipset_device::mmio::MmioIntercept;
@@ -298,6 +319,8 @@ mod tests {
             root_identity,
             true,
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             MicroVmOwnerMode::Vmm,
             temporary_directory.path(),
             None,
@@ -314,34 +337,60 @@ mod tests {
     }
 
     #[async_test]
-    async fn microvm_slots_expose_their_own_tags(driver: DefaultDriver) {
+    async fn microvm_slot_exposes_its_tag(driver: DefaultDriver) {
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
-        for (stable_id, tag) in MICROVM_SLOTS {
-            let temporary_directory = tempfile::tempdir().unwrap();
-            let active = VirtioFsDevice::new_microvm_hostfs(
-                &driver_source,
-                stable_id.to_owned(),
-                microvm_root_identity(temporary_directory.path()).unwrap(),
-                false,
-                Vec::new(),
-                MicroVmOwnerMode::Vmm,
-                temporary_directory.path(),
-                None,
-            )
-            .unwrap();
-            let dormant =
-                VirtioFsDevice::new_microvm_dormant(&driver_source, stable_id.to_owned(), None)
-                    .unwrap();
-            for device in [active, dormant] {
-                assert_eq!(&device.config.tag[..tag.len()], tag.as_bytes());
-                assert_eq!(device.config.tag[tag.len()], 0);
-                assert_eq!(device.microvm_attachment_id.as_deref(), Some(stable_id));
-            }
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let active = VirtioFsDevice::new_microvm_hostfs(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            microvm_root_identity(temporary_directory.path()).unwrap(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            MicroVmOwnerMode::Vmm,
+            temporary_directory.path(),
+            None,
+        )
+        .unwrap();
+        let dormant = VirtioFsDevice::new_microvm_dormant(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            None,
+        )
+        .unwrap();
+        let aggregate = VirtioFsDevice::new_microvm_aggregate(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            vec![
+                MicroVmAggregateChild::new(
+                    "0".to_owned(),
+                    microvm_root_identity(temporary_directory.path()).unwrap(),
+                    true,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            ],
+            MicroVmOwnerMode::Vmm,
+            &[temporary_directory.path()],
+            None,
+        )
+        .unwrap();
+        for device in [active, dormant, aggregate] {
+            assert_eq!(&device.config.tag[..8], b"microvm\0");
+            assert_eq!(
+                device.microvm_attachment_id.as_deref(),
+                Some(MICROVM_ATTACHMENT_ID)
+            );
         }
-        assert!(
-            VirtioFsDevice::new_microvm_dormant(&driver_source, "fs:microvm2".to_owned(), None)
-                .is_err()
-        );
+        for stable_id in ["fs:microvm1", "fs:microvm2"] {
+            assert!(
+                VirtioFsDevice::new_microvm_dormant(&driver_source, stable_id.to_owned(), None)
+                    .is_err()
+            );
+        }
     }
 
     #[async_test]
@@ -378,12 +427,86 @@ mod tests {
             microvm_root_identity(root.path()).unwrap(),
             false,
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             MicroVmOwnerMode::Vmm,
             root.path(),
             None,
         )
         .unwrap();
         destination.restore_device(Some(state)).unwrap();
+    }
+
+    #[async_test]
+    async fn microvm_dormant_state_restores_into_aggregate_attachment(driver: DefaultDriver) {
+        use crate::microvm::saved_state::SAVED_DIRECTORY_CHILD;
+        use crate::microvm::saved_state::SAVED_FILE_CHILD;
+        use crate::profile::microvm_file_identity;
+
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let mut source = VirtioFsDevice::new_microvm_dormant(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            None,
+        )
+        .unwrap();
+        source.quiesce_input().await.unwrap();
+        let state = source.save_device().unwrap().unwrap();
+
+        // The slot that a capture left dormant takes an aggregate of a
+        // read-write directory and a read-only file, as a cold boot's would.
+        let work = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let settings = files.path().join("settings.json");
+        std::fs::write(&settings, b"{}").unwrap();
+        let mut destination = VirtioFsDevice::new_microvm_aggregate(
+            &driver_source,
+            MICROVM_ATTACHMENT_ID.to_owned(),
+            vec![
+                MicroVmAggregateChild::new(
+                    "work".to_owned(),
+                    microvm_root_identity(work.path()).unwrap(),
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap(),
+                MicroVmAggregateChild::new_file(
+                    "settings".to_owned(),
+                    microvm_file_identity(&settings).unwrap(),
+                    true,
+                )
+                .unwrap(),
+            ],
+            MicroVmOwnerMode::Vmm,
+            &[work.path(), settings.as_path()],
+            None,
+        )
+        .unwrap();
+        destination.restore_device(Some(state)).unwrap();
+
+        // From then on, the device saves the aggregate rather than the
+        // dormant slot.
+        destination.quiesce_input().await.unwrap();
+        let saved = destination
+            .save_device()
+            .unwrap()
+            .unwrap()
+            .parse::<SavedState>()
+            .unwrap();
+        assert!(!saved.dormant);
+        assert_eq!(
+            saved
+                .aggregate_children
+                .iter()
+                .map(|child| (child.name.as_str(), child.kind, child.access_mode))
+                .collect::<Vec<_>>(),
+            [
+                ("work", SAVED_DIRECTORY_CHILD, 2),
+                ("settings", SAVED_FILE_CHILD, 1),
+            ]
+        );
     }
 
     #[async_test]
@@ -395,6 +518,8 @@ mod tests {
             MICROVM_ATTACHMENT_ID.to_owned(),
             microvm_root_identity(root.path()).unwrap(),
             false,
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             MicroVmOwnerMode::Vmm,
             root.path(),
@@ -467,6 +592,8 @@ mod tests {
             MICROVM_ATTACHMENT_ID.to_owned(),
             microvm_root_identity(root.path()).unwrap(),
             false,
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             MicroVmOwnerMode::Vmm,
             root.path(),

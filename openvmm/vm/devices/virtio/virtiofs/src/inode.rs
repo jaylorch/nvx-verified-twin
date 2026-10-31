@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::file::VirtioFsFile;
+use crate::microvm::policy::SubtreePolicy;
 use crate::util;
 use fuse::protocol::*;
 use lx::LxStr;
@@ -11,6 +12,7 @@ use lxutil::LxVolume;
 use lxutil::PathBufExt;
 use parking_lot::RwLock;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
@@ -44,8 +46,15 @@ pub(crate) struct VirtioFsVolume {
     pub(crate) id: u32,
     pub(crate) readonly: bool,
     pub(crate) strict_paths: bool,
-    pub(crate) denied_paths: Vec<PathBuf>,
-    pub(crate) denied_identities: Vec<(u64, u64)>,
+    pub(crate) policy: SubtreePolicy,
+    /// Host objects of the policy's hidden paths, by device and inode number,
+    /// with the only path at which the guest may reach each, if any.
+    pub(crate) pinned_identities: HashMap<(u64, u64), Option<PathBuf>>,
+    /// The name of the regular file of the volume's host directory that a
+    /// microVM aggregate's file child exposes, which is then the volume's root
+    /// object and the only object that the guest can reach, or `None` when the
+    /// volume's root object is its directory.
+    pub(crate) exposed_file: Option<PathBuf>,
 }
 
 impl VirtioFsVolume {
@@ -55,8 +64,9 @@ impl VirtioFsVolume {
             id,
             readonly,
             strict_paths: false,
-            denied_paths: Vec::new(),
-            denied_identities: Vec::new(),
+            policy: SubtreePolicy::default(),
+            pinned_identities: HashMap::new(),
+            exposed_file: None,
         }
     }
 
@@ -66,6 +76,18 @@ impl VirtioFsVolume {
 
     pub(crate) fn readonly(&self) -> bool {
         self.readonly
+    }
+
+    /// Returns the name of the regular file that the volume exposes alone, if
+    /// it exposes one rather than its directory.
+    pub(crate) fn exposed_file(&self) -> Option<&Path> {
+        self.exposed_file.as_deref()
+    }
+
+    /// Returns the path of the volume's root object relative to its host
+    /// directory: the exposed file's name, or the empty path of the directory.
+    pub(crate) fn root_entry(&self) -> &Path {
+        self.exposed_file().unwrap_or(Path::new(""))
     }
 
     pub(crate) fn map_inode(&self, raw: lx::ino_t) -> lx::ino_t {
@@ -113,7 +135,7 @@ impl VirtioFsInode {
     /// Create a new inode for the specified path.
     pub fn new(volume: Arc<VirtioFsVolume>, path: PathBuf) -> lx::Result<(Self, lx::Stat)> {
         let stat = volume.lstat(&path)?;
-        volume.ensure_identity_allowed(&stat)?;
+        volume.ensure_object_allowed(&path, &stat)?;
         let inode = Self::with_attr(volume, path, &stat);
         Ok((inode, stat))
     }
@@ -145,9 +167,10 @@ impl VirtioFsInode {
         self.volume.id()
     }
 
-    /// Whether this inode's volume is read-only.
+    /// Whether this inode is read-only: its volume is, or the volume's access
+    /// policy does not let the guest modify it through every path it knows.
     pub fn readonly(&self) -> bool {
-        self.volume.readonly()
+        self.volume.readonly() || !self.policy_permits_writes()
     }
 
     /// This inode's own number as reported to the guest: its namespaced inode
@@ -496,6 +519,19 @@ impl VirtioFsInode {
         }
     }
 
+    /// Swaps two alias prefixes after a successful `RENAME_EXCHANGE`.
+    pub(crate) fn exchange_alias_prefixes(&self, first: &Path, second: &Path) {
+        let mut aliases = self.aliases.write();
+        *aliases = aliases
+            .iter()
+            .map(|alias| exchanged_path(alias, first, second))
+            .collect();
+        drop(aliases);
+
+        let mut path = self.path.write();
+        *path = exchanged_path(&path, first, second);
+    }
+
     /// The key used to deduplicate this inode in the `InodeMap`, so that
     /// repeated lookups of the same host file return one stable FUSE node id.
     ///
@@ -548,4 +584,16 @@ pub(crate) fn renamed_path(new: &Path, suffix: &Path) -> PathBuf {
         path.push(suffix);
     }
     path
+}
+
+/// Returns `path` after a `RENAME_EXCHANGE` of `first` and `second`, which
+/// swaps the objects at and below the two names.
+pub(crate) fn exchanged_path(path: &Path, first: &Path, second: &Path) -> PathBuf {
+    if let Ok(suffix) = path.strip_prefix(first) {
+        renamed_path(second, suffix)
+    } else if let Ok(suffix) = path.strip_prefix(second) {
+        renamed_path(first, suffix)
+    } else {
+        path.to_path_buf()
+    }
 }

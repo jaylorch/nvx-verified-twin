@@ -11,15 +11,63 @@ use std::path::PathBuf;
 pub(super) const MICROVM_FILESYSTEM_STABLE_ID: &str =
     openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0].stable_id;
 
+/// The largest combined size, in bytes, of the canonical host paths of an
+/// aggregate's children, which bounds the aggregate's snapshot contract.
+const MAX_AGGREGATE_ROOT_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug)]
 pub(super) struct EffectiveMicrovmFilesystem {
     pub(super) config: openvmm_defs::microvm::MicrovmFilesystemConfig,
+    /// The canonical host root of a single directory; empty for an aggregate.
     pub(super) root_path: String,
+    /// The live attachment of the filesystem's device.
     pub(super) attachment: openvmm_helpers::snapshot::microvm::SnapshotAttachment,
+    /// The canonical host roots and live root attachments of an aggregate's
+    /// children, in child order.
+    pub(super) children: Vec<(
+        String,
+        openvmm_helpers::snapshot::microvm::SnapshotAttachment,
+    )>,
 }
 
+/// The microVM filesystem that the command line requests.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum MicrovmFilesystemRequest<'a> {
+    /// One host directory, from `--mount`.
+    Single(&'a cli_args::microvm::MicrovmMountCli),
+    /// Several host directories or regular files, from `--mount-aggregate` and
+    /// `--mount-child`.
+    Aggregate {
+        guest_target: &'a str,
+        children: &'a [cli_args::microvm::MicrovmMountChildCli],
+    },
+}
+
+impl<'a> MicrovmFilesystemRequest<'a> {
+    /// Returns the filesystem that `options` requests, if any.
+    pub(super) fn from_options(options: &'a crate::Options) -> Option<Self> {
+        if let Some(mount) = &options.microvm.microvm_mount {
+            Some(Self::Single(mount))
+        } else {
+            options
+                .microvm
+                .microvm_mount_aggregate
+                .as_deref()
+                .map(|guest_target| Self::Aggregate {
+                    guest_target,
+                    children: &options.microvm.microvm_mount_child,
+                })
+        }
+    }
+}
+
+/// Resolves the host path of a microVM filesystem root, which must be of
+/// `kind`: a plain directory, or a regular file that an aggregate child
+/// exposes. Returns its canonical path and its identity, with the identity's
+/// kind.
 fn canonical_microvm_filesystem_root(
     path: &Path,
+    kind: openvmm_defs::microvm::MicrovmFilesystemChildKind,
 ) -> anyhow::Result<(PathBuf, &'static str, Vec<u8>)> {
     anyhow::ensure!(
         !path.as_os_str().is_empty(),
@@ -79,11 +127,20 @@ fn canonical_microvm_filesystem_root(
             canonical.display()
         )
     })?;
-    anyhow::ensure!(
-        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
-        "microVM filesystem root is not a plain directory: {}",
-        canonical.display()
-    );
+    // The requested kind, not the one found, decides what the child exposes,
+    // so a file replaced by a directory is not exported in its place.
+    match kind {
+        openvmm_defs::microvm::MicrovmFilesystemChildKind::Directory => anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "microVM filesystem root is not a plain directory: {}",
+            canonical.display()
+        ),
+        openvmm_defs::microvm::MicrovmFilesystemChildKind::File => anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "microVM filesystem root is not a regular file: {}",
+            canonical.display()
+        ),
+    }
 
     #[cfg(unix)]
     let (identity_kind, identity) = {
@@ -131,9 +188,14 @@ fn canonical_microvm_filesystem_root(
     Ok((canonical, identity_kind, identity))
 }
 
-fn canonical_microvm_filesystem_denied_paths(
+/// Resolves the host paths that one of `--mount-deny`, `--mount-allow`, or
+/// `--mount-write` requests in the export root `root_path` to unique, canonical
+/// relative paths in lexical order. Each must exist inside the export root, on
+/// its filesystem, and be reachable without a symbolic link.
+fn canonical_microvm_filesystem_policy_paths(
     root_path: &Path,
     requested: &[PathBuf],
+    kind: openvmm_defs::microvm::MicrovmFilesystemPathKind,
 ) -> anyhow::Result<Vec<String>> {
     #[cfg(unix)]
     let root_metadata = fs_err::symlink_metadata(root_path).with_context(|| {
@@ -143,99 +205,108 @@ fn canonical_microvm_filesystem_denied_paths(
         )
     })?;
     let mut relative_paths = Vec::with_capacity(requested.len());
-    for denied in requested {
+    for path in requested {
         anyhow::ensure!(
-            !denied.as_os_str().is_empty()
-                && !denied.components().any(|component| matches!(
+            !path.as_os_str().is_empty()
+                && !path.components().any(|component| matches!(
                     component,
                     std::path::Component::CurDir | std::path::Component::ParentDir
                 )),
-            "microVM denied path is empty or contains a dot or parent component: {}",
-            denied.display()
+            "microVM {kind} path is empty or contains a dot or parent component: {}",
+            path.display()
         );
-        let absolute = if denied.is_absolute() {
-            denied.clone()
+        let absolute = if path.is_absolute() {
+            path.clone()
         } else {
-            root_path.join(denied)
+            root_path.join(path)
         };
         let canonical = fs_err::canonicalize(&absolute).with_context(|| {
             format!(
-                "failed to canonicalize microVM denied path {}",
+                "failed to canonicalize microVM {kind} path {}",
                 absolute.display()
             )
         })?;
-        let relative = canonical.strip_prefix(root_path).with_context(|| {
-            format!(
-                "microVM denied path resolves outside the filesystem export root: {}",
-                denied.display()
-            )
-        })?;
-        anyhow::ensure!(
-            !relative.as_os_str().is_empty(),
-            "microVM denied path cannot hide the complete filesystem export"
-        );
-
-        let mut current = root_path.to_owned();
-        for component in relative.components() {
-            let std::path::Component::Normal(component) = component else {
-                anyhow::bail!("microVM denied path contains a non-normal component");
-            };
-            current.push(component);
+        // Canonicalizing resolves links, so inspect the requested path itself.
+        let mut current = PathBuf::new();
+        for component in absolute.components() {
+            current.push(component.as_os_str());
+            if !matches!(component, std::path::Component::Normal(_)) {
+                continue;
+            }
             let metadata = fs_err::symlink_metadata(&current).with_context(|| {
                 format!(
-                    "failed to inspect microVM denied path component {}",
+                    "failed to inspect microVM {kind} path component {}",
                     current.display()
                 )
             })?;
             anyhow::ensure!(
                 !metadata.file_type().is_symlink(),
-                "microVM denied path component is a symbolic link: {}",
+                "microVM {kind} path component is a symbolic link: {}",
                 current.display()
             );
             #[cfg(windows)]
             anyhow::ensure!(
                 std::os::windows::fs::MetadataExt::file_attributes(&metadata) & 0x400 == 0,
-                "microVM denied path component is a reparse point: {}",
+                "microVM {kind} path component is a reparse point: {}",
                 current.display()
             );
         }
+        let relative = canonical.strip_prefix(root_path).with_context(|| {
+            format!(
+                "microVM {kind} path resolves outside the filesystem export root: {}",
+                path.display()
+            )
+        })?;
+        // A denied root hides everything but the allowed paths inside it.
+        anyhow::ensure!(
+            !relative.as_os_str().is_empty()
+                || kind == openvmm_defs::microvm::MicrovmFilesystemPathKind::Denied,
+            "microVM {kind} path cannot be the complete filesystem export"
+        );
+        anyhow::ensure!(
+            relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "microVM {kind} path contains a non-normal component"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            let denied_metadata = fs_err::symlink_metadata(&canonical)?;
+            let metadata = fs_err::symlink_metadata(&canonical)?;
             anyhow::ensure!(
-                denied_metadata.dev() == root_metadata.dev(),
-                "microVM denied path crosses a nested mount: {}",
-                denied.display()
+                metadata.dev() == root_metadata.dev(),
+                "microVM {kind} path crosses a nested mount: {}",
+                path.display()
             );
         }
         relative_paths.push(relative.to_owned());
     }
-    relative_paths.sort_unstable();
-    for pair in relative_paths.windows(2) {
-        anyhow::ensure!(
-            pair[0] != pair[1] && !pair[1].starts_with(&pair[0]),
-            "microVM denied paths must be unique and non-overlapping"
-        );
-    }
-    let encoded = relative_paths
+    let mut encoded = relative_paths
         .iter()
         .map(|path| {
             path.iter()
                 .map(|component| {
                     component
                         .to_str()
-                        .context("microVM denied path is not valid UTF-8")
+                        .with_context(|| format!("microVM {kind} path is not valid UTF-8"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
                 .map(|components| components.join("/"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    openvmm_defs::microvm::MicrovmFilesystemConfig::new(
-        "/unused".to_owned(),
-        openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly,
-    )?
-    .with_denied_paths(encoded.clone())?;
+    // The snapshot contract records the paths in lexical order.
+    encoded.sort_unstable();
+    for pair in encoded.windows(2) {
+        anyhow::ensure!(
+            pair[0] != pair[1],
+            "microVM {kind} paths must be unique{}",
+            match kind {
+                openvmm_defs::microvm::MicrovmFilesystemPathKind::Allowed => "",
+                _ => " and non-overlapping",
+            }
+        );
+    }
+    openvmm_defs::microvm::validate_microvm_filesystem_policy_paths(kind, &encoded)?;
     Ok(encoded)
 }
 
@@ -248,7 +319,25 @@ pub(crate) fn microvm_filesystem_attachment(
     String,
     openvmm_helpers::snapshot::microvm::SnapshotAttachment,
 )> {
-    let (canonical, identity_kind, identity) = canonical_microvm_filesystem_root(host_path)?;
+    microvm_filesystem_object_attachment(
+        host_path,
+        slot,
+        openvmm_defs::microvm::MicrovmFilesystemChildKind::Directory,
+    )
+}
+
+/// Returns the canonical host path of `host_path`, which must be of `kind`, a
+/// directory or a regular file, with its live attachment identity in the
+/// virtio-fs slot `slot`.
+fn microvm_filesystem_object_attachment(
+    host_path: &Path,
+    slot: &openvmm_defs::microvm::MicrovmFilesystemSlot,
+    kind: openvmm_defs::microvm::MicrovmFilesystemChildKind,
+) -> anyhow::Result<(
+    String,
+    openvmm_helpers::snapshot::microvm::SnapshotAttachment,
+)> {
+    let (canonical, identity_kind, identity) = canonical_microvm_filesystem_root(host_path, kind)?;
     let root_path = canonical
         .to_str()
         .context("microVM filesystem host path is not valid UTF-8")?
@@ -268,39 +357,125 @@ pub(crate) fn microvm_filesystem_attachment(
     ))
 }
 
+/// The host paths that `--mount-deny`, `--mount-allow`, and `--mount-write`
+/// request, each in the `--mount` whose host directory contains it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MicrovmFilesystemPolicyPaths<'a> {
+    /// Paths hidden from the guest.
+    pub(crate) denied: &'a [PathBuf],
+    /// Paths inside denied paths that the guest can reach again.
+    pub(crate) allowed: &'a [PathBuf],
+    /// The only paths of a read-write export that the guest can modify.
+    pub(crate) writable: &'a [PathBuf],
+}
+
 /// Builds the filesystem of `requested` in its canonical host root, with the
-/// denied paths that `--mount-deny` attributed to it.
+/// access policy that `--mount-deny`, `--mount-allow`, and `--mount-write`
+/// attributed to it.
 fn microvm_filesystem_from_root(
     requested: &cli_args::microvm::MicrovmMountCli,
     (root_path, attachment): (
         String,
         openvmm_helpers::snapshot::microvm::SnapshotAttachment,
     ),
-    denied_paths: &[PathBuf],
+    policy: MicrovmFilesystemPolicyPaths<'_>,
     owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
 ) -> anyhow::Result<EffectiveMicrovmFilesystem> {
+    use openvmm_defs::microvm::MicrovmFilesystemPathKind;
+
     if owner.is_caller() {
         validate_caller_owned_root(Path::new(&root_path))?;
     }
-    let denied_paths =
-        canonical_microvm_filesystem_denied_paths(Path::new(&root_path), denied_paths)?;
+    let root = Path::new(&root_path);
     let config = openvmm_defs::microvm::MicrovmFilesystemConfig::new(
         requested.guest_target.clone(),
         requested.access,
     )?
-    .with_denied_paths(denied_paths)?
+    .with_access_policy(
+        canonical_microvm_filesystem_policy_paths(
+            root,
+            policy.denied,
+            MicrovmFilesystemPathKind::Denied,
+        )?,
+        canonical_microvm_filesystem_policy_paths(
+            root,
+            policy.allowed,
+            MicrovmFilesystemPathKind::Allowed,
+        )?,
+        canonical_microvm_filesystem_policy_paths(
+            root,
+            policy.writable,
+            MicrovmFilesystemPathKind::Writable,
+        )?,
+    )?
     .with_owner(owner);
     Ok(EffectiveMicrovmFilesystem {
         config,
         root_path,
         attachment,
+        children: Vec::new(),
     })
+}
+
+/// Builds the aggregate child `requested` in its canonical host root, a
+/// directory or, by the request's kind, a regular file, with the access
+/// policy that `--mount-deny`, `--mount-allow`, and `--mount-write`
+/// attributed to it. A child that exposes a file takes no policy paths: its
+/// mode applies to the whole file.
+fn microvm_filesystem_child_from_root(
+    requested: &cli_args::microvm::MicrovmMountChildCli,
+    root_path: &str,
+    policy: MicrovmFilesystemPolicyPaths<'_>,
+    owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
+) -> anyhow::Result<openvmm_defs::microvm::MicrovmFilesystemChildConfig> {
+    use openvmm_defs::microvm::MicrovmFilesystemPathKind;
+
+    if owner.is_caller() {
+        validate_caller_owned_root(Path::new(root_path))?;
+    }
+    if requested.kind == openvmm_defs::microvm::MicrovmFilesystemChildKind::File {
+        anyhow::ensure!(
+            policy.denied.is_empty() && policy.allowed.is_empty() && policy.writable.is_empty(),
+            "--mount-child {} exposes the file {root_path}, which no --mount-deny, --mount-allow, or --mount-write path may name; its mode applies to the whole file",
+            requested.name
+        );
+        return Ok(
+            openvmm_defs::microvm::MicrovmFilesystemChildConfig::new_file(
+                requested.name.clone(),
+                requested.access,
+            )?,
+        );
+    }
+    let root = Path::new(root_path);
+    openvmm_defs::microvm::MicrovmFilesystemChildConfig::new(
+        requested.name.clone(),
+        requested.access,
+    )?
+    .with_access_policy(
+        canonical_microvm_filesystem_policy_paths(
+            root,
+            policy.denied,
+            MicrovmFilesystemPathKind::Denied,
+        )?,
+        canonical_microvm_filesystem_policy_paths(
+            root,
+            policy.allowed,
+            MicrovmFilesystemPathKind::Allowed,
+        )?,
+        canonical_microvm_filesystem_policy_paths(
+            root,
+            policy.writable,
+            MicrovmFilesystemPathKind::Writable,
+        )?,
+    )
+    .with_context(|| format!("invalid policy of --mount-child {}", requested.name))
 }
 
 /// Rejects host roots that overlap, so that no share can reach the files of
 /// another share, or the paths that another share denies, under a different
-/// access policy. Equal root identities catch one directory reached through
-/// two canonical paths, such as a bind mount.
+/// access policy. Equal root identities catch one directory or file reached
+/// through two canonical paths, such as a bind mount or a hard link. A
+/// regular file overlaps only a directory that contains it.
 fn validate_microvm_filesystem_roots(
     roots: &[(
         String,
@@ -313,7 +488,7 @@ fn validate_microvm_filesystem_roots(
                 !Path::new(root).starts_with(other)
                     && !Path::new(other).starts_with(root)
                     && attachment.identity != other_attachment.identity,
-                "microVM filesystem host directories must not overlap: {other} and {root}"
+                "microVM filesystem host paths must not overlap: {other} and {root}"
             );
         }
     }
@@ -426,7 +601,8 @@ mod mount_sources {
         Ok(sources)
     }
 
-    /// Rejects canonical roots that reach a common directory of a filesystem.
+    /// Rejects canonical roots that reach a common file or directory of a
+    /// filesystem.
     pub(super) fn validate_disjoint(mountinfo: &str, roots: &[&Path]) -> anyhow::Result<()> {
         let mounts = parse(mountinfo)?;
         let sources = roots
@@ -439,7 +615,7 @@ mod mount_sources {
                     !root_sources
                         .iter()
                         .any(|source| other_sources.iter().any(|other| source.overlaps(other))),
-                    "microVM filesystem host directories must not overlap: {} and {} reach the same files through a mount",
+                    "microVM filesystem host paths must not overlap: {} and {} reach the same files through a mount",
                     roots[other_index].display(),
                     roots[index].display()
                 );
@@ -517,70 +693,159 @@ mod mount_sources {
     }
 }
 
-/// Builds the filesystems of the `--mount` options, which occupy the fixed
-/// virtio-fs slots in order. Each `--mount-deny` applies to the export root
-/// that contains it; a relative path is relative to the only export root.
-fn microvm_filesystems_from_mounts(
-    requested: &[cli_args::microvm::MicrovmMountCli],
-    denied_paths: &[PathBuf],
-    owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
-) -> anyhow::Result<Vec<EffectiveMicrovmFilesystem>> {
-    let slots = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS;
-    anyhow::ensure!(
-        requested.len() <= slots.len(),
-        openvmm_defs::microvm::InvalidMicrovmFilesystemConfig::TooManyFilesystems
-    );
-    let roots = requested
-        .iter()
-        .zip(slots)
-        .map(|(mount, slot)| microvm_filesystem_attachment(&mount.host_path, slot))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    validate_microvm_filesystem_roots(&roots)?;
-
+/// Attributes the host paths of one access-policy option to the export roots
+/// that contain them: every path to the root of a single directory, which
+/// resolves a relative path, or each absolute path to the aggregate child
+/// whose root contains it.
+fn attribute_microvm_filesystem_policy_paths(
+    roots: &[(
+        String,
+        openvmm_helpers::snapshot::microvm::SnapshotAttachment,
+    )],
+    aggregate: bool,
+    requested: &[PathBuf],
+    option: &str,
+    kind: openvmm_defs::microvm::MicrovmFilesystemPathKind,
+) -> anyhow::Result<Vec<Vec<PathBuf>>> {
     let mut attributed = vec![Vec::new(); roots.len()];
-    match roots.len() {
-        0 => anyhow::ensure!(denied_paths.is_empty(), "--mount-deny requires --mount"),
-        1 => attributed[0].extend_from_slice(denied_paths),
-        _ => {
-            for denied in denied_paths {
-                anyhow::ensure!(
-                    denied.is_absolute(),
-                    "with several --mount options, --mount-deny requires an absolute host path: {}",
-                    denied.display()
+    if !aggregate {
+        anyhow::ensure!(
+            roots.len() == 1 || requested.is_empty(),
+            "{option} requires --mount or --mount-aggregate"
+        );
+        if let Some(paths) = attributed.first_mut() {
+            paths.extend_from_slice(requested);
+        }
+        return Ok(attributed);
+    }
+    for path in requested {
+        anyhow::ensure!(
+            path.is_absolute(),
+            "with --mount-aggregate, {option} requires an absolute host path: {}",
+            path.display()
+        );
+        let canonical = fs_err::canonicalize(path).with_context(|| {
+            format!(
+                "failed to canonicalize microVM {kind} path {}",
+                path.display()
+            )
+        })?;
+        let index = roots
+            .iter()
+            .position(|(root, _)| canonical.starts_with(root))
+            .with_context(|| {
+                format!(
+                    "microVM {kind} path resolves outside the filesystem export roots: {}",
+                    path.display()
+                )
+            })?;
+        attributed[index].push(path.clone());
+    }
+    Ok(attributed)
+}
+
+/// Builds the filesystem that `request` describes. Each `--mount-deny`,
+/// `--mount-allow`, and `--mount-write` path applies to the export root that
+/// contains it: the `--mount` root, against which a relative path resolves,
+/// or the root of the `--mount-child` that contains the absolute path.
+fn microvm_filesystem_from_request(
+    request: MicrovmFilesystemRequest<'_>,
+    policy: MicrovmFilesystemPolicyPaths<'_>,
+    owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
+) -> anyhow::Result<EffectiveMicrovmFilesystem> {
+    use openvmm_defs::microvm::MicrovmFilesystemPathKind;
+
+    let slot = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0];
+    let (aggregate, roots) = match request {
+        MicrovmFilesystemRequest::Single(mount) => (
+            false,
+            vec![microvm_filesystem_attachment(&mount.host_path, slot)?],
+        ),
+        MicrovmFilesystemRequest::Aggregate { children, .. } => (
+            true,
+            children
+                .iter()
+                .map(|child| {
+                    microvm_filesystem_object_attachment(&child.host_path, slot, child.kind)
+                        .with_context(|| format!("invalid --mount-child {}", child.name))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ),
+    };
+    validate_microvm_filesystem_roots(&roots)?;
+    let attribute = |requested, option, kind| {
+        attribute_microvm_filesystem_policy_paths(&roots, aggregate, requested, option, kind)
+    };
+    let denied = attribute(
+        policy.denied,
+        "--mount-deny",
+        MicrovmFilesystemPathKind::Denied,
+    )?;
+    let allowed = attribute(
+        policy.allowed,
+        "--mount-allow",
+        MicrovmFilesystemPathKind::Allowed,
+    )?;
+    let writable = attribute(
+        policy.writable,
+        "--mount-write",
+        MicrovmFilesystemPathKind::Writable,
+    )?;
+    let policy = |index: usize| MicrovmFilesystemPolicyPaths {
+        denied: &denied[index],
+        allowed: &allowed[index],
+        writable: &writable[index],
+    };
+
+    match request {
+        MicrovmFilesystemRequest::Single(mount) => {
+            let root = roots.into_iter().next().context("--mount has no root")?;
+            microvm_filesystem_from_root(mount, root, policy(0), owner)
+        }
+        MicrovmFilesystemRequest::Aggregate {
+            guest_target,
+            children,
+        } => {
+            anyhow::ensure!(
+                roots.iter().map(|(root, _)| root.len()).sum::<usize>() <= MAX_AGGREGATE_ROOT_BYTES,
+                "the host paths of the --mount-child options exceed {MAX_AGGREGATE_ROOT_BYTES} bytes"
+            );
+            let child_configs = children
+                .iter()
+                .zip(&roots)
+                .enumerate()
+                .map(|(index, (child, (root, _)))| {
+                    microvm_filesystem_child_from_root(child, root, policy(index), owner)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let config = openvmm_defs::microvm::MicrovmFilesystemConfig::new_aggregate(
+                guest_target.to_owned(),
+                child_configs,
+            )?
+            .with_owner(owner);
+            let attachment =
+                openvmm_helpers::snapshot::microvm::microvm_filesystem_aggregate_attachment(
+                    slot.stable_id,
+                    config
+                        .children
+                        .iter()
+                        .zip(&roots)
+                        .map(|(child, (_, attachment))| {
+                            (
+                                child.name.as_str(),
+                                attachment.identity_kind.as_str(),
+                                attachment.identity.as_slice(),
+                            )
+                        }),
                 );
-                let canonical = fs_err::canonicalize(denied).with_context(|| {
-                    format!(
-                        "failed to canonicalize microVM denied path {}",
-                        denied.display()
-                    )
-                })?;
-                let index = roots
-                    .iter()
-                    .position(|(root, _)| canonical.starts_with(root))
-                    .with_context(|| {
-                        format!(
-                            "microVM denied path resolves outside the filesystem export roots: {}",
-                            denied.display()
-                        )
-                    })?;
-                attributed[index].push(denied.clone());
-            }
+            Ok(EffectiveMicrovmFilesystem {
+                config,
+                root_path: String::new(),
+                attachment,
+                children: roots,
+            })
         }
     }
-
-    let filesystems = requested
-        .iter()
-        .zip(roots)
-        .zip(&attributed)
-        .map(|((mount, root), denied)| microvm_filesystem_from_root(mount, root, denied, owner))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    openvmm_defs::microvm::validate_microvm_filesystems(
-        &filesystems
-            .iter()
-            .map(|filesystem| filesystem.config.clone())
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(filesystems)
 }
 
 /// Rejects an export root that caller ownership cannot squash guest root to.
@@ -661,21 +926,7 @@ pub(crate) fn validate_microvm_filesystem_private_storage(
 pub(crate) fn microvm_filesystem_from_snapshot(
     saved: &openvmm_helpers::snapshot::microvm::SnapshotMicrovmFilesystem,
 ) -> anyhow::Result<openvmm_defs::microvm::MicrovmFilesystemConfig> {
-    let access = match saved.access_mode.as_str() {
-        "ro" => openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly,
-        "rw" => openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite,
-        mode => anyhow::bail!("snapshot microVM filesystem access mode '{mode}' is unsupported"),
-    };
-    openvmm_defs::microvm::MicrovmFilesystemConfig::new(saved.guest_mount_target.clone(), access)?
-        .with_denied_paths(saved.denied_paths.clone())
-        .context("snapshot microVM filesystem policy is invalid")
-        .and_then(|config| {
-            Ok(config.with_owner(
-                openvmm_helpers::snapshot::microvm::snapshot_microvm_filesystem_owner(
-                    &saved.owner_mode,
-                )?,
-            ))
-        })
+    openvmm_helpers::snapshot::microvm::snapshot_microvm_filesystem_config(saved)
 }
 
 pub(crate) fn microvm_filesystem_slot_from_snapshot(
@@ -700,18 +951,21 @@ pub(crate) fn microvm_filesystem_slot_from_snapshot(
     }
 }
 
-/// Returns the effective filesystems of the `--mount` options, in virtio-fs
-/// slot order. A restore must supply exactly the snapshot's filesystems, in
-/// the same order, unless the snapshot's first slot is dormant, in which case
-/// one `--mount` may bind a new filesystem to it.
-pub(super) fn effective_microvm_filesystems(
-    requested: &[cli_args::microvm::MicrovmMountCli],
-    denied_paths: &[PathBuf],
+/// Returns the effective filesystem that `request` attaches. A restore must
+/// supply exactly the snapshot's filesystem, unless the snapshot's slot is
+/// dormant, in which case the restore may bind a new filesystem to it, which
+/// it validates as a cold boot does: one `--mount`, or, at the restore of a
+/// platform snapshot, which `prepare_restore` checks, an aggregate.
+pub(super) fn effective_microvm_filesystem(
+    request: Option<MicrovmFilesystemRequest<'_>>,
+    policy: MicrovmFilesystemPolicyPaths<'_>,
     owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
     restore: Option<&openvmm_helpers::snapshot::microvm::SnapshotMachineContract>,
-) -> anyhow::Result<Vec<EffectiveMicrovmFilesystem>> {
+) -> anyhow::Result<Option<EffectiveMicrovmFilesystem>> {
     let Some(restore) = restore else {
-        return microvm_filesystems_from_mounts(requested, denied_paths, owner);
+        return request
+            .map(|request| microvm_filesystem_from_request(request, policy, owner))
+            .transpose();
     };
 
     let has_device = microvm_filesystem_slot_from_snapshot(restore)?;
@@ -726,51 +980,68 @@ pub(super) fn effective_microvm_filesystems(
                 || has_device == restore.microvm_filesystem.is_some()),
         "snapshot microVM filesystem slot, policy, and attachment inventories disagree"
     );
-    let saved = restore.microvm_filesystems().collect::<Vec<_>>();
-    if saved.is_empty() {
-        if requested.is_empty() {
-            return Ok(Vec::new());
-        }
+    let Some(saved) = &restore.microvm_filesystem else {
+        let Some(request) = request else {
+            return Ok(None);
+        };
         anyhow::ensure!(
             restore.microvm_filesystem_slot_version
                 == openvmm_helpers::snapshot::microvm::MICROVM_FILESYSTEM_SLOT_VERSION,
             "snapshot does not support restore-time microVM filesystem attachment"
         );
-        // Only the dormant first slot exists in the snapshot's machine.
-        anyhow::ensure!(
-            requested.len() == 1,
-            "a dormant-slot snapshot can attach only one --mount on restore"
-        );
-        return microvm_filesystems_from_mounts(requested, denied_paths, owner);
-    }
-    anyhow::ensure!(
-        !requested.is_empty(),
-        "snapshot restore requires a fresh --mount attachment for fs:microvm0"
-    );
-    anyhow::ensure!(
-        requested.len() == saved.len(),
-        "snapshot restore requires {} --mount attachments in snapshot order, but {} were supplied",
-        saved.len(),
-        requested.len()
-    );
-    let mut configs = Vec::with_capacity(saved.len());
-    for (requested, saved) in requested.iter().zip(&saved) {
-        let config = microvm_filesystem_from_snapshot(saved)?;
-        anyhow::ensure!(
-            requested.guest_target == config.guest_mount_target
-                && requested.access == config.access,
+        // The snapshot's machine has only the dormant slot, whose device and
+        // command line stay as captured whatever the restore binds to it, so
+        // the restore builds the filesystem as a cold boot does.
+        return microvm_filesystem_from_request(request, policy, owner).map(Some);
+    };
+    let request =
+        request.context("snapshot restore requires a fresh --mount attachment for fs:microvm0")?;
+    let config = microvm_filesystem_from_snapshot(saved)?;
+    match (request, config.is_aggregate()) {
+        (MicrovmFilesystemRequest::Single(mount), false) => anyhow::ensure!(
+            mount.guest_target == config.guest_mount_target && mount.access == config.access,
             "restore-time mount target or access mode does not match the snapshot contract"
-        );
-        anyhow::ensure!(
-            owner == config.owner,
-            "restore-time --mount-owner {} does not match the snapshot contract ({})",
-            owner.as_str(),
-            config.owner.as_str()
-        );
-        configs.push(config);
+        ),
+        (
+            MicrovmFilesystemRequest::Aggregate {
+                guest_target,
+                children,
+            },
+            true,
+        ) => anyhow::ensure!(
+            guest_target == config.guest_mount_target
+                && children.len() == config.children.len()
+                && children
+                    .iter()
+                    .zip(&config.children)
+                    .all(|(requested, saved)| requested.name == saved.name
+                        && requested.access == saved.access),
+            "restore-time aggregate target, or --mount-child names, order, or access modes, do not match the snapshot contract"
+        ),
+        (_, false) => {
+            anyhow::bail!("snapshot restore requires the --mount that the snapshot attached")
+        }
+        (_, true) => anyhow::bail!(
+            "snapshot restore requires the --mount-aggregate and --mount-child options that the snapshot attached"
+        ),
     }
-    let effective = microvm_filesystems_from_mounts(requested, denied_paths, owner)?;
-    for ((effective, saved), config) in effective.iter().zip(&saved).zip(&configs) {
+    anyhow::ensure!(
+        owner == config.owner,
+        "restore-time --mount-owner {} does not match the snapshot contract ({})",
+        owner.as_str(),
+        config.owner.as_str()
+    );
+    let effective = microvm_filesystem_from_request(request, policy, owner)?;
+    if config.is_aggregate() {
+        anyhow::ensure!(
+            effective
+                .children
+                .iter()
+                .zip(&saved.children)
+                .all(|((root_path, _), saved)| *root_path == saved.canonical_host_path),
+            "restore-time --mount-child canonical host paths do not match the snapshot contract"
+        );
+    } else {
         anyhow::ensure!(
             !saved.canonical_host_path.is_empty(),
             "snapshot filesystem canonical host path is missing; this snapshot predates path-bound filesystem restore"
@@ -779,16 +1050,16 @@ pub(super) fn effective_microvm_filesystems(
             effective.root_path == saved.canonical_host_path,
             "restore-time filesystem canonical host path does not match the snapshot contract"
         );
-        anyhow::ensure!(
-            restore.attachments.contains(&effective.attachment),
-            "restore-time filesystem root identity does not match the snapshot attachment"
-        );
-        anyhow::ensure!(
-            effective.config == *config,
-            "restore-time filesystem denied paths do not match the snapshot contract"
-        );
     }
-    Ok(effective)
+    anyhow::ensure!(
+        restore.attachments.contains(&effective.attachment),
+        "restore-time filesystem root identity does not match the snapshot attachment"
+    );
+    anyhow::ensure!(
+        effective.config == config,
+        "restore-time filesystem access policy (denied, allowed, or writable paths) does not match the snapshot contract"
+    );
+    Ok(Some(effective))
 }
 
 #[cfg(test)]
@@ -802,18 +1073,27 @@ mod tests {
 
     const VMM: openvmm_defs::microvm::MicrovmFilesystemOwner =
         openvmm_defs::microvm::MicrovmFilesystemOwner::Vmm;
+    #[cfg(guest_arch = "x86_64")]
+    const DENIED: openvmm_defs::microvm::MicrovmFilesystemPathKind =
+        openvmm_defs::microvm::MicrovmFilesystemPathKind::Denied;
 
-    /// Resolves at most one `--mount`, like the single-share tests expect.
-    fn effective_microvm_filesystem(
-        requested: &[cli_args::microvm::MicrovmMountCli],
+    /// Resolves the `--mount` of a single directory.
+    fn single_filesystem(
+        requested: Option<&cli_args::microvm::MicrovmMountCli>,
         denied_paths: &[PathBuf],
         owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
         restore: Option<&openvmm_helpers::snapshot::microvm::SnapshotMachineContract>,
     ) -> anyhow::Result<Option<EffectiveMicrovmFilesystem>> {
-        let mut filesystems =
-            effective_microvm_filesystems(requested, denied_paths, owner, restore)?;
-        assert!(filesystems.len() <= 1);
-        Ok(filesystems.pop())
+        let policy = MicrovmFilesystemPolicyPaths {
+            denied: denied_paths,
+            ..Default::default()
+        };
+        effective_microvm_filesystem(
+            requested.map(MicrovmFilesystemRequest::Single),
+            policy,
+            owner,
+            restore,
+        )
     }
 
     fn filesystem_contract(
@@ -832,34 +1112,49 @@ mod tests {
         )
         .unwrap()
         .with_owner(owner);
-        filesystems_contract(&[(filesystem, root)])
+        share_contract(Some((&filesystem, root)))
     }
 
     fn dormant_filesystem_contract() -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract
     {
-        filesystems_contract(&[])
+        share_contract(None)
     }
 
-    /// Builds the contract of a cold-booted machine with `shares` attached to
-    /// the virtio-fs slots in order, or with a dormant first slot.
-    fn filesystems_contract(
-        shares: &[(openvmm_defs::microvm::MicrovmFilesystemConfig, &Path)],
+    /// Builds the contract of a cold-booted machine with `share` attached to
+    /// the virtio-fs slot, or with a dormant slot.
+    fn share_contract(
+        share: Option<(&openvmm_defs::microvm::MicrovmFilesystemConfig, &Path)>,
     ) -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
-        let filesystems = shares
-            .iter()
-            .map(|(filesystem, _)| filesystem.clone())
-            .collect::<Vec<_>>();
-        let roots = shares
-            .iter()
-            .zip(&openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS)
-            .map(|((_, root), slot)| microvm_filesystem_attachment(root, slot).unwrap())
-            .collect::<Vec<_>>();
+        let slot = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0];
+        let root = share.map(|(_, root)| microvm_filesystem_attachment(root, slot).unwrap());
+        let effective = share
+            .zip(root)
+            .map(
+                |((config, _), (root_path, attachment))| EffectiveMicrovmFilesystem {
+                    config: config.clone(),
+                    root_path,
+                    attachment,
+                    children: Vec::new(),
+                },
+            );
+        effective_contract(effective.as_ref())
+    }
+
+    /// Builds the contract of a cold-booted machine with `filesystem`
+    /// attached to the virtio-fs slot, or with a dormant slot.
+    fn effective_contract(
+        filesystem: Option<&EffectiveMicrovmFilesystem>,
+    ) -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
+        let slot = &openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS[0];
         let mut command_line = build_microvm_command_line(&[], false).unwrap();
         openvmm_defs::microvm::append_microvm_virtio_discovery(
             &mut command_line,
             None,
             true,
-            &filesystems,
+            &filesystem
+                .iter()
+                .map(|filesystem| filesystem.config.clone())
+                .collect::<Vec<_>>(),
             false,
             false,
             &[],
@@ -878,25 +1173,25 @@ mod tests {
         ]
         .map(str::to_owned)
         .to_vec();
-        state_unit_names.extend(
-            openvmm_defs::microvm::MICROVM_FILESYSTEM_SLOTS
-                .iter()
-                .take(shares.len().max(1))
-                .map(|slot| format!("virtiofs-{}", slot.mmio_base)),
-        );
+        state_unit_names.push(format!("virtiofs-{}", slot.mmio_base));
         openvmm_helpers::snapshot::microvm::microvm_machine_contract(
             if cfg!(windows) { "whp" } else { "kvm" },
             openvmm_helpers::snapshot::microvm::MICROVM_BOOT_LAYOUT_VERSION,
             command_line,
             None,
             true,
-            filesystems
-                .iter()
-                .zip(&roots)
-                .map(|(filesystem, (root_path, attachment))| {
-                    (filesystem, Path::new(root_path), attachment.clone())
-                })
-                .collect(),
+            filesystem.map(|filesystem| {
+                openvmm_helpers::snapshot::microvm::MicrovmFilesystemSource {
+                    config: &filesystem.config,
+                    canonical_host_path: Path::new(&filesystem.root_path),
+                    attachment: filesystem.attachment.clone(),
+                    children: filesystem
+                        .children
+                        .iter()
+                        .map(|(root_path, attachment)| (Path::new(root_path), attachment))
+                        .collect(),
+                }
+            }),
             None,
             None,
             Vec::new(),
@@ -923,6 +1218,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn filesystem_denied_paths_are_canonical_and_root_scoped() {
         let root = tempfile::tempdir().unwrap();
@@ -939,8 +1235,8 @@ mod tests {
         ])
         .unwrap();
         options.validate_microvm_options().unwrap();
-        let filesystem = effective_microvm_filesystem(
-            options.microvm.microvm_mount.as_slice(),
+        let filesystem = single_filesystem(
+            options.microvm.microvm_mount.as_ref(),
             &options.microvm.microvm_mount_deny,
             VMM,
             None,
@@ -951,12 +1247,20 @@ mod tests {
 
         let outside = tempfile::tempdir().unwrap();
         assert!(
-            canonical_microvm_filesystem_denied_paths(root.path(), &[outside.path().to_owned()])
-                .is_err()
+            canonical_microvm_filesystem_policy_paths(
+                root.path(),
+                &[outside.path().to_owned()],
+                DENIED
+            )
+            .is_err()
         );
         assert!(
-            canonical_microvm_filesystem_denied_paths(root.path(), &[secrets.clone(), secrets])
-                .is_err()
+            canonical_microvm_filesystem_policy_paths(
+                root.path(),
+                &[secrets.clone(), secrets],
+                DENIED
+            )
+            .is_err()
         );
     }
 
@@ -965,8 +1269,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let contract = filesystem_contract(root.path());
         let options = restore_mount_options(root.path(), "ro");
-        let restored = effective_microvm_filesystem(
-            options.microvm.microvm_mount.as_slice(),
+        let restored = single_filesystem(
+            options.microvm.microvm_mount.as_ref(),
             &[],
             VMM,
             Some(&contract),
@@ -979,8 +1283,8 @@ mod tests {
         let replacement = tempfile::tempdir().unwrap();
         let replacement_options = restore_mount_options(replacement.path(), "ro");
         assert!(
-            effective_microvm_filesystem(
-                replacement_options.microvm.microvm_mount.as_slice(),
+            single_filesystem(
+                replacement_options.microvm.microvm_mount.as_ref(),
                 &[],
                 VMM,
                 Some(&contract)
@@ -1000,8 +1304,8 @@ mod tests {
 
         let options = restore_mount_options(&moved, "ro");
         assert!(
-            effective_microvm_filesystem(
-                options.microvm.microvm_mount.as_slice(),
+            single_filesystem(
+                options.microvm.microvm_mount.as_ref(),
                 &[],
                 VMM,
                 Some(&contract)
@@ -1014,12 +1318,12 @@ mod tests {
     fn filesystem_restore_rejects_missing_or_changed_policy() {
         let root = tempfile::tempdir().unwrap();
         let contract = filesystem_contract(root.path());
-        assert!(effective_microvm_filesystem(&[], &[], VMM, Some(&contract)).is_err());
+        assert!(single_filesystem(None, &[], VMM, Some(&contract)).is_err());
 
         let changed_mode = restore_mount_options(root.path(), "rw");
         assert!(
-            effective_microvm_filesystem(
-                changed_mode.microvm.microvm_mount.as_slice(),
+            single_filesystem(
+                changed_mode.microvm.microvm_mount.as_ref(),
                 &[],
                 VMM,
                 Some(&contract),
@@ -1032,7 +1336,7 @@ mod tests {
     fn filesystem_restore_without_mount_preserves_dormant_slot() {
         let contract = dormant_filesystem_contract();
         assert!(
-            effective_microvm_filesystem(&[], &[], VMM, Some(&contract))
+            single_filesystem(None, &[], VMM, Some(&contract))
                 .unwrap()
                 .is_none()
         );
@@ -1043,8 +1347,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let contract = dormant_filesystem_contract();
         let options = restore_mount_options(root.path(), "rw");
-        let filesystem = effective_microvm_filesystem(
-            options.microvm.microvm_mount.as_slice(),
+        let filesystem = single_filesystem(
+            options.microvm.microvm_mount.as_ref(),
             &[],
             VMM,
             Some(&contract),
@@ -1067,8 +1371,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let contract = network_contract();
         let options = restore_mount_options(root.path(), "ro");
-        let error = match effective_microvm_filesystem(
-            options.microvm.microvm_mount.as_slice(),
+        let error = match single_filesystem(
+            options.microvm.microvm_mount.as_ref(),
             &[],
             VMM,
             Some(&contract),
@@ -1085,10 +1389,21 @@ mod tests {
 
     #[test]
     fn filesystem_root_rejects_parent_components() {
+        use openvmm_defs::microvm::MicrovmFilesystemChildKind;
+
         let root = tempfile::tempdir().unwrap();
-        assert!(canonical_microvm_filesystem_root(&root.path().join("child").join("..")).is_err());
+        for kind in [
+            MicrovmFilesystemChildKind::Directory,
+            MicrovmFilesystemChildKind::File,
+        ] {
+            assert!(
+                canonical_microvm_filesystem_root(&root.path().join("child").join(".."), kind)
+                    .is_err()
+            );
+        }
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn mount_owner_defaults_to_the_vmm_and_requires_a_mount() {
         let root = tempfile::tempdir().unwrap();
@@ -1108,7 +1423,12 @@ mod tests {
             Some(cli_args::microvm::MicrovmMountOwnerCli::Vmm)
         );
         options.validate_microvm_options().unwrap();
-        assert!(parse(&["--mount-owner", "caller"]).is_err());
+        assert!(
+            parse(&["--mount-owner", "caller"])
+                .unwrap()
+                .validate_microvm_options()
+                .is_err()
+        );
         assert!(parse(&["--mount", &mount, "--mount-owner", "root"]).is_err());
 
         let options = parse(&["--mount", &mount, "--mount-owner", "caller"]).unwrap();
@@ -1134,8 +1454,8 @@ mod tests {
         let metadata = fs_err::metadata(root_owned).unwrap();
         if metadata.uid() == 0 && metadata.gid() == 0 {
             let options = restore_mount_options(root_owned, "ro");
-            let error = match effective_microvm_filesystem(
-                options.microvm.microvm_mount.as_slice(),
+            let error = match single_filesystem(
+                options.microvm.microvm_mount.as_ref(),
                 &[],
                 caller,
                 None,
@@ -1154,14 +1474,10 @@ mod tests {
         let metadata = fs_err::metadata(root.path()).unwrap();
         if metadata.uid() != 0 && metadata.gid() != 0 {
             let options = restore_mount_options(root.path(), "rw");
-            let filesystem = effective_microvm_filesystem(
-                options.microvm.microvm_mount.as_slice(),
-                &[],
-                caller,
-                None,
-            )
-            .unwrap()
-            .unwrap();
+            let filesystem =
+                single_filesystem(options.microvm.microvm_mount.as_ref(), &[], caller, None)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(filesystem.config.owner, caller);
         }
     }
@@ -1177,18 +1493,18 @@ mod tests {
             return;
         }
         let options = restore_mount_options(root.path(), "ro");
-        let requested = options.microvm.microvm_mount.as_slice();
+        let requested = options.microvm.microvm_mount.as_ref();
 
         let contract = filesystem_contract_with_owner(root.path(), caller);
         assert_eq!(
             contract.microvm_filesystem.as_ref().unwrap().owner_mode,
             "caller"
         );
-        let restored = effective_microvm_filesystem(requested, &[], caller, Some(&contract))
+        let restored = single_filesystem(requested, &[], caller, Some(&contract))
             .unwrap()
             .unwrap();
         assert_eq!(restored.config.owner, caller);
-        let error = match effective_microvm_filesystem(requested, &[], VMM, Some(&contract)) {
+        let error = match single_filesystem(requested, &[], VMM, Some(&contract)) {
             Err(error) => error,
             Ok(_) => panic!("restore accepted a different ownership mode"),
         };
@@ -1198,7 +1514,7 @@ mod tests {
         // predate the field.
         let contract = filesystem_contract(root.path());
         assert_eq!(contract.microvm_filesystem.as_ref().unwrap().owner_mode, "");
-        assert!(effective_microvm_filesystem(requested, &[], caller, Some(&contract)).is_err());
+        assert!(single_filesystem(requested, &[], caller, Some(&contract)).is_err());
     }
 
     #[cfg(unix)]
@@ -1207,9 +1523,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("target");
         fs_err::create_dir(&target).unwrap();
+        fs_err::write(target.join("file"), b"host").unwrap();
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(canonical_microvm_filesystem_root(&link).is_err());
+        let file_link = root.path().join("file-link");
+        std::os::unix::fs::symlink(target.join("file"), &file_link).unwrap();
+        for kind in [
+            openvmm_defs::microvm::MicrovmFilesystemChildKind::Directory,
+            openvmm_defs::microvm::MicrovmFilesystemChildKind::File,
+        ] {
+            assert!(canonical_microvm_filesystem_root(&link, kind).is_err());
+            assert!(canonical_microvm_filesystem_root(&link.join("file"), kind).is_err());
+            assert!(canonical_microvm_filesystem_root(&file_link, kind).is_err());
+        }
     }
 
     #[test]
@@ -1256,117 +1582,255 @@ mod tests {
         Options::try_parse_from(args).unwrap()
     }
 
+    fn aggregate_options(children: &[String], extra: &[&str]) -> Options {
+        let mut args = vec![
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--mount-aggregate",
+            "/run/nvx/shares",
+        ];
+        for child in children {
+            args.extend(["--mount-child", child.as_str()]);
+        }
+        args.extend(extra);
+        Options::try_parse_from(args).unwrap()
+    }
+
     fn workspace_and_toolcache(
         workspace: &Path,
         toolcache: &Path,
         toolcache_mode: &str,
     ) -> Vec<String> {
         vec![
-            format!("/workspace,{},rw", workspace.display()),
-            format!(
-                "/opt/hostedtoolcache,{},{toolcache_mode}",
-                toolcache.display()
-            ),
+            format!("work,{},rw", workspace.display()),
+            format!("tools,{},{toolcache_mode}", toolcache.display()),
         ]
     }
 
+    /// Resolves the filesystem and access policy that `options` request.
+    fn options_filesystem(
+        options: &Options,
+        restore: Option<&openvmm_helpers::snapshot::microvm::SnapshotMachineContract>,
+    ) -> anyhow::Result<EffectiveMicrovmFilesystem> {
+        effective_microvm_filesystem(
+            MicrovmFilesystemRequest::from_options(options),
+            MicrovmFilesystemPolicyPaths {
+                denied: &options.microvm.microvm_mount_deny,
+                allowed: &options.microvm.microvm_mount_allow,
+                writable: &options.microvm.microvm_mount_write,
+            },
+            VMM,
+            restore,
+        )?
+        .context("the options request no filesystem")
+    }
+
     #[test]
-    fn mounts_occupy_the_fixed_slots_in_order() {
+    fn mount_is_not_repeatable_and_conflicts_with_an_aggregate() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_mount = format!("/a,{}", first.path().display());
+        let second_mount = format!("/b,{}", second.path().display());
+        let child = format!("0,{}", second.path().display());
+        for arguments in [
+            vec!["--mount", &first_mount, "--mount", &second_mount],
+            vec![
+                "--mount",
+                &first_mount,
+                "--mount-aggregate",
+                "/b",
+                "--mount-child",
+                &child,
+            ],
+            vec!["--mount-child", &child],
+        ] {
+            assert!(
+                Options::try_parse_from(
+                    ["openvmm", "--machine", "microvm"]
+                        .into_iter()
+                        .chain(arguments.iter().copied())
+                )
+                .is_err(),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_child_names_and_modes_parse() {
+        use cli_args::microvm::MicrovmMountChildCli;
+        use openvmm_defs::microvm::MicrovmFilesystemAccess;
+        use openvmm_defs::microvm::MicrovmFilesystemChildKind;
+        use std::str::FromStr as _;
+
+        let child = MicrovmMountChildCli::from_str("work,/srv/a,b,rw").unwrap();
+        assert_eq!(child.name, "work");
+        assert_eq!(child.host_path, PathBuf::from("/srv/a,b"));
+        assert_eq!(child.access, MicrovmFilesystemAccess::ReadWrite);
+        let child = MicrovmMountChildCli::from_str("0,/srv/a,b").unwrap();
+        assert_eq!(child.host_path, PathBuf::from("/srv/a,b"));
+        assert_eq!(child.access, MicrovmFilesystemAccess::ReadOnly);
+        let child = MicrovmMountChildCli::from_str("0,/srv/a,ro").unwrap();
+        assert_eq!(child.host_path, PathBuf::from("/srv/a"));
+        assert_eq!(child.kind, MicrovmFilesystemChildKind::Directory);
+        // The `file` flag follows the optional mode.
+        let child = MicrovmMountChildCli::from_str("0,/srv/a,b.txt,rw,file").unwrap();
+        assert_eq!(child.host_path, PathBuf::from("/srv/a,b.txt"));
+        assert_eq!(child.access, MicrovmFilesystemAccess::ReadWrite);
+        assert_eq!(child.kind, MicrovmFilesystemChildKind::File);
+        let child = MicrovmMountChildCli::from_str("0,/srv/a.txt,file").unwrap();
+        assert_eq!(child.host_path, PathBuf::from("/srv/a.txt"));
+        assert_eq!(child.access, MicrovmFilesystemAccess::ReadOnly);
+        assert_eq!(child.kind, MicrovmFilesystemChildKind::File);
+        let child = MicrovmMountChildCli::from_str("0,/srv/a.txt,file,rw").unwrap();
+        assert_eq!(child.host_path, PathBuf::from("/srv/a.txt,file"));
+        assert_eq!(child.kind, MicrovmFilesystemChildKind::Directory);
+        for invalid in [
+            "",
+            "0",
+            "0,",
+            "0,,rw",
+            "0,,file",
+            "0,,rw,file",
+            "a b,/srv",
+            ".,/srv",
+            "a/b,/srv",
+        ] {
+            assert!(
+                MicrovmMountChildCli::from_str(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn aggregate_children_share_the_fixed_slot() {
+        use openvmm_defs::microvm::MicrovmFilesystemAccess;
+
         let workspace = tempfile::tempdir().unwrap();
         let toolcache = tempfile::tempdir().unwrap();
-        let options = mount_options(
+        let options = aggregate_options(
             &workspace_and_toolcache(workspace.path(), toolcache.path(), "ro"),
             &[],
         );
         options.validate_microvm_options().unwrap();
-        let filesystems =
-            effective_microvm_filesystems(&options.microvm.microvm_mount, &[], VMM, None).unwrap();
-        let summary = filesystems
-            .iter()
-            .map(|filesystem| {
-                (
-                    filesystem.attachment.stable_id.as_str(),
-                    filesystem.config.guest_mount_target.as_str(),
-                    filesystem.config.access,
-                )
-            })
-            .collect::<Vec<_>>();
+        let filesystem = options_filesystem(&options, None).unwrap();
+        assert!(filesystem.config.is_aggregate());
+        assert_eq!(filesystem.config.guest_mount_target, "/run/nvx/shares");
+        assert_eq!(filesystem.config.access, MicrovmFilesystemAccess::ReadWrite);
         assert_eq!(
-            summary,
+            filesystem
+                .config
+                .children
+                .iter()
+                .map(|child| (child.name.as_str(), child.access))
+                .collect::<Vec<_>>(),
             [
-                (
-                    "fs:microvm0",
-                    "/workspace",
-                    openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite
-                ),
-                (
-                    "fs:microvm1",
-                    "/opt/hostedtoolcache",
-                    openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly
-                ),
+                ("work", MicrovmFilesystemAccess::ReadWrite),
+                ("tools", MicrovmFilesystemAccess::ReadOnly),
             ]
         );
-        for (filesystem, root) in filesystems.iter().zip([&workspace, &toolcache]) {
+        assert!(filesystem.root_path.is_empty());
+        assert_eq!(filesystem.attachment.stable_id, "fs:microvm0");
+        assert_eq!(
+            filesystem.attachment.identity_kind,
+            openvmm_helpers::snapshot::microvm::MICROVM_FILESYSTEM_AGGREGATE_IDENTITY_KIND
+        );
+        for ((root_path, _), root) in filesystem.children.iter().zip([&workspace, &toolcache]) {
             assert_eq!(
-                filesystem.root_path,
+                root_path,
                 fs_err::canonicalize(root.path()).unwrap().to_str().unwrap()
             );
         }
         assert_ne!(
-            filesystems[0].attachment.identity,
-            filesystems[1].attachment.identity
+            filesystem.children[0].1.identity,
+            filesystem.children[1].1.identity
         );
+
+        // The aggregate's identity covers the root of every child.
+        let other = tempfile::tempdir().unwrap();
+        let changed = options_filesystem(
+            &aggregate_options(
+                &workspace_and_toolcache(workspace.path(), other.path(), "ro"),
+                &[],
+            ),
+            None,
+        )
+        .unwrap();
+        assert_ne!(changed.attachment, filesystem.attachment);
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn aggregate_requires_unique_valid_children() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let options = aggregate_options(&[], &[]);
+        assert!(options.validate_microvm_options().is_err());
+        let options = aggregate_options(
+            &[
+                format!("same,{}", first.path().display()),
+                format!("same,{}", second.path().display()),
+            ],
+            &[],
+        );
+        let error = options.validate_microvm_options().unwrap_err();
+        assert!(format!("{error:#}").contains("not unique"), "{error:#}");
+        let options = Options::try_parse_from([
+            "openvmm",
+            "--machine",
+            "microvm",
+            "--mount-aggregate",
+            "relative",
+            "--mount-child",
+            &format!("0,{}", first.path().display()),
+        ])
+        .unwrap();
+        assert!(options.validate_microvm_options().is_err());
     }
 
     #[test]
-    fn mount_deny_applies_to_the_share_that_contains_it() {
+    fn aggregate_policy_paths_apply_to_the_child_that_contains_them() {
         let workspace = tempfile::tempdir().unwrap();
         let toolcache = tempfile::tempdir().unwrap();
         let workspace_secrets = workspace.path().join("secrets");
         let toolcache_secrets = toolcache.path().join("credentials");
         fs_err::create_dir(&workspace_secrets).unwrap();
         fs_err::create_dir(&toolcache_secrets).unwrap();
-        let mounts = workspace_and_toolcache(workspace.path(), toolcache.path(), "ro");
-        let filesystems = effective_microvm_filesystems(
-            &mount_options(&mounts, &[]).microvm.microvm_mount,
-            &[toolcache_secrets.clone(), workspace_secrets.clone()],
-            VMM,
-            None,
-        )
-        .unwrap();
-        assert_eq!(filesystems[0].config.denied_paths, ["secrets"]);
-        assert_eq!(filesystems[1].config.denied_paths, ["credentials"]);
+        let children = workspace_and_toolcache(workspace.path(), toolcache.path(), "ro");
+        let deny = |paths: &[&Path]| {
+            let mut arguments = Vec::new();
+            for path in paths {
+                arguments.push("--mount-deny".to_owned());
+                arguments.push(path.display().to_string());
+            }
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            options_filesystem(&aggregate_options(&children, &arguments), None)
+        };
+        let filesystem = deny(&[&toolcache_secrets, &workspace_secrets]).unwrap();
+        assert_eq!(filesystem.config.children[0].denied_paths, ["secrets"]);
+        assert_eq!(filesystem.config.children[1].denied_paths, ["credentials"]);
 
-        // With several shares, a relative path names no export root.
-        let error = effective_microvm_filesystems(
-            &mount_options(&mounts, &[]).microvm.microvm_mount,
-            &[PathBuf::from("secrets")],
-            VMM,
-            None,
-        )
-        .unwrap_err();
+        // A relative path names no child.
+        let error = deny(&[Path::new("secrets")]).unwrap_err();
         assert!(
             error.to_string().contains("absolute host path"),
             "{error:#}"
         );
-
         let outside = tempfile::tempdir().unwrap();
-        let error = effective_microvm_filesystems(
-            &mount_options(&mounts, &[]).microvm.microvm_mount,
-            &[outside.path().to_owned()],
-            VMM,
-            None,
-        )
-        .unwrap_err();
+        let error = deny(&[outside.path()]).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("outside the filesystem export roots")
+                .contains("outside the filesystem export roots"),
+            "{error:#}"
         );
     }
 
     #[test]
-    fn mounts_reject_overlapping_host_directories_and_guest_targets() {
+    fn aggregate_children_reject_overlapping_host_directories() {
         let parent = tempfile::tempdir().unwrap();
         let nested = parent.path().join("nested");
         fs_err::create_dir(&nested).unwrap();
@@ -1375,115 +1839,782 @@ mod tests {
             (nested.as_path(), parent.path()),
             (parent.path(), parent.path()),
         ] {
-            let options = mount_options(&workspace_and_toolcache(first, second, "ro"), &[]);
-            let error =
-                match effective_microvm_filesystems(&options.microvm.microvm_mount, &[], VMM, None)
-                {
-                    Err(error) => error,
-                    Ok(_) => panic!("overlapping host directories were accepted"),
-                };
+            let options = aggregate_options(&workspace_and_toolcache(first, second, "ro"), &[]);
+            let error = match options_filesystem(&options, None) {
+                Err(error) => error,
+                Ok(_) => panic!("overlapping host directories were accepted"),
+            };
             assert!(error.to_string().contains("must not overlap"), "{error:#}");
         }
+    }
 
-        let other = tempfile::tempdir().unwrap();
-        let options = mount_options(
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn aggregate_children_may_expose_files() {
+        use openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly;
+        use openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite;
+        use openvmm_defs::microvm::MicrovmFilesystemChildKind::Directory;
+        use openvmm_defs::microvm::MicrovmFilesystemChildKind::File;
+
+        let parent = tempfile::tempdir().unwrap();
+        let work = parent.path().join("work");
+        fs_err::create_dir(&work).unwrap();
+        let settings = parent.path().join("settings.json");
+        let output = parent.path().join("output.txt");
+        fs_err::write(&settings, b"{}").unwrap();
+        fs_err::write(&output, b"").unwrap();
+        // Files beside each other, and beside a directory child, do not
+        // overlap.
+        let options = aggregate_options(
             &[
-                format!("/workspace,{},rw", parent.path().display()),
-                format!("/workspace/cache,{},ro", other.path().display()),
+                format!("work,{},rw", work.display()),
+                format!("settings,{},ro,file", settings.display()),
+                format!("output,{},rw,file", output.display()),
             ],
             &[],
         );
-        assert!(options.validate_microvm_options().is_err());
+        options.validate_microvm_options().unwrap();
+        let filesystem = options_filesystem(&options, None).unwrap();
+        assert_eq!(
+            filesystem
+                .config
+                .children
+                .iter()
+                .map(|child| (child.name.as_str(), child.kind, child.access))
+                .collect::<Vec<_>>(),
+            [
+                ("work", Directory, ReadWrite),
+                ("settings", File, ReadOnly),
+                ("output", File, ReadWrite),
+            ]
+        );
+        assert_eq!(
+            filesystem.children[1].0,
+            fs_err::canonicalize(&settings).unwrap().to_str().unwrap()
+        );
+        assert_ne!(
+            filesystem.children[1].1.identity,
+            filesystem.children[2].1.identity
+        );
+
+        // The requested kind must match the host object, so a file that a
+        // directory replaced is not exported in its place, and a file needs
+        // its `file` flag.
+        for (child, message) in [
+            (
+                format!("work,{},rw,file", work.display()),
+                "not a regular file",
+            ),
+            (
+                format!("settings,{},ro", settings.display()),
+                "not a plain directory",
+            ),
+        ] {
+            let error = options_filesystem(&aggregate_options(&[child], &[]), None).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+
+        // A file inside a directory child overlaps it, and one file reached
+        // through two names, such as a hard link, overlaps itself.
+        let link = parent.path().join("settings-link.json");
+        fs_err::hard_link(&settings, &link).unwrap();
+        for children in [
+            vec![
+                format!("work,{},rw", parent.path().display()),
+                format!("settings,{},ro,file", settings.display()),
+            ],
+            vec![
+                format!("settings,{},ro,file", settings.display()),
+                format!("link,{},ro,file", link.display()),
+            ],
+        ] {
+            let error = options_filesystem(&aggregate_options(&children, &[]), None).unwrap_err();
+            assert!(error.to_string().contains("must not overlap"), "{error:#}");
+        }
+
+        // The mode of a file child applies to the whole file.
+        let settings_path = settings.display().to_string();
+        for option in ["--mount-deny", "--mount-allow", "--mount-write"] {
+            let error = options_filesystem(
+                &aggregate_options(
+                    &[format!("settings,{},rw,file", settings.display())],
+                    &[option, &settings_path],
+                ),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("exposes the file"), "{error:#}");
+        }
+
+        // A single --mount shares a directory, which the guest mounts.
+        let error = options_filesystem(
+            &mount_options(&[format!("/settings.json,{}", settings.display())], &[]),
+            None,
+        )
+        .unwrap_err();
         assert!(
-            effective_microvm_filesystems(&options.microvm.microvm_mount, &[], VMM, None).is_err()
+            error.to_string().contains("not a plain directory"),
+            "{error:#}"
         );
     }
 
-    fn two_share_contract(
-        workspace: &Path,
-        toolcache: &Path,
-    ) -> openvmm_helpers::snapshot::microvm::SnapshotMachineContract {
-        filesystems_contract(&[
-            (
-                openvmm_defs::microvm::MicrovmFilesystemConfig::new(
-                    "/workspace".to_owned(),
-                    openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite,
-                )
-                .unwrap(),
-                workspace,
-            ),
-            (
-                openvmm_defs::microvm::MicrovmFilesystemConfig::new(
-                    "/opt/hostedtoolcache".to_owned(),
-                    openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly,
-                )
-                .unwrap(),
-                toolcache,
-            ),
-        ])
+    #[test]
+    fn aggregate_restore_requires_the_same_files() {
+        let parent = tempfile::tempdir().unwrap();
+        let settings = parent.path().join("settings.json");
+        fs_err::write(&settings, b"{}").unwrap();
+        let children = [format!("settings,{},ro,file", settings.display())];
+        let captured = options_filesystem(&aggregate_options(&children, &[]), None).unwrap();
+        let contract = effective_contract(Some(&captured));
+        assert_eq!(
+            contract.microvm_filesystem.as_ref().unwrap().children[0].kind,
+            "file"
+        );
+        let restore = || {
+            options_filesystem(
+                &aggregate_options(&children, &["--restore-snapshot", "snapshot"]),
+                Some(&contract),
+            )
+        };
+        assert_eq!(restore().unwrap().config, captured.config);
+
+        // A restore must request the file that the snapshot exposed, not a
+        // directory.
+        let directory = parent.path().join("config");
+        fs_err::create_dir(&directory).unwrap();
+        assert!(
+            options_filesystem(
+                &aggregate_options(
+                    &[format!("settings,{},ro", directory.display())],
+                    &["--restore-snapshot", "snapshot"]
+                ),
+                Some(&contract),
+            )
+            .is_err()
+        );
+
+        // A file that replaces the snapshot's at its path is another object.
+        let replacement = parent.path().join("settings.new");
+        fs_err::write(&replacement, b"{}").unwrap();
+        fs_err::rename(&replacement, &settings).unwrap();
+        let error = restore().unwrap_err();
+        assert!(error.to_string().contains("root identity"), "{error:#}");
+        // So is a directory, which also changes the child's kind.
+        fs_err::remove_file(&settings).unwrap();
+        fs_err::create_dir(&settings).unwrap();
+        assert!(restore().is_err());
     }
 
     #[test]
-    fn filesystem_restore_requires_every_share_in_snapshot_order() {
+    fn restore_attaches_an_aggregate_only_to_a_dormant_slot() {
         let workspace = tempfile::tempdir().unwrap();
         let toolcache = tempfile::tempdir().unwrap();
-        let contract = two_share_contract(workspace.path(), toolcache.path());
-        assert_eq!(contract.microvm_additional_filesystems.len(), 1);
-        let restore = |mounts: &[String]| {
-            let options = mount_options(mounts, &["--restore-snapshot", "snapshot"]);
-            effective_microvm_filesystems(&options.microvm.microvm_mount, &[], VMM, Some(&contract))
-        };
+        let children = workspace_and_toolcache(workspace.path(), toolcache.path(), "ro");
+        let options = aggregate_options(&children, &["--restore-snapshot", "snapshot"]);
 
-        let mounts = workspace_and_toolcache(workspace.path(), toolcache.path(), "ro");
-        let restored = restore(&mounts).unwrap();
-        assert_eq!(restored.len(), 2);
+        // A dormant slot binds the aggregate.
+        let filesystem =
+            options_filesystem(&options, Some(&dormant_filesystem_contract())).unwrap();
+        assert!(filesystem.config.is_aggregate());
+
+        // A snapshot that predates the dormant slot binds no filesystem.
+        let error = options_filesystem(&options, Some(&network_contract())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support restore-time microVM filesystem attachment"),
+            "{error:#}"
+        );
+
+        // A snapshot of a single directory requires that directory.
+        let error =
+            options_filesystem(&options, Some(&filesystem_contract(workspace.path()))).unwrap_err();
+        assert!(
+            error.to_string().contains("requires the --mount"),
+            "{error:#}"
+        );
+    }
+
+    /// Resolves the aggregate that `children` and the access-policy options
+    /// `policy` request with `owner`, at a cold boot and at a restore that
+    /// binds it to a dormant slot.
+    fn cold_and_dormant_aggregates(
+        children: &[String],
+        policy: &[&str],
+        owner: openvmm_defs::microvm::MicrovmFilesystemOwner,
+    ) -> [anyhow::Result<EffectiveMicrovmFilesystem>; 2] {
+        let mut restore = policy.to_vec();
+        restore.extend(["--restore-snapshot", "snapshot"]);
+        let dormant = dormant_filesystem_contract();
+        [
+            (aggregate_options(children, policy), None),
+            (aggregate_options(children, &restore), Some(&dormant)),
+        ]
+        .map(|(options, contract)| {
+            effective_microvm_filesystem(
+                MicrovmFilesystemRequest::from_options(&options),
+                MicrovmFilesystemPolicyPaths {
+                    denied: &options.microvm.microvm_mount_deny,
+                    allowed: &options.microvm.microvm_mount_allow,
+                    writable: &options.microvm.microvm_mount_write,
+                },
+                owner,
+                contract,
+            )
+            .and_then(|filesystem| filesystem.context("the options request no filesystem"))
+        })
+    }
+
+    #[test]
+    fn dormant_slot_restore_attaches_an_aggregate_as_a_cold_boot_does() {
+        use openvmm_defs::microvm::MicrovmFilesystemAccess::ReadOnly;
+        use openvmm_defs::microvm::MicrovmFilesystemAccess::ReadWrite;
+        use openvmm_defs::microvm::MicrovmFilesystemChildKind::Directory;
+        use openvmm_defs::microvm::MicrovmFilesystemChildKind::File;
+
+        let workspace = policy_share();
+        let toolcache = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let settings = files.path().join("settings.json");
+        let output = files.path().join("output.txt");
+        fs_err::write(&settings, b"{}").unwrap();
+        fs_err::write(&output, b"").unwrap();
+        let children = [
+            format!("work,{},rw", workspace.path().display()),
+            format!("tools,{},ro", toolcache.path().display()),
+            format!("settings,{},ro,file", settings.display()),
+            format!("output,{},rw,file", output.display()),
+        ];
+        let path = |relative: &str| workspace.path().join(relative).display().to_string();
+        let (logs, payloads, out, log) = (
+            path("logs"),
+            path("logs/payloads"),
+            path("out"),
+            path("build.log"),
+        );
+        let policy = [
+            "--mount-deny",
+            &logs,
+            "--mount-allow",
+            &payloads,
+            "--mount-write",
+            &out,
+            "--mount-write",
+            &log,
+        ];
+        let [cold, restored] = cold_and_dormant_aggregates(&children, &policy, VMM);
+        let (cold, restored) = (cold.unwrap(), restored.unwrap());
         assert_eq!(
             restored
+                .config
+                .children
                 .iter()
-                .map(|filesystem| filesystem.attachment.clone())
+                .map(|child| (child.name.as_str(), child.kind, child.access))
                 .collect::<Vec<_>>(),
-            contract.attachments
+            [
+                ("work", Directory, ReadWrite),
+                ("tools", Directory, ReadOnly),
+                ("settings", File, ReadOnly),
+                ("output", File, ReadWrite),
+            ]
+        );
+        let work = &restored.config.children[0];
+        assert_eq!(work.denied_paths, ["logs"]);
+        assert_eq!(work.allowed_paths, ["logs/payloads"]);
+        assert_eq!(work.writable_paths, ["build.log", "out"]);
+        // The restore resolves the roots, identities, and policy of the cold
+        // boot.
+        assert_eq!(restored.config, cold.config);
+        assert_eq!(restored.attachment, cold.attachment);
+        assert_eq!(restored.children, cold.children);
+    }
+
+    #[test]
+    fn dormant_slot_restore_refuses_the_aggregates_that_a_cold_boot_refuses() {
+        let parent = tempfile::tempdir().unwrap();
+        let work = parent.path().join("work");
+        let nested = work.join("nested");
+        fs_err::create_dir_all(&nested).unwrap();
+        let settings = parent.path().join("settings.json");
+        fs_err::write(&settings, b"{}").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let directory = |name: &str, path: &Path| format!("{name},{},rw", path.display());
+        let file = |name: &str, path: &Path| format!("{name},{},ro,file", path.display());
+        let settings_path = settings.display().to_string();
+        let outside_path = outside.path().display().to_string();
+        for (children, policy, expected) in [
+            // Host paths that overlap.
+            (
+                vec![directory("work", &work), directory("nested", &nested)],
+                vec![],
+                "must not overlap",
+            ),
+            (
+                vec![
+                    directory("parent", parent.path()),
+                    file("settings", &settings),
+                ],
+                vec![],
+                "must not overlap",
+            ),
+            // Host objects of another kind than the child's.
+            (
+                vec![format!("work,{},rw,file", work.display())],
+                vec![],
+                "not a regular file",
+            ),
+            (
+                vec![format!("settings,{},ro", settings.display())],
+                vec![],
+                "not a plain directory",
+            ),
+            // A repeated name.
+            (
+                vec![directory("same", &work), directory("same", other.path())],
+                vec![],
+                "not unique",
+            ),
+            // Policy paths that no child takes.
+            (
+                vec![file("settings", &settings)],
+                vec!["--mount-deny", settings_path.as_str()],
+                "exposes the file",
+            ),
+            (
+                vec![directory("work", &work)],
+                vec!["--mount-deny", outside_path.as_str()],
+                "outside the filesystem export roots",
+            ),
+            (
+                vec![directory("work", &work)],
+                vec!["--mount-deny", "nested"],
+                "absolute host path",
+            ),
+        ] {
+            let [cold, restored] = cold_and_dormant_aggregates(&children, &policy, VMM);
+            let (cold, restored) = (cold.unwrap_err(), restored.unwrap_err());
+            assert!(format!("{cold:#}").contains(expected), "{cold:#}");
+            assert_eq!(format!("{restored:#}"), format!("{cold:#}"));
+        }
+    }
+
+    #[test]
+    fn dormant_slot_restore_applies_the_owner_of_a_cold_boot() {
+        let work = tempfile::tempdir().unwrap();
+        let children = [format!("work,{},rw", work.path().display())];
+        let [cold, restored] = cold_and_dormant_aggregates(
+            &children,
+            &[],
+            openvmm_defs::microvm::MicrovmFilesystemOwner::Caller,
+        );
+        // Caller ownership needs a Linux host and roots that root does not
+        // own, so a cold boot may refuse it here; the restore must then refuse
+        // it too.
+        match (cold, restored) {
+            (Ok(cold), Ok(restored)) => {
+                assert!(restored.config.owner.is_caller());
+                assert_eq!(restored.config, cold.config);
+            }
+            (Err(cold), Err(restored)) => {
+                assert_eq!(format!("{restored:#}"), format!("{cold:#}"));
+            }
+            (cold, restored) => {
+                panic!("the cold boot and the restore disagree: {cold:?} and {restored:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_restore_requires_the_same_children() {
+        let workspace = policy_share();
+        let toolcache = tempfile::tempdir().unwrap();
+        let children = workspace_and_toolcache(workspace.path(), toolcache.path(), "ro");
+        let deny = workspace.path().join("logs").display().to_string();
+        let policy = ["--mount-deny", deny.as_str()];
+        let captured = options_filesystem(&aggregate_options(&children, &policy), None).unwrap();
+        let contract = effective_contract(Some(&captured));
+        assert_eq!(
+            contract.microvm_filesystem.as_ref().unwrap().children.len(),
+            2
+        );
+        let restore = |children: &[String], policy: &[&str]| {
+            let mut arguments = policy.to_vec();
+            arguments.extend(["--restore-snapshot", "snapshot"]);
+            options_filesystem(&aggregate_options(children, &arguments), Some(&contract))
+        };
+        let restored = restore(&children, &policy).unwrap();
+        assert_eq!(restored.attachment, captured.attachment);
+        assert_eq!(restored.config, captured.config);
+
+        let other = tempfile::tempdir().unwrap();
+        let swapped = vec![children[1].clone(), children[0].clone()];
+        let renamed = vec![
+            children[0].replace("work,", "workspace,"),
+            children[1].clone(),
+        ];
+        let writable = workspace_and_toolcache(workspace.path(), toolcache.path(), "rw");
+        let replaced = workspace_and_toolcache(workspace.path(), other.path(), "ro");
+        for (changed, policy, expected) in [
+            (&swapped, &policy[..], "do not match the snapshot contract"),
+            (&renamed, &policy[..], "do not match the snapshot contract"),
+            (&writable, &policy[..], "do not match the snapshot contract"),
+            (
+                &children[..1].to_vec(),
+                &policy[..],
+                "do not match the snapshot contract",
+            ),
+            (&replaced, &policy[..], "canonical host paths"),
+            (&children, &[][..], "access policy"),
+        ] {
+            let error = restore(changed, policy).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        let error = options_filesystem(
+            &mount_options(
+                &[format!("/run/nvx/shares,{},rw", workspace.path().display())],
+                &["--restore-snapshot", "snapshot"],
+            ),
+            Some(&contract),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--mount-aggregate"), "{error:#}");
+    }
+
+    /// Creates a share with a denied `logs` directory that holds an allowed
+    /// `logs/payloads` directory, a writable `out` directory, and a writable
+    /// `build.log` file.
+    fn policy_share() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs_err::create_dir_all(root.path().join("logs").join("payloads")).unwrap();
+        fs_err::create_dir(root.path().join("out")).unwrap();
+        fs_err::write(root.path().join("build.log"), b"log").unwrap();
+        root
+    }
+
+    fn policy_options(root: &Path, mode: &str, policy: &[&str]) -> Options {
+        mount_options(&[format!("/workspace,{},{mode}", root.display())], policy)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn mount_allow_and_mount_write_build_the_access_policy() {
+        let root = policy_share();
+        let options = policy_options(
+            root.path(),
+            "rw",
+            &[
+                "--mount-deny",
+                "logs",
+                "--mount-allow",
+                &root
+                    .path()
+                    .join("logs")
+                    .join("payloads")
+                    .display()
+                    .to_string(),
+                "--mount-write",
+                "out",
+                "--mount-write",
+                "build.log",
+            ],
+        );
+        let filesystem = options_filesystem(&options, None).unwrap();
+        options.validate_microvm_options().unwrap();
+        let config = &filesystem.config;
+        assert_eq!(config.denied_paths, ["logs"]);
+        assert_eq!(config.allowed_paths, ["logs/payloads"]);
+        assert_eq!(config.writable_paths, ["build.log", "out"]);
+
+        for (mode, policy, expected) in [
+            (
+                "ro",
+                &["--mount-write", "out"][..],
+                "read-only microVM filesystem cannot have writable paths",
+            ),
+            (
+                "rw",
+                &["--mount-deny", "logs", "--mount-allow", "out"][..],
+                "must be inside a denied path",
+            ),
+            (
+                "rw",
+                &["--mount-deny", "logs", "--mount-write", "logs/payloads"][..],
+                "hidden by a denied path",
+            ),
+            (
+                "rw",
+                &["--mount-write", "out", "--mount-write", "out"][..],
+                "writable paths must be unique",
+            ),
+            ("rw", &["--mount-write", "."][..], "dot or parent component"),
+            (
+                "rw",
+                &["--mount-write", "missing"][..],
+                "failed to canonicalize microVM writable path",
+            ),
+        ] {
+            let options = policy_options(root.path(), mode, policy);
+            let error = match options_filesystem(&options, None) {
+                Err(error) => format!("{error:#}"),
+                Ok(_) => panic!("unsafe access policy {policy:?} was accepted"),
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+        let root_path = root.path().display().to_string();
+        let options = policy_options(root.path(), "rw", &["--mount-write", &root_path]);
+        let error = format!("{:#}", options_filesystem(&options, None).unwrap_err());
+        assert!(
+            error.contains("cannot be the complete filesystem export"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn policy_paths_may_contain_spaces() {
+        let root = policy_share();
+        let tool = root.path().join("Program Files").join("My Tool");
+        fs_err::create_dir_all(&tool).unwrap();
+        let program_files = root.path().join("Program Files").display().to_string();
+        let tool = tool.display().to_string();
+        let options = policy_options(
+            root.path(),
+            "rw",
+            &[
+                "--mount-deny",
+                &program_files,
+                "--mount-allow",
+                &tool,
+                "--mount-write",
+                &tool,
+            ],
+        );
+        let config = options_filesystem(&options, None).unwrap().config;
+        assert_eq!(config.denied_paths, ["Program Files"]);
+        assert_eq!(config.allowed_paths, ["Program Files/My Tool"]);
+        assert_eq!(config.writable_paths, ["Program Files/My Tool"]);
+
+        // A name that begins or ends with a space is not canonical.
+        let spaced = root.path().join(" spaced ");
+        fs_err::create_dir(&spaced).unwrap();
+        let spaced = spaced.display().to_string();
+        let options = policy_options(root.path(), "rw", &["--mount-deny", &spaced]);
+        let error = format!("{:#}", options_filesystem(&options, None).unwrap_err());
+        assert!(error.contains("invalid denied path"), "{error}");
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn host_paths_may_contain_commas() {
+        use openvmm_defs::microvm::MicrovmFilesystemAccess;
+
+        let base = tempfile::tempdir().unwrap();
+        let alpha = base.path().join("alpha,beta");
+        let reports = base.path().join("2026, final");
+        for root in [&alpha, &reports] {
+            fs_err::create_dir_all(root.join("secret")).unwrap();
+        }
+        // The text before a path's last comma names another directory.
+        fs_err::create_dir(base.path().join("alpha")).unwrap();
+        let canonical = |path: &Path| {
+            fs_err::canonicalize(path)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        let alpha_secret = alpha.join("secret").display().to_string();
+        let reports_secret = reports.join("secret").display().to_string();
+
+        // The mode follows the last comma, so `--mount` shares the exact
+        // directory, with its mode and policy.
+        let options = mount_options(
+            &[format!("/work,{},rw", alpha.display())],
+            &["--mount-deny", "secret"],
+        );
+        options.validate_microvm_options().unwrap();
+        let filesystem = options_filesystem(&options, None).unwrap();
+        assert_eq!(filesystem.config.guest_mount_target, "/work");
+        assert_eq!(filesystem.config.access, MicrovmFilesystemAccess::ReadWrite);
+        assert_eq!(filesystem.config.denied_paths, ["secret"]);
+        assert_eq!(filesystem.root_path, canonical(&alpha));
+        let options = mount_options(
+            &[format!("/reports,{},ro", reports.display())],
+            &["--mount-deny", &reports_secret],
+        );
+        let filesystem = options_filesystem(&options, None).unwrap();
+        assert_eq!(filesystem.config.access, MicrovmFilesystemAccess::ReadOnly);
+        assert_eq!(filesystem.config.denied_paths, ["secret"]);
+        assert_eq!(filesystem.root_path, canonical(&reports));
+
+        // Without the mode, the text after the last comma is no mode.
+        let unmoded = format!("/work,{}", alpha.display());
+        assert!(
+            Options::try_parse_from(["openvmm", "--machine", "microvm", "--mount", &unmoded])
+                .is_err()
         );
 
-        let error = restore(&[]).unwrap_err();
-        assert!(error.to_string().contains("requires a fresh --mount"));
-        let error = restore(&mounts[..1]).unwrap_err();
+        // Children of an aggregate follow the same rule.
+        let options = aggregate_options(
+            &[
+                format!("work,{},rw", alpha.display()),
+                format!("reports,{},ro", reports.display()),
+            ],
+            &[
+                "--mount-deny",
+                &alpha_secret,
+                "--mount-deny",
+                &reports_secret,
+            ],
+        );
+        let filesystem = options_filesystem(&options, None).unwrap();
+        assert_eq!(filesystem.children[0].0, canonical(&alpha));
+        assert_eq!(filesystem.children[1].0, canonical(&reports));
+        for child in &filesystem.config.children {
+            assert_eq!(child.denied_paths, ["secret"]);
+        }
+    }
+
+    #[test]
+    fn mount_deny_hides_a_root_that_has_allowed_paths() {
+        let root = policy_share();
+        let root_path = root.path().display().to_string();
+        let log = root.path().join("build.log").display().to_string();
+        let options = policy_options(root.path(), "rw", &["--mount-deny", &root_path]);
+        let error = format!("{:#}", options_filesystem(&options, None).unwrap_err());
+        assert!(error.contains("hide its root only"), "{error}");
+        let options = policy_options(
+            root.path(),
+            "rw",
+            &["--mount-deny", &root_path, "--mount-allow", &log],
+        );
+        let config = options_filesystem(&options, None).unwrap().config;
+        assert_eq!(config.denied_paths, [""]);
+        assert_eq!(config.allowed_paths, ["build.log"]);
+
+        // In an aggregate, the root is the child's.
+        let other = tempfile::tempdir().unwrap();
+        let children = workspace_and_toolcache(other.path(), root.path(), "ro");
+        let options = aggregate_options(
+            &children,
+            &["--mount-deny", &root_path, "--mount-allow", &log],
+        );
+        let filesystem = options_filesystem(&options, None).unwrap();
+        assert!(filesystem.config.children[0].denied_paths.is_empty());
+        assert_eq!(filesystem.config.children[1].denied_paths, [""]);
+        assert_eq!(filesystem.config.children[1].allowed_paths, ["build.log"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_paths_reject_symbolic_link_components() {
+        use openvmm_defs::microvm::MicrovmFilesystemPathKind;
+
+        let root = policy_share();
+        std::os::unix::fs::symlink("logs", root.path().join("link")).unwrap();
+        // Each path resolves inside the export, but only through the link.
+        for kind in [
+            MicrovmFilesystemPathKind::Denied,
+            MicrovmFilesystemPathKind::Allowed,
+            MicrovmFilesystemPathKind::Writable,
+        ] {
+            for requested in [
+                PathBuf::from("link"),
+                PathBuf::from("link/payloads"),
+                root.path().join("link").join("payloads"),
+            ] {
+                let error = canonical_microvm_filesystem_policy_paths(
+                    root.path(),
+                    std::slice::from_ref(&requested),
+                    kind,
+                )
+                .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("component is a symbolic link"),
+                    "{requested:?}: {error:#}"
+                );
+            }
+        }
+        assert_eq!(
+            canonical_microvm_filesystem_policy_paths(
+                root.path(),
+                &[PathBuf::from("logs/payloads")],
+                MicrovmFilesystemPathKind::Writable,
+            )
+            .unwrap(),
+            ["logs/payloads"]
+        );
+    }
+
+    #[test]
+    fn mount_write_applies_to_the_child_that_contains_it() {
+        let workspace = policy_share();
+        let toolcache = tempfile::tempdir().unwrap();
+        let children = workspace_and_toolcache(workspace.path(), toolcache.path(), "ro");
+        let out = workspace.path().join("out").display().to_string();
+        let options = aggregate_options(&children, &["--mount-write", &out]);
+        let filesystem = options_filesystem(&options, None).unwrap();
+        assert_eq!(filesystem.config.children[0].writable_paths, ["out"]);
+        assert!(filesystem.config.children[1].writable_paths.is_empty());
+
+        let options = aggregate_options(&children, &["--mount-write", "out"]);
+        let error = options_filesystem(&options, None).unwrap_err();
         assert!(
-            error.to_string().contains("2 --mount attachments"),
+            error
+                .to_string()
+                .contains("--mount-write requires an absolute host path"),
             "{error:#}"
         );
-        let swapped = [mounts[1].clone(), mounts[0].clone()];
-        assert!(restore(&swapped).is_err());
-        let writable = workspace_and_toolcache(workspace.path(), toolcache.path(), "rw");
-        assert!(restore(&writable).is_err());
-
-        let replacement = tempfile::tempdir().unwrap();
-        let replaced = workspace_and_toolcache(workspace.path(), replacement.path(), "ro");
-        let error = restore(&replaced).unwrap_err();
+        // A read-only child cannot have writable paths.
+        let tools_out = toolcache.path().join("out");
+        fs_err::create_dir(&tools_out).unwrap();
+        let tools_out = tools_out.display().to_string();
+        let options = aggregate_options(&children, &["--mount-write", &tools_out]);
+        let error = options_filesystem(&options, None).unwrap_err();
         assert!(
-            error.to_string().contains("canonical host path"),
+            format!("{error:#}").contains("cannot have writable paths"),
             "{error:#}"
         );
     }
 
     #[test]
-    fn dormant_snapshot_attaches_only_one_mount_on_restore() {
-        let contract = dormant_filesystem_contract();
-        let workspace = tempfile::tempdir().unwrap();
-        let toolcache = tempfile::tempdir().unwrap();
-        let options = mount_options(
-            &workspace_and_toolcache(workspace.path(), toolcache.path(), "ro"),
-            &["--restore-snapshot", "snapshot"],
-        );
-        let error = match effective_microvm_filesystems(
-            &options.microvm.microvm_mount,
-            &[],
-            VMM,
-            Some(&contract),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("a dormant-slot snapshot attached two shares"),
+    fn filesystem_restore_requires_the_same_access_policy() {
+        let root = policy_share();
+        let policy = [
+            "--mount-deny",
+            "logs",
+            "--mount-allow",
+            "logs/payloads",
+            "--mount-write",
+            "out",
+        ];
+        let saved = options_filesystem(&policy_options(root.path(), "rw", &policy), None)
+            .unwrap()
+            .config;
+        let contract = share_contract(Some((&saved, root.path())));
+        let restore = |policy: &[&str]| {
+            let mut arguments = policy.to_vec();
+            arguments.extend(["--restore-snapshot", "snapshot"]);
+            options_filesystem(
+                &policy_options(root.path(), "rw", &arguments),
+                Some(&contract),
+            )
         };
-        assert!(error.to_string().contains("only one --mount"));
+        restore(&policy).unwrap();
+        for changed in [
+            &policy[..4],
+            &["--mount-deny", "logs", "--mount-write", "out"][..],
+            &[
+                "--mount-deny",
+                "logs",
+                "--mount-allow",
+                "logs/payloads",
+                "--mount-write",
+                "build.log",
+            ][..],
+        ] {
+            let error = restore(changed).unwrap_err();
+            assert!(error.to_string().contains("access policy"), "{error:#}");
+        }
     }
 }

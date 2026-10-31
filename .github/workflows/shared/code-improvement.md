@@ -52,30 +52,30 @@ steps:
       cache-dependency-path: requirements-dev.txt
   - name: Install pinned development tools
     run: python -m pip install --requirement requirements-dev.txt
-  - name: Install the aci_edge_sandboxes Rust toolchains
+  - name: Install the nvx-rs Rust toolchains
     # A failure here only fails the `aci-*` baseline commands, so it does not
     # stop candidates outside the crate.
     continue-on-error: true
     run: |
       set -euo pipefail
       # Keep the toolchain in sync with the `toolchain` input of
-      # .github/actions/check-aci-edge-sandboxes/action.yml. The crate's minimum
+      # .github/actions/check-nvx-rs/action.yml. The crate's minimum
       # supported Rust version comes from its manifest, as it does in that action.
-      toolchain="1.93"
-      msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' aci_edge_sandboxes/Cargo.toml)
+      toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+      msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' nvx-rs/Cargo.toml)
       test -n "${msrv}"
       # Later steps and the sandboxed agent inherit these variables. The
       # baseline script reads both toolchains, and the skip value keeps every
       # `--all-features` build from downloading the bundled OpenVMM release.
       {
-        echo "ACI_EDGE_SANDBOXES_BUNDLE=skip"
-        echo "ACI_RUST_TOOLCHAIN=${toolchain}"
-        echo "ACI_RUST_MSRV=${msrv}"
+        echo "NVX_BUNDLE=skip"
+        echo "NVX_RUST_TOOLCHAIN=${toolchain}"
+        echo "NVX_RUST_MSRV=${msrv}"
       } >> "${GITHUB_ENV}"
       rustup toolchain install "${toolchain}" --profile minimal --component clippy,rustfmt
       rustup toolchain install "${msrv}" --profile minimal
       rustup target add --toolchain "${toolchain}" aarch64-apple-darwin x86_64-pc-windows-msvc
-      cargo "+${toolchain}" fetch --locked --manifest-path aci_edge_sandboxes/Cargo.toml
+      cargo "+${toolchain}" fetch --locked --manifest-path nvx-rs/Cargo.toml
   - name: Validate the baseline and prepare bounded context
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -108,12 +108,17 @@ steps:
           "guest/common/nvx-sandbox-smoke",
           "guest/common/nvx-snapshot",
           "guest/common/nvx-virtio-restore-probe",
-          "scripts/setup/setup-linux-mshv.sh",
-          "scripts/setup/setup-linux-runner.sh",
+          "scripts/setup/setup-linux.sh",
       ]
       bash_shell_files = [
+          ".github/actions/run-benchmark/forward-signals.sh",
           ".github/specula/setup-runner.sh",
           "guest/ubuntu/nvx-bashrc",
+          "scripts/setup/azure/linux/bootstrap-runner.sh",
+          "scripts/setup/azure/linux/block-runner-metadata.sh",
+          "scripts/setup/azure/linux/setup-data-disk.sh",
+          "scripts/setup/azure/linux/setup-mshv.sh",
+          "scripts/setup/azure/linux/verify-mshv.sh",
       ]
       unit_tests = [
           "scripts/test_performance.py",
@@ -144,16 +149,16 @@ steps:
         exit 1
       }
       """
-      # Mirror .github/actions/check-aci-edge-sandboxes/action.yml. The manifest
+      # Mirror .github/actions/check-nvx-rs/action.yml. The manifest
       # path replaces its working directory, and a rustdoc flag in the command
       # line replaces its RUSTDOCFLAGS variable, so that each command is
       # self-contained and the agent can repeat it unchanged. The Windows type
       # check is an addition: CI runs the crate natively on Windows, which this
       # workflow cannot do. A missing toolchain variable fails these commands
       # without stopping the rest of the baseline.
-      aci_toolchain = "+" + os.environ.get("ACI_RUST_TOOLCHAIN", "unavailable")
-      aci_msrv = "+" + os.environ.get("ACI_RUST_MSRV", "unavailable")
-      aci_manifest = ["--manifest-path", "aci_edge_sandboxes/Cargo.toml"]
+      aci_toolchain = "+" + os.environ.get("NVX_RUST_TOOLCHAIN", "unavailable")
+      aci_msrv = "+" + os.environ.get("NVX_RUST_MSRV", "unavailable")
+      aci_manifest = ["--manifest-path", "nvx-rs/Cargo.toml"]
       aci_locked = [*aci_manifest, "--locked"]
       aci_deny_warnings = ["--", "-D", "warnings"]
       aci_check = ["check", *aci_locked, "--all-targets", "--all-features"]
@@ -414,12 +419,12 @@ steps:
               {
                   "command": ["python", "scripts/nvx.py", "verify"],
                   "reason": (
-                      "Requires the private openvmm submodule; this workflow must "
-                      "not initialize, inspect, or modify that submodule."
+                      "Checked by the source-preserving setup; this workflow must "
+                      "not replace or modify the vendored OpenVMM tree."
                   ),
               },
               {
-                  "command": ["python", "scripts/nvx.py", "test-aci-edge-sandboxes"],
+                  "command": ["python", "scripts/nvx.py", "test-runtime-adapter"],
                   "reason": (
                       "Requires a hypervisor and OpenVMM release artifacts, as do "
                       "the ignored openvmm_e2e tests."
@@ -436,9 +441,9 @@ steps:
                       "artifacts",
                   ],
                   "reason": (
-                      "Checks artifact bundling, which only build.rs, "
-                      "artifacts.json, and openvmm/artifacts.rs affect. "
-                      "Candidate selection excludes all three."
+                      "Checks artifact bundling in build.rs and "
+                      "src/host/artifacts/, using artifacts.json and "
+                      "src/contract.rs. Candidate selection excludes all four."
                   ),
               },
           ],
@@ -545,11 +550,11 @@ safe-outputs:
       - "scripts/**/*.py"
       - "scripts/setup/*.sh"
       - "scripts/setup/*.ps1"
-      - "aci_edge_sandboxes/src/*.rs"
-      - "aci_edge_sandboxes/src/**/*.rs"
-      - "aci_edge_sandboxes/tests/*.rs"
-      - "aci_edge_sandboxes/tests/**/*.rs"
-      - "aci_edge_sandboxes/examples/*.rs"
+      - "nvx-rs/src/*.rs"
+      - "nvx-rs/src/**/*.rs"
+      - "nvx-rs/tests/*.rs"
+      - "nvx-rs/tests/**/*.rs"
+      - "nvx-rs/examples/*.rs"
       - "guest/common/init"
       - "guest/alpine/nvx-container-enter"
       - "guest/alpine/nvx-container-launch"
@@ -567,10 +572,10 @@ safe-outputs:
       - ".github/workflows/*.lock.yml"
       - "scripts/publish_development_release.py"
       - "scripts/nvx_tools/release.py"
-      - "aci_edge_sandboxes/src/openvmm/artifacts.rs"
-      - "aci_edge_sandboxes/src/openvmm/contract.rs"
-      - "aci_edge_sandboxes/src/openvmm/platform/windows.rs"
-      - "aci_edge_sandboxes/target/**"
+      - "nvx-rs/src/host/artifacts/**"
+      - "nvx-rs/src/contract.rs"
+      - "nvx-rs/src/host/platform/windows.rs"
+      - "nvx-rs/target/**"
       - "data/**"
       - "build/**"
       - ".cache/**"
@@ -615,8 +620,8 @@ repository-defined commands.
    `doc/setup.md`, `doc/build.md`, `doc/ci.md`, `doc/project-structure.md`,
    `.github/actions/check-quality/action.yml`, and
    `.github/actions/validate-nvx/action.yml`. Before choosing a candidate in
-   `aci_edge_sandboxes/`, also read its `README.md` and
-   `.github/actions/check-aci-edge-sandboxes/action.yml`.
+   `nvx-rs/`, also read its `README.md` and
+   `.github/actions/check-nvx-rs/action.yml`.
 2. Read `/tmp/gh-aw/agent/repository-context.json` and
    `/tmp/gh-aw/agent/pull-request-history.json`. Read individual files under
    `/tmp/gh-aw/agent/baseline-logs/` only for failed checks.
@@ -661,9 +666,9 @@ Only consider candidates whose complete implementation and focused tests are
 covered by `create-pull-request.allowed-files`. Explicitly exclude
 `.github/specula/**`: do not inspect it for candidates or propose changes to
 it. Likewise, never select `Cargo.toml`, `Cargo.lock`, `build.rs`,
-`artifacts.json`, `README.md`, `src/openvmm/artifacts.rs`,
-`src/openvmm/contract.rs`, or `src/openvmm/platform/windows.rs` in
-`aci_edge_sandboxes/`: they hold dependencies, release pins, artifact
+`artifacts.json`, `README.md`, any file under `src/host/artifacts/`,
+`src/contract.rs`, or `src/host/platform/windows.rs` in
+`nvx-rs/`: they hold dependencies, release pins, artifact
 provenance, the control contract, or code that only a Windows host can run,
 and the pull request configuration rejects or strips them.
 
@@ -681,7 +686,7 @@ as a fallback.
 - Change one concern only and add or update a focused test when behavior changes.
 - Preserve Python 3.10 compatibility and the repository's strict Pyright, Ruff,
   POSIX shell, and formatting conventions.
-- In `aci_edge_sandboxes/`, preserve the public API (every item reachable from
+- In `nvx-rs/`, preserve the public API (every item reachable from
   the crate root, `openvmm`, or `testing`, with its signature, trait
   implementations, error codes, and serialized field names), the crate's
   `rust-version`, and its edition. Keep any new helper private or `pub(crate)`.
@@ -707,12 +712,12 @@ Run the narrowest relevant test first, then every applicable repository check:
 - allowlisted shell changes: the exact ShellCheck and shfmt commands for that
   file from `.github/actions/check-quality/action.yml`;
 - PowerShell changes: the parser check from that same action;
-- Rust changes in `aci_edge_sandboxes/`: the focused `cargo test` first, with
+- Rust changes in `nvx-rs/`: the focused `cargo test` first, with
   the toolchain, `--manifest-path`, and `--locked` arguments that the
   baseline's `aci-test-*` commands record, then every baseline command named
   `aci-*` with exactly its recorded arguments: formatting, Clippy, tests,
   rustdoc, the minimum supported Rust version, and the macOS and Windows type
-  checks. The job environment sets `ACI_EDGE_SANDBOXES_BUNDLE=skip`; leave it
+  checks. The job environment sets `NVX_BUNDLE=skip`; leave it
   set so that no build downloads a release;
 - documentation changes: verify every changed command, path, and link against
   the repository;
@@ -751,7 +756,7 @@ and concise reason. Never create activity merely to avoid a no-op.
   change.
 - **DO NOT** modify `.github/specula/**`; Specula is outside this workflow's
   candidate scope.
-- **DO NOT** modify the `aci_edge_sandboxes` files that candidate selection
+- **DO NOT** modify the `nvx-rs` files that candidate selection
   excludes, add `unsafe` code, `#[allow]` attributes, Cargo features, or
   dependencies to that crate, or change what one of its sandboxes permits or
   denies: host path mapping and denial, network rule expansion, workload

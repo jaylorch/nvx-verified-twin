@@ -23,12 +23,14 @@ from .build_config import (
     OpenVmmBackend,
     OpenVmmBuildConfig,
     OpenVmmPlatform,
+    ScratchTemplateBuildConfig,
 )
 from .build_constants import (
     AlpineBuildConstants,
     AzureLinuxBuildConstants,
     BuildConstants,
     DockerBuildConstants,
+    GuestRustBuildConstants,
     InitramfsBuildConstants,
     KernelBuildConstants,
     OpenVMMBuildConstants,
@@ -39,6 +41,7 @@ from .common import (
     artifact_path,
     download_verified,
     format_size,
+    normalized_sha256_file,
     openvmm_git_state,
     require_file,
     require_success,
@@ -46,6 +49,11 @@ from .common import (
     run_capture,
     run_checked,
     sha256_file,
+)
+from .guest_binaries import (
+    build_guest_binaries,
+    guest_binary_source_files,
+    inspect_guest_binaries,
 )
 from .guests import GuestDescriptor, guest_descriptor
 
@@ -111,6 +119,14 @@ def _assert_sandbox_kernel_config(path: Path) -> None:
     )
 
 
+def _assert_network_kernel_config(path: Path) -> None:
+    _assert_kernel_config(
+        path,
+        KernelBuildConstants.REQUIRED_NETWORK_CONFIG,
+        "kernel configuration cannot support the portable network profile: ",
+    )
+
+
 def _assert_shared_status_kernel_config(path: Path) -> None:
     _assert_kernel_config(
         path,
@@ -171,6 +187,7 @@ def assert_required_kernel_config(path: Path, *, debug: bool = False) -> None:
     _assert_direct_boot_kernel_config(path)
     _assert_virtio_console_kernel_config(path)
     _assert_sandbox_kernel_config(path)
+    _assert_network_kernel_config(path)
     _assert_shared_status_kernel_config(path)
     _assert_time_abi_kernel_config(path)
     _assert_hardening_kernel_config(path)
@@ -338,20 +355,23 @@ def merge_kernel_config_fragment(base: str, fragment: str) -> str:
 
 
 def _initramfs_source_files() -> tuple[Path, ...]:
-    sources = [
+    sources = {
         BuildConstants.REPO_ROOT / DockerBuildConstants.DOCKERFILE,
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build.py",
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build_config.py",
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build_constants.py",
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "common.py",
+        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "elf.py",
+        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guest_binaries.py",
         BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guests.py",
+        *guest_binary_source_files(),
         *(
             path
             for directory in AlpineBuildConstants.GUEST_SOURCE_DIRECTORIES
             for path in (BuildConstants.REPO_ROOT / directory).rglob("*")
             if path.is_file()
         ),
-    ]
+    }
     return tuple(
         sorted(
             (require_file(path, "initramfs provenance input") for path in sources),
@@ -371,7 +391,7 @@ def initramfs_provenance_inputs() -> dict[str, object]:
         "source_files": [
             {
                 "path": path.relative_to(BuildConstants.REPO_ROOT).as_posix(),
-                "sha256": sha256_file(path),
+                "sha256": normalized_sha256_file(path),
             }
             for path in _initramfs_source_files()
         ],
@@ -379,7 +399,7 @@ def initramfs_provenance_inputs() -> dict[str, object]:
 
 
 def record_openvmm_provenance(config: OpenVmmBuildConfig) -> None:
-    """Bind an OpenVMM executable to the checked-out submodule revision."""
+    """Bind an OpenVMM executable to the checked-out source-tree revision."""
     source_revision, source_clean = openvmm_git_state(config.directory)
     executable = require_file(config.output, "OpenVMM release binary")
     provenance = {
@@ -588,53 +608,6 @@ def _install(source: Path, destination: Path) -> dict[str, str]:
     return {
         "source_sha256": sha256_file(source),
         "binary_sha256": sha256_file(destination),
-    }
-
-
-def _build_static_helper(
-    work: Path,
-    source: Path,
-    destination: Path,
-    cflags: tuple[str, ...] = InitramfsBuildConstants.STATIC_HELPER_CFLAGS,
-    compiler_name: str = "cc",
-) -> dict[str, str]:
-    compiler = require_tool(compiler_name)
-    output = work / source.stem
-    run_checked(
-        [
-            compiler,
-            *cflags,
-            "-o",
-            output,
-            source,
-        ]
-    )
-    shutil.copyfile(output, destination)
-    destination.chmod(0o755)
-    return {
-        "source_sha256": sha256_file(source),
-        "binary_sha256": sha256_file(output),
-    }
-
-
-def _build_device_io_helper(work: Path, destination: Path) -> dict[str, str]:
-    compiler = require_tool("cc")
-    source = BuildConstants.REPO_ROOT / "guest" / "common" / "nvx-device-io.c"
-    output = work / "nvx-device-io"
-    run_checked(
-        [
-            compiler,
-            *InitramfsBuildConstants.DEVICE_IO_CFLAGS,
-            "-o",
-            output,
-            source,
-        ]
-    )
-    shutil.copyfile(output, destination)
-    destination.chmod(0o755)
-    return {
-        "source_sha256": sha256_file(source),
-        "binary_sha256": sha256_file(output),
     }
 
 
@@ -854,31 +827,25 @@ def _install_guest_files(
         if name == "nvx-bashrc":
             destination.chmod(0o644)
 
-    for name in InitramfsBuildConstants.STATIC_HELPERS:
-        helpers[name] = _build_static_helper(
-            config.work,
-            common / f"{name}.c",
-            root / "sbin" / name,
-        )
-    for name in InitramfsBuildConstants.MUSL_STATIC_HELPERS:
-        helpers[name] = _build_static_helper(
-            config.work,
-            common / f"{name}.c",
-            root / "sbin" / name,
-            compiler_name=InitramfsBuildConstants.MUSL_COMPILER,
-        )
-    probe = InitramfsBuildConstants.TIME_PROBE_NAME
-    helpers[probe] = _build_static_helper(
-        config.work,
-        common / f"{probe}.c",
-        root / "sbin" / probe,
-        InitramfsBuildConstants.TIME_PROBE_CFLAGS,
-        compiler_name=InitramfsBuildConstants.MUSL_COMPILER,
-    )
-    helpers["nvx-device-io"] = _build_device_io_helper(
-        config.work,
-        root / "sbin" / "nvx-device-io",
-    )
+    prebuilt = os.environ.get(GuestRustBuildConstants.BINARIES_VARIABLE)
+    if prebuilt:
+        binary_directory = Path(prebuilt)
+        result = inspect_guest_binaries(binary_directory)
+    else:
+        binary_directory = config.work / GuestRustBuildConstants.OUTPUT_DIRECTORY_NAME
+        result = build_guest_binaries(binary_directory)
+    for name in GuestRustBuildConstants.BINARIES:
+        source = binary_directory / name
+        destination = root / "sbin" / name
+        shutil.copyfile(source, destination)
+        destination.chmod(0o755)
+        binary_sha256 = sha256_file(destination)
+        if binary_sha256 != result.binaries[name]:
+            raise ScriptError(f"installed Rust guest binary changed: {name}")
+        helpers[name] = {
+            "source_sha256": result.source_sha256,
+            "binary_sha256": binary_sha256,
+        }
     return helpers
 
 
@@ -933,7 +900,7 @@ def _guest_customization_files(descriptor: GuestDescriptor) -> tuple[Path, ...]:
         )
         if path.is_file()
     )
-    return (*common, *alpine)
+    return (*common, *alpine, *guest_binary_source_files())
 
 
 def build_initramfs(config: InitramfsBuildConfig) -> None:
@@ -949,6 +916,13 @@ def build_initramfs(config: InitramfsBuildConfig) -> None:
     provenance_path = output.with_name(InitramfsBuildConstants.PROVENANCE_NAME)
     if provenance_inputs is not None:
         provenance_path.unlink(missing_ok=True)
+    # Snapshot before the root is prepared so the manifest describes the sources
+    # this build consumed; the post-pack comparison catches any edit in between.
+    ubuntu_input_sha256 = (
+        ubuntu.converter_input_sha256(ubuntu.customization_files())
+        if descriptor.name == "ubuntu"
+        else None
+    )
     root = _prepare_guest_root(config, descriptor)
     helpers = _install_guest_files(config, root, descriptor)
     if descriptor.name == "ubuntu":
@@ -956,13 +930,15 @@ def build_initramfs(config: InitramfsBuildConfig) -> None:
     else:
         _write_apk_manifest(root, output, helpers)
     _pack_initramfs(root, output)
-    if descriptor.name == "ubuntu":
-        _write_ubuntu_manifest(
-            root,
-            output,
-            helpers,
-            ubuntu.converter_input_sha256(ubuntu.customization_files()),
-        )
+    if ubuntu_input_sha256 is not None:
+        _write_ubuntu_manifest(root, output, helpers, ubuntu_input_sha256)
+        if (
+            ubuntu.converter_input_sha256(ubuntu.customization_files())
+            != ubuntu_input_sha256
+        ):
+            output.unlink(missing_ok=True)
+            package_manifest.unlink(missing_ok=True)
+            raise ScriptError("initramfs source inputs changed during the build")
     if (
         provenance_inputs is not None
         and initramfs_provenance_inputs() != provenance_inputs
@@ -1066,6 +1042,106 @@ def build_distro_layer(config: DistroLayerBuildConfig) -> None:
     print(f">> built {output} ({format_size(output.stat().st_size)})")
 
 
+def scratch_template_arguments(output: Path) -> list[str]:
+    """Return the arguments, after its name, of the mkfs.ext4 command that
+    formats the sandbox scratch template in `output`, a file of
+    `UbuntuBuildConstants.SCRATCH_TEMPLATE_SIZE` bytes."""
+    uuid = UbuntuBuildConstants.SCRATCH_TEMPLATE_UUID
+    return [
+        "-q",
+        "-F",
+        "-b",
+        str(UbuntuBuildConstants.SCRATCH_TEMPLATE_BLOCK_SIZE),
+        "-I",
+        str(UbuntuBuildConstants.SCRATCH_TEMPLATE_INODE_SIZE),
+        "-N",
+        str(UbuntuBuildConstants.SCRATCH_TEMPLATE_INODES),
+        "-m",
+        str(UbuntuBuildConstants.SCRATCH_TEMPLATE_RESERVED_PERCENT),
+        "-O",
+        ",".join(("none", *UbuntuBuildConstants.SCRATCH_TEMPLATE_FEATURES)),
+        "-U",
+        uuid,
+        "-E",
+        f"lazy_itable_init=0,lazy_journal_init=0,hash_seed={uuid}",
+        os.fspath(output),
+    ]
+
+
+def scratch_template_environment() -> dict[str, str]:
+    """Return the environment of mkfs.ext4 as it formats the scratch template:
+    this process's, without the variables that change what e2fsprogs writes,
+    and with its clock at `UbuntuBuildConstants.SCRATCH_TEMPLATE_TIMESTAMP`."""
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("E2FSPROGS_", "MKE2FS_"))
+    }
+    environment["E2FSPROGS_FAKE_TIME"] = str(
+        UbuntuBuildConstants.SCRATCH_TEMPLATE_TIMESTAMP
+    )
+    return environment
+
+
+def _mkfs_ext4() -> str:
+    """Return mkfs.ext4 from PATH, or else from the system directories that
+    distributions such as Debian leave out of an unprivileged user's PATH."""
+    search = os.pathsep.join(
+        directory
+        for directory in (os.environ.get("PATH", ""), "/usr/sbin", "/sbin")
+        if directory
+    )
+    executable = shutil.which("mkfs.ext4", path=search)
+    if executable is None:
+        raise ScriptError(
+            "mkfs.ext4 was not found on PATH, in /usr/sbin, or in /sbin; "
+            "install e2fsprogs"
+        )
+    return executable
+
+
+def build_scratch_template(config: ScratchTemplateBuildConfig) -> None:
+    """Format the sandbox scratch template at `config.output` with mkfs.ext4,
+    and warn when its bytes are not those that
+    `UbuntuBuildConstants.SCRATCH_TEMPLATE_SHA256` pins."""
+    if sys.platform != "linux":
+        # build-guest without --native formats the template only with every
+        # guest, so name that build rather than _require_linux's.
+        raise ScriptError(
+            "build-scratch-template requires Linux; install the template with "
+            "`nvx-rs download`, or build it, with the Ubuntu distro layer, in "
+            "Docker with `build-guest --guest all`"
+        )
+    output = config.output.resolve()
+    if output.exists() and not config.replace:
+        raise ScriptError(
+            f"refusing to replace existing scratch template: {output}; pass --replace"
+        )
+    mkfs = _mkfs_ext4()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f"{output.name}.part")
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("xb") as template:
+            template.truncate(UbuntuBuildConstants.SCRATCH_TEMPLATE_SIZE)
+        run_checked(
+            [mkfs, *scratch_template_arguments(temporary)],
+            env=scratch_template_environment(),
+        )
+        digest = sha256_file(temporary)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if digest != UbuntuBuildConstants.SCRATCH_TEMPLATE_SHA256:
+        print(
+            f"!! {mkfs} formatted {output} with SHA-256 {digest}, not the "
+            f"{UbuntuBuildConstants.SCRATCH_TEMPLATE_SHA256} that "
+            "UbuntuBuildConstants.SCRATCH_TEMPLATE_SHA256 pins",
+            file=sys.stderr,
+        )
+    print(f">> built {output} ({format_size(output.stat().st_size)})")
+
+
 def verify_guest_determinism(work: Path, guest: str) -> None:
     _require_linux("verify-guest-determinism")
     descriptor = guest_descriptor(guest)
@@ -1078,6 +1154,7 @@ def verify_guest_determinism(work: Path, guest: str) -> None:
         descriptor.package_manifest_name,
         UbuntuBuildConstants.DISTRO_NAME,
         UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+        UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME,
     )
     attempts: list[Path] = []
     digests: list[dict[str, str]] = []
@@ -1104,6 +1181,11 @@ def verify_guest_determinism(work: Path, guest: str) -> None:
                     / InitramfsBuildConstants.DETERMINISM_DISTRO_WORK_DIRECTORY_NAME
                 ),
                 output=attempt_root / UbuntuBuildConstants.DISTRO_NAME,
+            )
+        )
+        build_scratch_template(
+            ScratchTemplateBuildConfig(
+                output=attempt_root / UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME
             )
         )
         attempts.append(attempt_root)
@@ -1139,7 +1221,16 @@ def verify_guest_determinism(work: Path, guest: str) -> None:
             f"Ubuntu guest artifacts are not deterministic: "
             f"{digests[0]!r} != {digests[1]!r}{diagnostic}"
         )
-    print(">> Ubuntu initramfs and EROFS artifacts are deterministic")
+    template_sha256 = digests[0][UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME]
+    if template_sha256 != UbuntuBuildConstants.SCRATCH_TEMPLATE_SHA256:
+        raise ScriptError(
+            f"the scratch template is not reproducible: its SHA-256 is "
+            f"{template_sha256}, not the {UbuntuBuildConstants.SCRATCH_TEMPLATE_SHA256} "
+            "that UbuntuBuildConstants.SCRATCH_TEMPLATE_SHA256 pins"
+        )
+    print(
+        ">> Ubuntu initramfs, EROFS, and scratch template artifacts are deterministic"
+    )
 
 
 def build_kernel(config: KernelBuildConfig) -> None:

@@ -59,7 +59,7 @@ pub(super) fn create_private_directory(path: &Path) -> std::io::Result<()> {
     {
         let descriptor: pal::windows::security::LocalSecurityDescriptor =
             "D:P(A;;FA;;;SY)(A;;FA;;;OW)".parse()?;
-        pal::windows::security::create::create_directory_with_security(path, &descriptor)
+        pal::windows::security::create_directory_with_security(path, &descriptor)
     }
     #[cfg(not(windows))]
     let mut builder = std::fs::DirBuilder::new();
@@ -113,7 +113,7 @@ fn create_file(path: &Path, description: &str) -> anyhow::Result<std::fs::File> 
     {
         let descriptor: pal::windows::security::LocalSecurityDescriptor =
             "D:P(A;;FA;;;SY)(A;;FA;;;OW)".parse()?;
-        pal::windows::security::create::create_file_with_security(path, &descriptor)
+        pal::windows::security::create_file_with_security(path, &descriptor)
             .with_context(|| format!("failed to create {description} at {}", path.display()))
     }
     #[cfg(not(windows))]
@@ -300,10 +300,10 @@ pub(super) fn verify_hard_link_identity(
             "automatic snapshot RAM hard link has the wrong file identity or EOF"
         );
     }
+    #[cfg(any(target_os = "linux", windows))]
+    return Ok(());
     #[cfg(not(any(target_os = "linux", windows)))]
     anyhow::bail!("exact-file hard-link identity checks are unsupported on this platform");
-
-    Ok(())
 }
 
 /// Sizes a newly created snapshot RAM backing.
@@ -395,6 +395,51 @@ pub(super) fn copy_exact(
         "published independent snapshot artifact"
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn reflink_exact(
+    source_file: &std::fs::File,
+    destination_path: &Path,
+    expected_length: u64,
+    source_description: &str,
+    destination_description: &str,
+) -> anyhow::Result<()> {
+    let source_metadata = source_file
+        .metadata()
+        .with_context(|| format!("failed to inspect {source_description}"))?;
+    anyhow::ensure!(
+        source_metadata.file_type().is_file() && source_metadata.len() == expected_length,
+        "{source_description} does not match the expected regular-file generation"
+    );
+    let destination = create_file(destination_path, destination_description)?;
+    pal::unix::fs::reflink(source_file, &destination).with_context(|| {
+        format!("{destination_description} requires filesystem reflink support")
+    })?;
+
+    anyhow::ensure!(
+        destination
+            .metadata()
+            .with_context(|| format!("failed to inspect {destination_description}"))?
+            .len()
+            == expected_length,
+        "{destination_description} length does not match {source_description}",
+    );
+    destination
+        .sync_all()
+        .with_context(|| format!("failed to flush {destination_description}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn reflink_exact(
+    _source_file: &std::fs::File,
+    _destination_path: &Path,
+    _expected_length: u64,
+    _source_description: &str,
+    destination_description: &str,
+) -> anyhow::Result<()> {
+    anyhow::bail!("{destination_description} copy-on-write cloning is unsupported on this platform")
 }
 
 fn size_empty_file(file: &std::fs::File, length: u64, description: &str) -> anyhow::Result<()> {
